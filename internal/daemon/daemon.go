@@ -19,6 +19,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"testing"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -28,7 +29,6 @@ import (
 	"cccp/internal/engine"
 	"cccp/internal/ipc"
 	"cccp/internal/paths"
-	"cccp/internal/power"
 	"cccp/internal/present"
 	"cccp/internal/store"
 )
@@ -42,6 +42,10 @@ type request struct {
 type subscriber struct {
 	ch chan engine.Snapshot // capacity 1: the latest snapshot wins
 }
+
+// notifyRunner is the notifier new daemons use. Tests must replace it (see
+// testNotifier in the tests) so no test can reach the real desktop.
+var notifyRunner = execNotifier
 
 // Daemon is the running daemon.
 type Daemon struct {
@@ -65,8 +69,11 @@ type Daemon struct {
 
 	notified map[string]string // key → signature of the last notified state
 
-	sumBusy  bool
-	sumQueue []summaryJob
+	sumq *sumQueue
+	// runSummary executes one summary job (replaced in tests).
+	runSummary func(job summaryJob, model string) summaryResult
+	// notifier delivers a desktop notification (replaced in tests).
+	notifier func(argv []string) error
 
 	timer     *time.Timer
 	saveDue   time.Time
@@ -106,6 +113,9 @@ func Run(logger *log.Logger, stop <-chan struct{}) error {
 		appliedWin: map[string]string{},
 		notified:   map[string]string{},
 		timer:      time.NewTimer(time.Hour),
+		sumq:       newSumQueue(),
+		runSummary: summaryRunner,
+		notifier:   notifyRunner,
 	}
 	d.timer.Stop()
 
@@ -437,6 +447,26 @@ func (d *Daemon) decorateTmux(snap engine.Snapshot) {
 	}
 }
 
+func orDash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
+}
+
+// execNotifier runs the notification command without waiting for it.
+func execNotifier(argv []string) error {
+	if testing.Testing() {
+		return errors.New("refusing to send a real desktop notification from a test binary")
+	}
+	cmd := exec.Command(argv[0], argv[1:]...)
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	go cmd.Wait()
+	return nil
+}
+
 // signature identifies an attention state for notification de-duplication.
 func signature(s engine.Session) string {
 	if !s.NeedsAttention() || !s.Alive {
@@ -479,12 +509,10 @@ func (d *Daemon) notify(prev, snap engine.Snapshot) {
 			body = s.Location + "  " + body
 		}
 		argv := append(append([]string{}, cfg.NotifyCommand...), title, body)
-		cmd := exec.Command(argv[0], argv[1:]...)
-		if err := cmd.Start(); err != nil {
+		d.log.Printf("notify %s (%s, pane %s): %s", s.Key, s.Group, orDash(s.Location), title)
+		if err := d.notifier(argv); err != nil {
 			d.log.Printf("notify: %v", err)
-			continue
 		}
-		go cmd.Wait()
 	}
 }
 
@@ -496,11 +524,14 @@ func (d *Daemon) queueSummaries(snap engine.Snapshot) {
 	case "off":
 		return
 	case "ac":
-		if power.OnBattery() {
+		if snap.OnBattery {
 			return
 		}
 	}
+	now := snap.At
+	keep := map[string]bool{}
 	for _, s := range snap.Sessions {
+		keep[s.Key] = true
 		if !s.NeedsAttention() || !s.Alive || (s.LastMessage == "" && s.Question == "") {
 			continue
 		}
@@ -508,39 +539,37 @@ func (d *Daemon) queueSummaries(snap engine.Snapshot) {
 		if rec, ok := d.eng.Persist.Summaries[s.Key]; ok && rec.InputHash == hash {
 			continue
 		}
-		queued := false
-		for _, j := range d.sumQueue {
-			if j.key == s.Key && j.hash == hash {
-				queued = true
-			}
-		}
-		if !queued {
-			d.sumQueue = append(d.sumQueue, summaryJob{key: s.Key, hash: hash, input: in})
-		}
+		d.sumq.offer(summaryJob{key: s.Key, hash: hash, input: in}, now)
 	}
-	d.startSummary()
+	d.sumq.forget(keep)
+	d.startSummary(now)
 }
 
-func (d *Daemon) startSummary() {
-	if d.sumBusy || len(d.sumQueue) == 0 {
+func (d *Daemon) startSummary(now time.Time) {
+	job, ok := d.sumq.next(now)
+	if !ok {
 		return
 	}
-	job := d.sumQueue[0]
-	d.sumQueue = d.sumQueue[1:]
-	d.sumBusy = true
-	model := d.eng.Config().SummaryModel
-	go func() { d.sums <- runSummary(job, model) }()
+	model, run := d.eng.Config().SummaryModel, d.runSummary
+	go func() {
+		res := run(job, model)
+		res.hash = job.hash
+		d.sums <- res
+	}()
 }
 
 func (d *Daemon) handleSummary(res summaryResult) {
-	d.sumBusy = false
+	now := time.Now()
+	if d.sumq.done(res, res.hash, now) {
+		d.log.Printf("summaries paused for %v after %d consecutive failures (last: %v)", pauseFor, pauseAfter, res.err)
+	}
 	if res.err != nil {
 		d.log.Printf("summary for %s failed after %v: %v", res.key, res.took.Round(time.Millisecond), res.err)
 	} else if res.rec.Text != "" {
 		d.eng.Persist.Summaries[res.key] = res.rec
 		d.eng.PersistDirty = true
 	}
-	d.startSummary()
+	d.startSummary(now)
 }
 
 // accept serves socket connections.

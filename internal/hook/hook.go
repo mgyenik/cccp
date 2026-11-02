@@ -61,6 +61,7 @@ func Run(agent model.Agent, r io.Reader, now time.Time) error {
 	ev.Pane = os.Getenv("TMUX_PANE")
 	if st, ok := procs.FindAncestor(os.Getppid(), string(agent), 8); ok {
 		ev.PID, ev.PIDStart = st.PID, st.StartTime
+		ev.PrintMode = procs.IsPrintMode(procs.Cmdline(st.PID))
 	}
 	return store.Update(agent, ev.SessionID, func(s model.HookState) model.HookState {
 		return reduce.Apply(s, ev)

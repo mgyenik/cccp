@@ -202,7 +202,11 @@ func (e *Engine) Discover() {
 	if len(e.panes) > 0 {
 		t := procs.Snapshot()
 		for _, p := range e.panes {
-			st, a, ok := t.FindAgentBelow(p.PID)
+			// Print-mode runs (`claude -p` from a script) are automation,
+			// not sessions.
+			st, a, ok := t.FindAgentBelow(p.PID, func(st procs.Stat) bool {
+				return !procs.IsPrintMode(procs.Cmdline(st.PID))
+			})
 			if !ok {
 				continue
 			}
@@ -271,8 +275,8 @@ func (e *Engine) Snapshot(now time.Time) Snapshot {
 	// 1. Hook state files.
 	for p := range e.hooks {
 		h := e.hooks[p]
-		if h.SessionID == "" || h.Agent == "" {
-			continue
+		if h.SessionID == "" || h.Agent == "" || h.PrintMode {
+			continue // print mode is automation, not a session to watch
 		}
 		get(h.Agent, h.SessionID).hook = &h
 	}

@@ -403,3 +403,24 @@ Built as designed, with these differences and measured results.
   quiet-pane inference is disabled for panes in split windows.
 * `claude -p` runs started from inside a tmux pane are real sessions with
   hooks and appear (briefly) in that pane's location.
+
+### Changes after first use (2026-11-02)
+
+* **Print-mode runs are not sessions.** `claude -p` registers in Claude's
+  session registry as `kind: "interactive"` with `entrypoint: "sdk-cli"`, and
+  with the plugin installed its hooks fire too. Such runs (scripts, other
+  tools) were listed briefly and notified "your turn" when they exited. They
+  are now excluded at every source: registry entries with an `sdk*`
+  entrypoint, hook sessions whose `claude`/`agy` process was started with
+  `-p`/`--print`/`--prompt` (recorded by the hook as `print_mode`), and
+  print-mode processes found under tmux panes.
+* **Summary scheduling** (`internal/daemon/sumqueue.go`): at most one queued
+  job per session (the newest input replaces an older queued one); a failure
+  backs that input off for 1 min, doubling to 1 h; 3 consecutive failures
+  across sessions (logged out, usage limit) pause all summaries for 15 min.
+  Before this, a failing `claude -p` was respawned on every recompute.
+* **Notifications are logged** (`journalctl --user -u cccp`) with session,
+  group and location, and the notifier is injected; the daemon tests install
+  a recording notifier in `TestMain`, so tests never reach the desktop. (The
+  original daemon integration test used the default config and sent a real
+  notification on every `go test` run.)

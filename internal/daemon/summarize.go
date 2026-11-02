@@ -5,9 +5,11 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"os"
 	"os/exec"
 	"strings"
+	"testing"
 	"time"
 
 	"cccp/internal/engine"
@@ -23,6 +25,7 @@ type summaryJob struct {
 
 type summaryResult struct {
 	key  string
+	hash string // input hash of the job
 	rec  engine.SummaryRecord
 	err  error
 	took time.Duration
@@ -60,6 +63,9 @@ func tail(s string, n int) string {
 // runSummary runs one job with `claude -p`. CCCP_INTERNAL=1 makes cccp's own
 // hooks ignore this process, and it loads no settings, tools or MCP servers.
 func runSummary(job summaryJob, model string) summaryResult {
+	if testing.Testing() {
+		return summaryResult{key: job.key, err: errors.New("refusing to run a real claude -p from a test binary")}
+	}
 	start := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -93,3 +99,6 @@ func runSummary(job summaryJob, model string) summaryResult {
 	}
 	return res
 }
+
+// summaryRunner is the job runner new daemons use (tests replace it).
+var summaryRunner = runSummary

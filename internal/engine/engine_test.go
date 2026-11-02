@@ -235,3 +235,24 @@ func TestCleanPaneTitle(t *testing.T) {
 		}
 	}
 }
+
+func TestPrintModeSessionsExcluded(t *testing.T) {
+	dir := isolate(t)
+	pid, start := self(t)
+	now := time.Now()
+	putHook(t, model.HookState{Version: 1, Agent: model.Claude, SessionID: "script", PID: pid, PIDStart: start,
+		PrintMode: true, Activity: model.Idle, ActivityAt: now, TurnEndedAt: now, LastEventAt: now})
+	// claude -p registers as kind "interactive" with entrypoint "sdk-cli".
+	b, _ := json.Marshal(map[string]any{"pid": pid, "sessionId": "sdk", "procStart": fmt.Sprint(start),
+		"kind": "interactive", "entrypoint": "sdk-cli", "status": "idle", "statusUpdatedAt": now.UnixMilli()})
+	if err := os.WriteFile(filepath.Join(dir, "claude", "sessions", fmt.Sprintf("%d.json", pid)), b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	e := New(config.Default(), nil)
+	e.LoadAll()
+	for _, s := range e.Snapshot(now).Sessions {
+		if s.Key == "claude:script" || s.Key == "claude:sdk" {
+			t.Fatalf("print-mode session listed: %+v", s)
+		}
+	}
+}

@@ -158,8 +158,9 @@ func Snapshot() Table {
 }
 
 // FindAgentBelow searches the process tree under root (inclusive,
-// breadth-first) for an agent process and returns the shallowest one.
-func (t Table) FindAgentBelow(root int) (Stat, string, bool) {
+// breadth-first) for an agent process and returns the shallowest one for
+// which accept (if non-nil) returns true.
+func (t Table) FindAgentBelow(root int, accept func(Stat) bool) (Stat, string, bool) {
 	queue := []int{root}
 	seen := map[int]bool{}
 	for len(queue) > 0 {
@@ -170,7 +171,7 @@ func (t Table) FindAgentBelow(root int) (Stat, string, bool) {
 		}
 		seen[pid] = true
 		if st, ok := t.ByPID[pid]; ok {
-			if a, ok := IsAgentComm(st.Comm); ok {
+			if a, ok := IsAgentComm(st.Comm); ok && (accept == nil || accept(st)) {
 				return st, a, true
 			}
 		}
@@ -199,4 +200,22 @@ func StartWall(startTicks uint64) time.Time {
 		}
 	}
 	return time.Time{}
+}
+
+// IsPrintMode reports whether an agent command line runs non-interactively.
+// Both claude and agy use -p / --print (agy also --prompt).
+func IsPrintMode(args []string) bool {
+	if len(args) == 0 {
+		return false
+	}
+	for _, a := range args[1:] {
+		switch {
+		case a == "--":
+			return false
+		case a == "-p", a == "--print", a == "--prompt",
+			strings.HasPrefix(a, "--print="), strings.HasPrefix(a, "--prompt="):
+			return true
+		}
+	}
+	return false
 }

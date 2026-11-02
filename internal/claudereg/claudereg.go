@@ -103,8 +103,13 @@ func (e Entry) Question() string {
 }
 
 // IsUserSession reports whether the entry is a session a person works in
-// (interactive or background), as opposed to e.g. an SDK/print-mode process.
+// (interactive or background), as opposed to an SDK or print-mode process.
+// Print mode (`claude -p`) registers with kind "interactive" but entrypoint
+// "sdk-cli" (observed on 2.1.316), so the entrypoint decides.
 func (e Entry) IsUserSession() bool {
+	if strings.HasPrefix(e.Entrypoint, "sdk") {
+		return false
+	}
 	return e.Kind == "interactive" || e.Kind == "background"
 }
 

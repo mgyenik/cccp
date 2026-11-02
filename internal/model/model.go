@@ -43,6 +43,9 @@ type HookState struct {
 	PID      int    `json:"pid,omitempty"`
 	PIDStart uint64 `json:"pid_start,omitempty"` // /proc/<pid>/stat field 22
 	Pane     string `json:"pane,omitempty"`      // tmux pane id, e.g. "%21"
+	// PrintMode: the agent runs non-interactively (`claude -p`, `agy -p`),
+	// i.e. automation, not a session a person works in.
+	PrintMode bool `json:"print_mode,omitempty"`
 
 	Cwd            string `json:"cwd,omitempty"`
 	TranscriptPath string `json:"transcript_path,omitempty"`
@@ -91,9 +94,10 @@ type Event struct {
 	Model          string
 	CustomTitle    string
 
-	PID      int
-	PIDStart uint64
-	Pane     string
+	PID       int
+	PIDStart  uint64
+	Pane      string
+	PrintMode bool
 
 	// Event-specific fields; which are set depends on Name.
 	Source           string // SessionStart source; PreCompact trigger

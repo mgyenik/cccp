@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"testing"
 	"time"
 )
 
@@ -42,6 +43,11 @@ func (c *Client) args(a ...string) []string {
 
 // Run executes a tmux command and returns stdout.
 func (c *Client) Run(a ...string) (string, error) {
+	if c.Socket == "" && testing.Testing() {
+		// Tests must name an isolated server (tmux -L / -S); never the
+		// user's default one.
+		return "", errors.New("refusing to talk to the default tmux server from a test binary")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "tmux", c.args(a...)...)
