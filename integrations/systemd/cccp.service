@@ -1,0 +1,16 @@
+[Unit]
+Description=cccp — control panel daemon for Claude Code / agy sessions in tmux
+Documentation=file://%h/git/cccp/docs/architecture.md
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/cccp daemon
+Restart=on-failure
+RestartSec=2
+# Low priority: the daemon is never latency critical and should not compete
+# with the agents or builds.
+Nice=10
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=default.target

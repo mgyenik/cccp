@@ -1,0 +1,5 @@
+{
+  "name": "cccp",
+  "version": "0.1.0",
+  "description": "Reports session lifecycle events to cccp (the tmux control panel). Observes only: the hook always exits 0 and prints nothing."
+}

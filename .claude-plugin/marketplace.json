@@ -1,0 +1,12 @@
+{
+  "name": "cccp",
+  "description": "cccp — control panel for Claude Code sessions in tmux",
+  "owner": { "name": "cccp" },
+  "plugins": [
+    {
+      "name": "cccp",
+      "source": "./integrations/claude-plugin",
+      "description": "Reports session lifecycle events (prompt, tool calls, permission requests, turn end) to cccp. Observes only: never blocks or decides anything."
+    }
+  ]
+}
