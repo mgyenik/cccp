@@ -7,12 +7,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"os/exec"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"cccp/internal/model"
 )
 
 // Client talks to one tmux server.
@@ -22,14 +23,9 @@ type Client struct {
 	Socket string
 }
 
-// Default returns a client for the user's default tmux server. A daemon not
-// started from tmux has no $TMUX, so the default socket path is used.
-func Default() *Client {
-	if s := os.Getenv("CCCP_TMUX_SOCKET"); s != "" {
-		return &Client{Socket: s}
-	}
-	return &Client{}
-}
+// New returns a client for the server at socket, or for tmux's default
+// server when socket is empty.
+func New(socket string) *Client { return &Client{Socket: socket} }
 
 // ErrNoServer is returned when no tmux server is running.
 var ErrNoServer = errors.New("no tmux server")
@@ -63,38 +59,16 @@ func (c *Client) Run(a ...string) (string, error) {
 	return out.String(), nil
 }
 
-// Pane is one tmux pane.
-type Pane struct {
-	ID          string // %N
-	PID         int    // pane_pid (usually the shell)
-	Session     string
-	WindowID    string // @N
-	WindowIndex int
-	WindowName  string
-	PaneIndex   int
-	Title       string
-	Command     string
-	Path        string
-	// Visible: the pane's window is the current window of a session that
-	// has at least one attached client.
-	Visible bool
-	// WindowActivity is the last time the pane's window produced output.
-	WindowActivity time.Time
-	WindowPanes    int
-}
-
-// Location is "session:window" (with ".pane" when the window is split).
-func (p Pane) Location() string {
-	s := fmt.Sprintf("%s:%d", p.Session, p.WindowIndex)
-	if p.WindowPanes > 1 {
-		s += fmt.Sprintf(".%d", p.PaneIndex)
-	}
-	return s
-}
-
 // sep separates fields in tmux format output. tmux escapes control
 // characters (\x1f becomes "\\037"), so a printable character that cannot
 // plausibly occur in names or titles is used: U+241F SYMBOL FOR UNIT SEPARATOR.
+// Pane and ClientInfo are plain data, defined in model so the functional
+// core can use them without depending on this package.
+type (
+	Pane       = model.TmuxPane
+	ClientInfo = model.TmuxClient
+)
+
 const sep = "␟"
 
 var paneFormat = strings.Join([]string{
@@ -132,17 +106,6 @@ func (c *Client) ListPanes() ([]Pane, error) {
 		panes = append(panes, p)
 	}
 	return panes, nil
-}
-
-// ClientInfo is one attached client.
-type ClientInfo struct {
-	Name    string
-	Session string
-	Pane    string // active pane of the client's current window
-	Focused bool   // terminal focus (needs focus-events on); see FocusKnown
-	// FocusKnown is false when tmux cannot know terminal focus (focus-events
-	// off), in which case Focused is assumed true.
-	FocusKnown bool
 }
 
 // ListClients returns attached clients.

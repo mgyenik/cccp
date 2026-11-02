@@ -8,13 +8,13 @@ import (
 )
 
 func TestConcurrentUpdatesAreSerialised(t *testing.T) {
-	t.Setenv("CCCP_STATE_DIR", t.TempDir())
+	st := Store{Dir: t.TempDir()}
 	var wg sync.WaitGroup
 	for i := 0; i < 50; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := Update(model.Claude, "s", func(s model.HookState) model.HookState {
+			if err := st.Update(model.Claude, "s", func(s model.HookState) model.HookState {
 				s.ToolCalls++
 				return s
 			}); err != nil {
@@ -23,7 +23,7 @@ func TestConcurrentUpdatesAreSerialised(t *testing.T) {
 		}()
 	}
 	wg.Wait()
-	s, err := Load(Path(model.Claude, "s"))
+	s, err := st.Load(st.Path(model.Claude, "s"))
 	if err != nil {
 		t.Fatal(err)
 	}

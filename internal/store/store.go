@@ -17,7 +17,6 @@ import (
 	"golang.org/x/sys/unix"
 
 	"cccp/internal/model"
-	"cccp/internal/paths"
 )
 
 // FileName returns the state file name for a session.
@@ -35,30 +34,37 @@ func sanitize(id string) string {
 	}, id)
 }
 
+// Store is the directory of session state files.
+type Store struct {
+	Dir string
+}
+
+// lockPath is the lock file serialising read-modify-write cycles.
+func (st Store) lockPath() string { return filepath.Join(st.Dir, ".lock") }
+
 // Path returns the absolute state file path for a session.
-func Path(agent model.Agent, sessionID string) string {
-	return filepath.Join(paths.SessionsDir(), FileName(agent, sessionID))
+func (st Store) Path(agent model.Agent, sessionID string) string {
+	return filepath.Join(st.Dir, FileName(agent, sessionID))
 }
 
 // Update applies fn to the session's state under the lock and writes the
 // result atomically. The lock wait is bounded so a wedged writer cannot stall
 // the agent that runs the hook.
-func Update(agent model.Agent, sessionID string, fn func(model.HookState) model.HookState) error {
-	dir := paths.SessionsDir()
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+func (st Store) Update(agent model.Agent, sessionID string, fn func(model.HookState) model.HookState) error {
+	if err := os.MkdirAll(st.Dir, 0o700); err != nil {
 		return err
 	}
-	lf, err := os.OpenFile(paths.SessionsLock(), os.O_CREATE|os.O_RDWR, 0o600)
+	lf, err := os.OpenFile(st.lockPath(), os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return err
 	}
 	defer lf.Close()
 	if err := lockWithTimeout(int(lf.Fd()), 2*time.Second); err != nil {
-		return err
+		return fmt.Errorf("%s: %w", st.lockPath(), err)
 	}
 	defer unix.Flock(int(lf.Fd()), unix.LOCK_UN)
 
-	p := Path(agent, sessionID)
+	p := st.Path(agent, sessionID)
 	var cur model.HookState
 	if b, err := os.ReadFile(p); err == nil {
 		// A corrupt file is replaced rather than wedging the session.
@@ -85,7 +91,7 @@ func lockWithTimeout(fd int, d time.Duration) error {
 			return err
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("timed out waiting for %s", paths.SessionsLock())
+			return errors.New("timed out waiting for the lock")
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
@@ -117,7 +123,7 @@ func WriteAtomic(p string, b []byte) error {
 }
 
 // Load reads one state file.
-func Load(p string) (model.HookState, error) {
+func (Store) Load(p string) (model.HookState, error) {
 	var s model.HookState
 	b, err := os.ReadFile(p)
 	if err != nil {
@@ -134,11 +140,12 @@ func IsStateFile(name string) bool {
 	return strings.HasSuffix(name, ".json") && !strings.HasPrefix(name, ".")
 }
 
-// LoadAll reads every state file. Unreadable files are skipped and reported.
-func LoadAll() (map[string]model.HookState, []error) {
+// LoadAll reads every state file, keyed by path. Unreadable files are skipped
+// and reported.
+func (st Store) LoadAll() (map[string]model.HookState, []error) {
 	out := map[string]model.HookState{}
 	var errs []error
-	ents, err := os.ReadDir(paths.SessionsDir())
+	ents, err := os.ReadDir(st.Dir)
 	if err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
 			errs = append(errs, err)
@@ -149,8 +156,8 @@ func LoadAll() (map[string]model.HookState, []error) {
 		if e.IsDir() || !IsStateFile(e.Name()) {
 			continue
 		}
-		p := filepath.Join(paths.SessionsDir(), e.Name())
-		s, err := Load(p)
+		p := filepath.Join(st.Dir, e.Name())
+		s, err := st.Load(p)
 		if err != nil {
 			errs = append(errs, err)
 			continue
@@ -160,8 +167,8 @@ func LoadAll() (map[string]model.HookState, []error) {
 	return out, errs
 }
 
-// Remove deletes a session's state file.
-func Remove(p string) error {
+// Remove deletes a state file; a missing file is not an error.
+func (Store) Remove(p string) error {
 	err := os.Remove(p)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil

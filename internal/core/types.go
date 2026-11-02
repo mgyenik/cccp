@@ -1,8 +1,10 @@
-// Package engine merges every source (hook state files, the Claude session
-// registry, transcripts, tmux and /proc) into one snapshot of all sessions.
-// It is used by the daemon and, when no daemon is reachable, in-process by
-// the CLI and cockpit.
-package engine
+// Package core is the functional core of cccp. Given a plain-data
+// Observation of every source (hook state files, Claude's session registry,
+// tmux, agent processes, transcripts) and the remembered Memory, Compute
+// derives the Snapshot of all sessions. Nothing in this package performs
+// I/O or reads the clock: every input is a parameter, so every rule is
+// testable with literal values.
+package core
 
 import (
 	"time"

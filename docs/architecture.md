@@ -83,7 +83,7 @@ One Go binary, `cccp`, with subcommands; plus three integration bundles.
    /proc + pidfd ────────────────┤
                                  ▼
                               cccpd  (cccp daemon; systemd --user)
-                                 │ engine: merge → classify → snapshot
+                                 │ gather → core.Compute → machine.Step → effects
         ┌────────────────────────┼───────────────────────────┬───────────────┐
         ▼                        ▼                           ▼               ▼
   tmux options             unix socket subscribers     notify-send      summarizer
@@ -110,47 +110,58 @@ One Go binary, `cccp`, with subcommands; plus three integration bundles.
   on the daemon, and runs in a few milliseconds. `CCCP_INTERNAL=1` in the
   environment makes it a no-op (used by cccp's own `claude -p` summarizer).
 
-### 4.2 `cccp daemon` — engine and side effects
+### 4.2 `cccp daemon`: event loop and effects
 
-A single goroutine owns all state and processes events from a channel:
+The daemon is an imperative shell around a pure state machine (section 10):
+one goroutine turns OS events into machine inputs and executes the effects
+the machine returns. Event sources:
 
 * fsnotify on the cccp state dir and on `~/.claude/sessions/`
 * pidfd exit notifications (one epoll goroutine for all tracked pids)
-* unix-socket messages: tmux pokes (focus/title/pane events), UI requests
-  (subscribe, refresh, seen, alias)
-* one timer, armed for the *earliest* future deadline across all sessions
-  (cache expiry, agy "probably waiting on approval" check)
+* unix-socket messages: tmux pokes (focus and layout events), UI requests
+  (subscribe, refresh, seen, alias, reload)
+* one timer, armed for the earliest deadline the machine names (a prompt
+  cache expiring, or a pending memory save)
+* SIGHUP: reload the configuration
 
-On each event only the affected sessions are recomputed; the resulting
-snapshot is diffed against the previous one and side effects are applied
-only for actual changes:
+Each event marks which sources are stale (`daemon.Scope`): a hook file change
+rereads that file; a session appearing, vanishing or changing process
+triggers a tmux reread and process rescan; a focus change rereads tmux only.
+Bursts are drained into one observation. Effects are applied only for
+actual changes:
 
 * **tmux decoration**: global user option `@cccp_status` (counts, styled),
-  per-window `@cccp_glyph`; set via `tmux set` only when the value changes.
-* **subscribers**: full snapshot pushed to connected cockpits.
-* **notifications**: `notify-send` when a session newly needs you and its
-  pane is not currently visible on a focused client.
+  per-window `@cccp_glyph`; written only when the value changes, and re-sent
+  in full after a tmux restart or a failed write.
+* **subscribers**: the snapshot is pushed to connected cockpits.
+* **notifications**: when a session newly needs you and its pane is not
+  visible on a focused client.
 * **summaries** (optional): see 4.8.
 
 Idle cost: all goroutines block in the kernel (inotify read, epoll_wait,
-accept, a single timer). See section 8.
+accept, one timer). See section 8.
 
-### 4.3 Engine: discovery and merge
+### 4.3 Session identification (`core.identify`)
 
 Session identity is `(agent, session id)`; for unmanaged sessions whose id
 can't be determined, `(agent, "pane:%N")`.
 
-Discovery, on daemon start and on every refresh:
+Sources, in order:
 
-1. cccp state files (hook-observed sessions).
-2. Claude registry files; liveness checked by pid + `procStart`.
-3. tmux panes (`list-panes -a`); for each pane, the process tree under
-   `pane_pid` is searched for a `claude` or `agy` process. A process not
-   already claimed by 1–2 becomes an **unmanaged** session. Its Claude session
-   id is resolved from `--resume <id>` on its command line if present,
-   otherwise by matching the pane title (`✳ <title>`) against `ai-title`
-   entries of transcripts in the project dir for its cwd (most recently
-   modified match wins; ambiguity is recorded and shown).
+1. Hook state files (hook-observed sessions). Print-mode runs are skipped.
+2. Claude registry entries of live user sessions (liveness: pid and
+   `procStart`; `sdk*` entrypoints, i.e. `claude -p`, are skipped).
+3. One current session per process: the registry's, else the hook session
+   with the latest event; others on that process are superseded (a `/clear`
+   without `SessionEnd`).
+4. Agent processes under tmux panes (the shallowest non-print-mode `claude`
+   or `agy` in each pane's process tree). A process no session claims is
+   **unmanaged**. Its Claude session id comes from `--resume <uuid>` if
+   present, otherwise from matching the pane title (`✳ <title>`) against
+   `ai-title` entries in its project directory (newest untaken match). An
+   agy process gets the newest untaken conversation in its directory modified
+   since it started. Processes are matched newest first, and each
+   conversation is assigned once.
 
 Pane association: hook `$TMUX_PANE` → registry `tmux` field →
 `/proc/<pid>/environ` `TMUX_PANE`.
@@ -273,8 +284,8 @@ pane if the session is running, or resumes it in a new tmux window if not.
 ### 4.10 Cockpit (`cccp ui`)
 
 Bubbletea v2 + Lipgloss v2 + Bubbles v2. Talks to the daemon over the
-socket; if the daemon is unreachable it runs the same engine in-process
-(with no seen-tracking history), so it always works.
+socket; if the daemon is unreachable it gathers and computes in-process
+(reading, never writing, the daemon's memory), so it always works.
 
 * Header: counts per group, power state.
 * Grouped list; row = state glyph, agent badge, tmux location, title, project,
@@ -369,12 +380,12 @@ Built as designed, with these differences and measured results.
   agy turn/cancel/error); hook payload parsing (documented Claude payloads,
   an agy payload captured live); transcript reader (window growth, partial
   final line, pending tool, interrupt, TTL bucket, sidechain exclusion);
-  engine merge rule, grouping, seen/unseen, pid supersession, registry
+  core merge rule, grouping, seen/unseen, pid supersession, registry
   busy→idle completions; store lock under 50 concurrent writers; search
   extraction (tool output excluded, incremental); `/proc` stat parsing.
 * Daemon integration test: the real daemon over a temp state dir; a hook
   state write reaches a socket subscriber via inotify; request/response ops.
-  Race detector clean on daemon, store and engine.
+  Race detector clean on every package.
 * End to end with a real `claude -p` run using the plugin from a scratch
   directory (`--plugin-dir`): prompt, tool call, final message, turn end
   and session end recorded, with the agent's pid and tmux pane.
@@ -420,7 +431,74 @@ Built as designed, with these differences and measured results.
   across sessions (logged out, usage limit) pause all summaries for 15 min.
   Before this, a failing `claude -p` was respawned on every recompute.
 * **Notifications are logged** (`journalctl --user -u cccp`) with session,
-  group and location, and the notifier is injected; the daemon tests install
-  a recording notifier in `TestMain`, so tests never reach the desktop. (The
-  original daemon integration test used the default config and sent a real
-  notification on every `go test` run.)
+  group and location. (The original daemon integration test used the default
+  config and sent a real notification on every `go test` run; on mains power
+  it would also have run a real `claude -p`. Section 10 describes the
+  architecture that replaced it.)
+
+## 10. Code architecture: functional core, imperative shell
+
+Rewritten 2026-11-02 after the test leaks above. The rule: every decision is
+made by a pure function or a deterministic state machine that takes all its
+inputs as values; the code that touches the world is thin enough to check by
+reading, and is reached only through interfaces.
+
+### Packages
+
+| Package | Kind | Role |
+|---|---|---|
+| `model` | pure | data types: hook state and events, registry entry, transcript metadata, tmux panes and clients, agy conversations |
+| `reduce` | pure | hook events → `HookState` (a state machine per session) |
+| `core` | pure | `Plan(Observation) Needs`; `Compute(Observation, Memory, Config, watchStart, now) (Snapshot, Memory)`; `NextAttention`, `PlanJump`, `NextDeadline`, `Expired` |
+| `machine` | pure | the daemon as a state machine: `Step(Input) []Effect`; notification de-duplication, tmux diffing, summary queue and backoff, save debounce, timer, pruning |
+| `present`, `config` | pure | formatting; configuration type, defaults and `Parse` |
+| `gather` | shell | builds an `Observation` from interfaces (`HookStore`, `Registry`, `TmuxReader`, `Procs`, `Transcripts`, `Files`, `AgyDB`, `Power`), refreshing only what an event made stale |
+| `daemon` | shell | event loop: OS events → machine inputs; effects → ports (`TmuxWriter`, `Notifier`, `Summarizer`, `MemoryStore`, `FileRemover`) |
+| `hook` | shell | `Handle(Deps, agent, stdin, now)`; payload parsing is pure |
+| `install` | shell | install/uninstall through a command runner and a tmux runner; `tmux.conf` edits are pure |
+| `store`, `claudereg`, `transcript`, `agydb`, `procs`, `tmux`, `power`, `memfile`, `search`, `ipc` | adapters | one external resource each |
+| `ui` | Elm architecture | Bubble Tea model over `Source`, `Actions`, `Searcher`, `PaneCapturer` interfaces |
+| `paths` | pure | `Resolve(getenv, home, uid) Layout` |
+| `cmd/cccp` | composition root | the only code that reads the environment and constructs real adapters |
+
+### Rules, and how they are enforced
+
+* **Pure packages perform no I/O and depend on no adapter.**
+  `internal/archtest` parses their imports and fails on any I/O package (`os`,
+  `net`, `syscall`, `log`, …) or any cccp package outside the allowed set.
+* **No global state, no environment reads below the root.** Paths, sockets
+  and the tmux server are values passed in; `paths.Resolve` is called once,
+  in `cmd/cccp`.
+* **Real adapters refuse to act inside a test binary.** The notifier, the
+  summarizer and a tmux client for the default server return an error under
+  `testing.Testing()`, so a test that forgets a fake fails instead of
+  touching the desktop, the user's tmux or their Claude subscription.
+* **The core is deterministic.** Maps are iterated in sorted order and ties
+  are broken explicitly; `TestComputeIsDeterministic` and the machine's
+  `TestDeterministic` check it.
+
+### Test tiers
+
+1. **Pure unit tests** (the bulk): `reduce`, `core`, `machine`, `present`,
+   `config`, `paths`, `install`'s conf edits. Literal values in, values out.
+   The core and machine rules were mutation-tested: each rule was broken
+   on purpose and the suite had to fail. Every mutant was killed except one
+   equivalent mutant (`outKnown &&` in the quiet-pane inference: an unknown
+   output age is zero, which is never at or past the threshold).
+2. **Shell logic with fakes**: `gather` (bookkeeping, rediscovery rules,
+   which transcripts are read, the miss cache), `daemon` (real fsnotify,
+   socket and timer in a temp dir; every port faked), `hook.Handle`,
+   `install` (commands issued, files written, the restore round trip), `ui`
+   (keys, filter, search, jump, preview).
+3. **Adapter contract tests against sandboxed real resources**: `store`
+   (50 concurrent writers under the lock), `transcript` (windowed backward
+   scan, partial lines), `search` (extraction, incremental updates), `procs`
+   (its own process), `memfile`, and the pidfd watcher (a real child
+   process killed while watched).
+4. **Manual end-to-end** (not in `go test`, because they cost money or touch
+   the user's environment): a `claude -p --plugin-dir` run with a scratch
+   copy of the plugin, the cockpit rendered in an isolated tmux server
+   (`tmux -L`), and the installed daemon checked with `cccp doctor`.
+
+`go test -race ./...` runs tiers 1 to 3 in about a second, with no network,
+no subprocess other than `sleep`, and nothing outside temp directories.

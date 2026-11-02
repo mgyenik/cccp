@@ -24,7 +24,6 @@ import (
 	"unicode/utf8"
 
 	"cccp/internal/model"
-	"cccp/internal/paths"
 	"cccp/internal/store"
 )
 
@@ -52,7 +51,13 @@ type Hit struct {
 	Matches int       `json:"matches"` // matching messages in this session
 }
 
-func textDir() string { return filepath.Join(paths.CacheDir(), "text") }
+// Index is the extracted-text cache and the transcript directories it is
+// built from.
+type Index struct {
+	TextDir           string
+	ClaudeProjectsDir string
+	AgyBrainDir       string
+}
 
 func docName(a model.Agent, id string) string {
 	return store.FileName(a, id) // "<agent>-<id>.json"; the text file shares the stem
@@ -60,24 +65,24 @@ func docName(a model.Agent, id string) string {
 
 // Update brings the extracted text up to date with every transcript and
 // returns the number of transcripts that had new content.
-func Update() (int, error) {
-	if err := os.MkdirAll(textDir(), 0o700); err != nil {
+func (ix Index) Update() (int, error) {
+	if err := os.MkdirAll(ix.TextDir, 0o700); err != nil {
 		return 0, err
 	}
 	sources := map[string]Doc{}
-	claude, _ := filepath.Glob(filepath.Join(paths.ClaudeProjectsDir(), "*", "*.jsonl"))
+	claude, _ := filepath.Glob(filepath.Join(ix.ClaudeProjectsDir, "*", "*.jsonl"))
 	for _, p := range claude {
 		id := strings.TrimSuffix(filepath.Base(p), ".jsonl")
 		sources[docName(model.Claude, id)] = Doc{Agent: model.Claude, SessionID: id, Source: p}
 	}
-	agy, _ := filepath.Glob(filepath.Join(paths.AgyDir(), "brain", "*", ".system_generated", "logs", "transcript_full.jsonl"))
+	agy, _ := filepath.Glob(filepath.Join(ix.AgyBrainDir, "*", ".system_generated", "logs", "transcript_full.jsonl"))
 	for _, p := range agy {
 		id := filepath.Base(filepath.Dir(filepath.Dir(filepath.Dir(p))))
 		sources[docName(model.Agy, id)] = Doc{Agent: model.Agy, SessionID: id, Source: p}
 	}
 	changed := 0
 	for name, d := range sources {
-		ok, err := updateOne(name, d)
+		ok, err := ix.updateOne(name, d)
 		if err != nil {
 			continue
 		}
@@ -86,25 +91,25 @@ func Update() (int, error) {
 		}
 	}
 	// Drop text whose transcript is gone.
-	ents, _ := os.ReadDir(textDir())
+	ents, _ := os.ReadDir(ix.TextDir)
 	for _, e := range ents {
 		n := e.Name()
 		if strings.HasSuffix(n, ".json") {
 			if _, ok := sources[n]; !ok {
-				os.Remove(filepath.Join(textDir(), n))
-				os.Remove(filepath.Join(textDir(), strings.TrimSuffix(n, ".json")+".txt"))
+				os.Remove(filepath.Join(ix.TextDir, n))
+				os.Remove(filepath.Join(ix.TextDir, strings.TrimSuffix(n, ".json")+".txt"))
 			}
 		}
 	}
 	return changed, nil
 }
 
-func updateOne(name string, src Doc) (bool, error) {
+func (ix Index) updateOne(name string, src Doc) (bool, error) {
 	fi, err := os.Stat(src.Source)
 	if err != nil {
 		return false, err
 	}
-	metaPath := filepath.Join(textDir(), name)
+	metaPath := filepath.Join(ix.TextDir, name)
 	txtPath := strings.TrimSuffix(metaPath, ".json") + ".txt"
 	var d Doc
 	if b, err := os.ReadFile(metaPath); err == nil {
@@ -331,11 +336,11 @@ func ParseQuery(q string) Query {
 // Run searches the extracted text. Results are grouped per session: the
 // most recent matching message represents its session, sessions ordered by
 // that message's time, newest first.
-func Run(q Query, limit int) ([]Hit, error) {
+func (ix Index) Run(q Query, limit int) ([]Hit, error) {
 	if len(q.Terms) == 0 {
 		return nil, errors.New("empty query")
 	}
-	ents, err := os.ReadDir(textDir())
+	ents, err := os.ReadDir(ix.TextDir)
 	if err != nil {
 		return nil, err
 	}
@@ -344,7 +349,7 @@ func Run(q Query, limit int) ([]Hit, error) {
 		if !strings.HasSuffix(e.Name(), ".json") {
 			continue
 		}
-		metaPath := filepath.Join(textDir(), e.Name())
+		metaPath := filepath.Join(ix.TextDir, e.Name())
 		var d Doc
 		b, err := os.ReadFile(metaPath)
 		if err != nil || json.Unmarshal(b, &d) != nil {

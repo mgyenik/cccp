@@ -157,27 +157,37 @@ func Snapshot() Table {
 	return t
 }
 
-// FindAgentBelow searches the process tree under root (inclusive,
-// breadth-first) for an agent process and returns the shallowest one for
-// which accept (if non-nil) returns true.
-func (t Table) FindAgentBelow(root int, accept func(Stat) bool) (Stat, string, bool) {
-	queue := []int{root}
+// Found is an agent process in a process tree.
+type Found struct {
+	Stat  Stat
+	Agent string
+	Depth int // 0 = root itself
+}
+
+// AgentsBelow lists every agent process in the tree under root (inclusive),
+// breadth-first, with its depth below root.
+func (t Table) AgentsBelow(root int) []Found {
+	type item struct{ pid, depth int }
+	var out []Found
+	queue := []item{{root, 0}}
 	seen := map[int]bool{}
 	for len(queue) > 0 {
-		pid := queue[0]
+		it := queue[0]
 		queue = queue[1:]
-		if seen[pid] {
+		if seen[it.pid] {
 			continue
 		}
-		seen[pid] = true
-		if st, ok := t.ByPID[pid]; ok {
-			if a, ok := IsAgentComm(st.Comm); ok && (accept == nil || accept(st)) {
-				return st, a, true
+		seen[it.pid] = true
+		if st, ok := t.ByPID[it.pid]; ok {
+			if a, ok := IsAgentComm(st.Comm); ok {
+				out = append(out, Found{Stat: st, Agent: a, Depth: it.depth})
 			}
 		}
-		queue = append(queue, t.Children[pid]...)
+		for _, c := range t.Children[it.pid] {
+			queue = append(queue, item{c, it.depth + 1})
+		}
 	}
-	return Stat{}, "", false
+	return out
 }
 
 // userHZ is the unit of /proc/<pid>/stat start times. The kernel exports
@@ -202,20 +212,20 @@ func StartWall(startTicks uint64) time.Time {
 	return time.Time{}
 }
 
-// IsPrintMode reports whether an agent command line runs non-interactively.
-// Both claude and agy use -p / --print (agy also --prompt).
-func IsPrintMode(args []string) bool {
-	if len(args) == 0 {
-		return false
-	}
-	for _, a := range args[1:] {
-		switch {
-		case a == "--":
-			return false
-		case a == "-p", a == "--print", a == "--prompt",
-			strings.HasPrefix(a, "--print="), strings.HasPrefix(a, "--prompt="):
-			return true
-		}
-	}
-	return false
-}
+// System reads the real /proc.
+type System struct{}
+
+// Snapshot reads every process once.
+func (System) Snapshot() Table { return Snapshot() }
+
+// Alive reports whether pid runs and is the recorded process.
+func (System) Alive(pid int, start uint64) bool { return Alive(pid, start) }
+
+// Cmdline returns the argv of pid.
+func (System) Cmdline(pid int) []string { return Cmdline(pid) }
+
+// Cwd returns the working directory of pid.
+func (System) Cwd(pid int) string { return Cwd(pid) }
+
+// StartWall converts a start time to wall-clock time.
+func (System) StartWall(ticks uint64) time.Time { return StartWall(ticks) }

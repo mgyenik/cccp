@@ -11,17 +11,16 @@ import (
 	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
 
-	"cccp/internal/engine"
+	"cccp/internal/core"
 	"cccp/internal/model"
 	"cccp/internal/present"
 	"cccp/internal/search"
-	"cccp/internal/tmux"
 )
 
 // Source feeds snapshots to the cockpit.
 type Source interface {
 	// Start begins delivering snapshots through send.
-	Start(send func(engine.Snapshot))
+	Start(send func(core.Snapshot))
 	// Refresh asks for a full rescan.
 	Refresh()
 	// Daemon reports whether a daemon serves the snapshots.
@@ -31,17 +30,28 @@ type Source interface {
 
 // Actions are side effects the cockpit asks for.
 type Actions struct {
-	Jump  func(s engine.Session) error
+	Jump  func(s core.Session) error
 	Alias func(key, value string) error
 	Seen  func(key string) error
 }
 
+// Searcher is transcript full-text search (search.Index).
+type Searcher interface {
+	Update() (int, error)
+	Run(q search.Query, limit int) ([]search.Hit, error)
+}
+
+// PaneCapturer captures a tmux pane's contents.
+type PaneCapturer interface {
+	CapturePane(pane string, ansi bool, lines int) (string, error)
+}
+
 // Options configure the cockpit.
 type Options struct {
-	Client  string
 	Source  Source
 	Actions Actions
-	Tmux    *tmux.Client
+	Panes   PaneCapturer // nil: no live preview
+	Search  Searcher     // nil: search disabled
 }
 
 type mode int
@@ -54,7 +64,7 @@ const (
 	modeAlias
 )
 
-type snapMsg engine.Snapshot
+type snapMsg core.Snapshot
 type tickMsg time.Time
 type previewMsg struct {
 	key  string
@@ -73,7 +83,7 @@ type doneMsg struct{ err error }
 type Model struct {
 	opt Options
 
-	snap    engine.Snapshot
+	snap    core.Snapshot
 	hasSnap bool
 	now     time.Time
 
@@ -130,7 +140,7 @@ func New(opt Options) *Model {
 func Run(opt Options) error {
 	m := New(opt)
 	p := tea.NewProgram(m)
-	opt.Source.Start(func(s engine.Snapshot) { p.Send(snapMsg(s)) })
+	opt.Source.Start(func(s core.Snapshot) { p.Send(snapMsg(s)) })
 	defer opt.Source.Close()
 	_, err := p.Run()
 	return err
@@ -144,11 +154,11 @@ func tick() tea.Cmd {
 func (m *Model) Init() tea.Cmd { return tick() }
 
 // visible returns the sessions shown in the list, in order.
-func (m *Model) visible() []engine.Session {
-	var out []engine.Session
+func (m *Model) visible() []core.Session {
+	var out []core.Session
 	f := strings.ToLower(strings.TrimSpace(m.filter.Value()))
 	for _, s := range m.snap.Sessions {
-		if s.Group == engine.GroupEnded && !m.showEnded && f == "" {
+		if s.Group == core.GroupEnded && !m.showEnded && f == "" {
 			continue
 		}
 		if f != "" && !matches(s, f) {
@@ -159,7 +169,7 @@ func (m *Model) visible() []engine.Session {
 	return out
 }
 
-func matches(s engine.Session, f string) bool {
+func matches(s core.Session, f string) bool {
 	hay := strings.ToLower(strings.Join([]string{
 		s.DisplayTitle(), s.Title, s.Cwd, s.Location, s.TmuxSess, string(s.Agent),
 		s.Group.String(), string(s.Activity), s.LastPrompt, s.Summary, s.SessionID,
@@ -172,10 +182,10 @@ func matches(s engine.Session, f string) bool {
 	return true
 }
 
-func (m *Model) selected() (engine.Session, bool) {
+func (m *Model) selected() (core.Session, bool) {
 	v := m.visible()
 	if m.cursor < 0 || m.cursor >= len(v) {
-		return engine.Session{}, false
+		return core.Session{}, false
 	}
 	return v[m.cursor], true
 }
@@ -195,7 +205,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.loadPreview()
 
 	case snapMsg:
-		m.snap, m.hasSnap = engine.Snapshot(msg), true
+		m.snap, m.hasSnap = core.Snapshot(msg), true
 		m.restoreSelection()
 		return m, m.loadPreview()
 
@@ -328,9 +338,13 @@ func (m *Model) key(k tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			if strings.TrimSpace(q) == "" {
 				return m, nil
 			}
+			if m.opt.Search == nil {
+				m.searchInfo = "search is not available"
+				return m, nil
+			}
 			m.searching = true
 			m.searchInfo = "searching…"
-			return m, runSearch(q)
+			return m, runSearch(m.opt.Search, q)
 		}
 		var cmd tea.Cmd
 		m.query, cmd = m.query.Update(k)
@@ -476,7 +490,7 @@ func (m *Model) openHit() tea.Cmd {
 		return nil
 	}
 	h := m.hits[m.hitCursor]
-	target := engine.Session{Key: h.Doc.Key(), Agent: h.Doc.Agent, SessionID: h.Doc.SessionID, Cwd: h.Doc.Cwd, Title: h.Doc.Title}
+	target := core.Session{Key: h.Doc.Key(), Agent: h.Doc.Agent, SessionID: h.Doc.SessionID, Cwd: h.Doc.Cwd, Title: h.Doc.Title}
 	for _, s := range m.snap.Sessions {
 		if s.Key == target.Key {
 			target = s
@@ -486,19 +500,19 @@ func (m *Model) openHit() tea.Cmd {
 	return func() tea.Msg { return doneMsg{err: jump(target)} }
 }
 
-func runSearch(q string) tea.Cmd {
+func runSearch(ix Searcher, q string) tea.Cmd {
 	return func() tea.Msg {
 		start := time.Now()
-		if _, err := search.Update(); err != nil {
+		if _, err := ix.Update(); err != nil {
 			return searchMsg{query: q, err: err}
 		}
-		hits, err := search.Run(search.ParseQuery(q), 200)
+		hits, err := ix.Run(search.ParseQuery(q), 200)
 		return searchMsg{query: q, hits: hits, err: err, took: time.Since(start)}
 	}
 }
 
 // effectivePreview resolves previewAuto for a session.
-func (m *Model) effectivePreview(s engine.Session) previewMode {
+func (m *Model) effectivePreview(s core.Session) previewMode {
 	if m.preview != previewAuto {
 		return m.preview
 	}
@@ -518,10 +532,10 @@ func (m *Model) loadPreview() tea.Cmd {
 	if s.Key != m.previewKey {
 		m.previewKey, m.previewText = s.Key, ""
 	}
-	if m.effectivePreview(s) != previewPane || s.Pane == "" || m.opt.Tmux == nil {
+	if m.effectivePreview(s) != previewPane || s.Pane == "" || m.opt.Panes == nil {
 		return nil
 	}
-	tm, key, pane := m.opt.Tmux, s.Key, s.Pane
+	tm, key, pane := m.opt.Panes, s.Key, s.Pane
 	return func() tea.Msg {
 		out, err := tm.CapturePane(pane, true, 0)
 		return previewMsg{key: key, text: out, err: err}
@@ -547,17 +561,17 @@ var (
 	sKeyHint = lipgloss.NewStyle().Foreground(cGray)
 )
 
-func groupStyle(g engine.Group) lipgloss.Style {
+func groupStyle(g core.Group) lipgloss.Style {
 	switch g {
-	case engine.GroupNeedsYou:
+	case core.GroupNeedsYou:
 		return lipgloss.NewStyle().Foreground(cYellow).Bold(true)
-	case engine.GroupYourTurn:
+	case core.GroupYourTurn:
 		return lipgloss.NewStyle().Foreground(cGreen).Bold(true)
-	case engine.GroupWorking:
+	case core.GroupWorking:
 		return lipgloss.NewStyle().Foreground(cCyan)
-	case engine.GroupCold:
+	case core.GroupCold:
 		return lipgloss.NewStyle().Foreground(cBlue)
-	case engine.GroupEnded, engine.GroupUnknown:
+	case core.GroupEnded, core.GroupUnknown:
 		return lipgloss.NewStyle().Foreground(cGray)
 	}
 	return lipgloss.NewStyle()
@@ -599,8 +613,8 @@ func (m *Model) render() string {
 func (m *Model) renderHeader() string {
 	c := m.snap.Counts()
 	var parts []string
-	for _, g := range engine.Groups {
-		if g == engine.GroupEnded {
+	for _, g := range core.Groups {
+		if g == core.GroupEnded {
 			continue
 		}
 		if n := c[g]; n > 0 {
@@ -688,7 +702,7 @@ func (m *Model) renderList(w, h int) string {
 		row  int // session index, -1 for headers
 	}
 	var lines []line
-	last := engine.Group(-1)
+	last := core.Group(-1)
 	for i, s := range vis {
 		if s.Group != last {
 			lines = append(lines, line{groupStyle(s.Group).Render(s.Group.String()), -1})
@@ -747,7 +761,7 @@ func pad(s string, n int) string {
 	return s + strings.Repeat(" ", n-w)
 }
 
-func (m *Model) renderRow(s engine.Session, w int, cursor bool) string {
+func (m *Model) renderRow(s core.Session, w int, cursor bool) string {
 	g := present.Glyph(s)
 	if s.Inferred {
 		g += "~"
@@ -783,7 +797,7 @@ func (m *Model) renderRow(s engine.Session, w int, cursor bool) string {
 }
 
 // glyphStyled colours the glyph at the start of a row.
-func glyphStyled(s engine.Session, left string) string {
+func glyphStyled(s core.Session, left string) string {
 	r := []rune(left)
 	if len(r) < 2 {
 		return left
@@ -801,7 +815,7 @@ func nonEmpty(xs ...string) []string {
 	return out
 }
 
-func (m *Model) renderPreview(s engine.Session, pm previewMode, w, h int) string {
+func (m *Model) renderPreview(s core.Session, pm previewMode, w, h int) string {
 	if w < 10 || h < 2 {
 		return ""
 	}
@@ -833,7 +847,7 @@ func (m *Model) renderPreview(s engine.Session, pm previewMode, w, h int) string
 	for _, l := range info {
 		b.WriteString(sDim.Render(ansi.Truncate(l, w, "…")) + "\n")
 	}
-	if d := present.Detail(s); d != "" && (s.Group == engine.GroupNeedsYou || s.Activity == model.Working) {
+	if d := present.Detail(s); d != "" && (s.Group == core.GroupNeedsYou || s.Activity == model.Working) {
 		b.WriteString(groupStyle(s.Group).Render(ansi.Truncate(d, w, "…")) + "\n")
 	}
 	b.WriteString("\n")
@@ -867,7 +881,7 @@ func tailLines(text string, w, n int) string {
 	return strings.Join(lines, "\n")
 }
 
-func (m *Model) conversation(s engine.Session, w, h int) string {
+func (m *Model) conversation(s core.Session, w, h int) string {
 	var parts []string
 	if s.Summary != "" {
 		parts = append(parts, lipgloss.NewStyle().Foreground(cGreen).Render("summary: ")+s.Summary, "")
@@ -919,7 +933,7 @@ func (m *Model) renderHits(w, h int) string {
 	if m.hitCursor >= m.hitOffset+visible {
 		m.hitOffset = m.hitCursor - visible + 1
 	}
-	live := map[string]engine.Session{}
+	live := map[string]core.Session{}
 	for _, s := range m.snap.Sessions {
 		live[s.Key] = s
 	}

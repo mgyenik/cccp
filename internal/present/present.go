@@ -6,37 +6,37 @@ import (
 	"strings"
 	"time"
 
-	"cccp/internal/engine"
+	"cccp/internal/core"
 	"cccp/internal/model"
 )
 
 // Glyph is the one-character marker for a session's group.
-func Glyph(s engine.Session) string {
+func Glyph(s core.Session) string {
 	switch s.Group {
-	case engine.GroupNeedsYou:
+	case core.GroupNeedsYou:
 		if s.Activity == model.Errored {
 			return "✗"
 		}
 		return "⚠"
-	case engine.GroupYourTurn:
+	case core.GroupYourTurn:
 		return "⏎"
-	case engine.GroupWorking:
+	case core.GroupWorking:
 		return "●"
-	case engine.GroupIdle:
+	case core.GroupIdle:
 		return "○"
-	case engine.GroupCold:
+	case core.GroupCold:
 		return "❄"
-	case engine.GroupUnknown:
+	case core.GroupUnknown:
 		return "?"
-	case engine.GroupEnded:
+	case core.GroupEnded:
 		return "·"
 	}
 	return " "
 }
 
 // GroupGlyph is the glyph for a group.
-func GroupGlyph(g engine.Group) string {
-	return Glyph(engine.Session{Group: g})
+func GroupGlyph(g core.Group) string {
+	return Glyph(core.Session{Group: g})
 }
 
 // AgentBadge is a two-letter agent marker.
@@ -75,8 +75,8 @@ func Since(now, t time.Time) string {
 }
 
 // CacheText describes the cache state: "warm 42m", "cold 3h", or "".
-func CacheText(s engine.Session, now time.Time) string {
-	if !s.Cache.Known || s.Group == engine.GroupWorking || s.Group == engine.GroupEnded {
+func CacheText(s core.Session, now time.Time) string {
+	if !s.Cache.Known || s.Group == core.GroupWorking || s.Group == core.GroupEnded {
 		return ""
 	}
 	suffix := ""
@@ -104,7 +104,7 @@ func Tokens(n int) string {
 
 // Detail is the most useful one-line description of what a session is doing
 // or waiting on.
-func Detail(s engine.Session) string {
+func Detail(s core.Session) string {
 	switch {
 	case s.Activity == model.Errored && s.Error != "":
 		return "error: " + s.Error
@@ -115,9 +115,9 @@ func Detail(s engine.Session) string {
 			return s.Tool + ": " + s.ToolDetail
 		}
 		return s.Tool
-	case s.Summary != "" && (s.Group == engine.GroupYourTurn || s.Group == engine.GroupNeedsYou):
+	case s.Summary != "" && (s.Group == core.GroupYourTurn || s.Group == core.GroupNeedsYou):
 		return s.Summary
-	case s.Group == engine.GroupYourTurn && s.LastMessage != "":
+	case s.Group == core.GroupYourTurn && s.LastMessage != "":
 		return LastLine(s.LastMessage)
 	case s.LastPrompt != "":
 		return "› " + OneLine(s.LastPrompt)
@@ -145,19 +145,19 @@ func LastLine(s string) string {
 
 // StatusSegment renders counts for the tmux status line, with tmux style
 // sequences. Empty groups are omitted; an empty string means nothing to show.
-func StatusSegment(snap engine.Snapshot) string {
+func StatusSegment(snap core.Snapshot) string {
 	c := snap.Counts()
 	var parts []string
-	add := func(g engine.Group, style string) {
+	add := func(g core.Group, style string) {
 		if n := c[g]; n > 0 {
 			parts = append(parts, fmt.Sprintf("#[%s]%s%d#[default]", style, GroupGlyph(g), n))
 		}
 	}
-	add(engine.GroupNeedsYou, "fg=yellow,bold")
-	add(engine.GroupYourTurn, "fg=green,bold")
-	add(engine.GroupWorking, "fg=cyan")
-	add(engine.GroupIdle, "fg=default")
-	add(engine.GroupCold, "fg=blue")
+	add(core.GroupNeedsYou, "fg=yellow,bold")
+	add(core.GroupYourTurn, "fg=green,bold")
+	add(core.GroupWorking, "fg=cyan")
+	add(core.GroupIdle, "fg=default")
+	add(core.GroupCold, "fg=blue")
 	if len(parts) == 0 {
 		return ""
 	}
@@ -165,10 +165,10 @@ func StatusSegment(snap engine.Snapshot) string {
 }
 
 // PlainStatus renders counts without tmux styles.
-func PlainStatus(snap engine.Snapshot) string {
+func PlainStatus(snap core.Snapshot) string {
 	c := snap.Counts()
 	var parts []string
-	for _, g := range []engine.Group{engine.GroupNeedsYou, engine.GroupYourTurn, engine.GroupWorking, engine.GroupIdle, engine.GroupCold, engine.GroupUnknown} {
+	for _, g := range []core.Group{core.GroupNeedsYou, core.GroupYourTurn, core.GroupWorking, core.GroupIdle, core.GroupCold, core.GroupUnknown} {
 		if n := c[g]; n > 0 {
 			parts = append(parts, fmt.Sprintf("%s%d", GroupGlyph(g), n))
 		}
@@ -178,10 +178,10 @@ func PlainStatus(snap engine.Snapshot) string {
 
 // WindowGlyphs computes the @cccp_glyph value for every tmux window holding a
 // session: the most urgent session in the window decides.
-func WindowGlyphs(snap engine.Snapshot) map[string]string {
-	best := map[string]engine.Session{}
+func WindowGlyphs(snap core.Snapshot) map[string]string {
+	best := map[string]core.Session{}
 	for _, s := range snap.Sessions {
-		if s.WindowID == "" || s.Group == engine.GroupEnded {
+		if s.WindowID == "" || s.Group == core.GroupEnded {
 			continue
 		}
 		if cur, ok := best[s.WindowID]; !ok || s.Group < cur.Group {
@@ -191,17 +191,17 @@ func WindowGlyphs(snap engine.Snapshot) map[string]string {
 	out := map[string]string{}
 	for w, s := range best {
 		switch s.Group {
-		case engine.GroupNeedsYou:
+		case core.GroupNeedsYou:
 			out[w] = "#[fg=yellow,bold]" + Glyph(s) + "#[default] "
-		case engine.GroupYourTurn:
+		case core.GroupYourTurn:
 			out[w] = "#[fg=green,bold]⏎#[default] "
-		case engine.GroupWorking:
+		case core.GroupWorking:
 			out[w] = "#[fg=cyan]●#[default] "
-		case engine.GroupCold:
+		case core.GroupCold:
 			out[w] = "#[fg=blue]❄#[default] "
-		case engine.GroupIdle:
+		case core.GroupIdle:
 			out[w] = "○ "
-		case engine.GroupUnknown:
+		case core.GroupUnknown:
 			out[w] = "? "
 		}
 	}

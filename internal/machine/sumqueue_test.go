@@ -1,7 +1,6 @@
-package daemon
+package machine
 
 import (
-	"errors"
 	"testing"
 	"time"
 )
@@ -39,7 +38,7 @@ func TestSumQueueBackoffStopsRespawnLoop(t *testing.T) {
 	job := summaryJob{key: "a", hash: "h1"}
 	q.offer(job, q0)
 	q.next(q0)
-	q.done(summaryResult{key: "a", err: errors.New("not logged in")}, "h1", q0)
+	q.done("a", "h1", true, q0)
 	// The daemon recomputes right after a result: the same input must not
 	// be queued again during the backoff.
 	if q.offer(job, q0.Add(time.Second)) {
@@ -49,7 +48,7 @@ func TestSumQueueBackoffStopsRespawnLoop(t *testing.T) {
 		t.Fatal("not retried after the backoff")
 	}
 	q.next(q0.Add(backoffBase + time.Second))
-	q.done(summaryResult{key: "a", err: errors.New("again")}, "h1", q0.Add(backoffBase+time.Second))
+	q.done("a", "h1", true, q0.Add(backoffBase+time.Second))
 	if q.offer(job, q0.Add(2*backoffBase)) {
 		t.Fatal("second backoff should be twice as long")
 	}
@@ -67,7 +66,7 @@ func TestSumQueuePausesAfterConsecutiveFailures(t *testing.T) {
 		if _, ok := q.next(q0); !ok {
 			t.Fatalf("job %d did not start", i)
 		}
-		paused = q.done(summaryResult{key: k, err: errors.New("usage limit")}, "h", q0)
+		paused = q.done(k, "h", true, q0)
 	}
 	if !paused {
 		t.Fatal("three consecutive failures should pause")
@@ -84,10 +83,10 @@ func TestSumQueueSuccessResetsFailures(t *testing.T) {
 	q := newSumQueue()
 	q.offer(summaryJob{key: "a", hash: "h"}, q0)
 	q.next(q0)
-	q.done(summaryResult{key: "a", err: errors.New("x")}, "h", q0)
+	q.done("a", "h", true, q0)
 	q.offer(summaryJob{key: "b", hash: "h"}, q0)
 	q.next(q0)
-	q.done(summaryResult{key: "b"}, "h", q0)
+	q.done("b", "h", false, q0)
 	if q.consecutive != 0 {
 		t.Fatal("success should reset the consecutive count")
 	}

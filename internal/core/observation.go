@@ -1,0 +1,114 @@
+package core
+
+import (
+	"time"
+
+	"cccp/internal/model"
+)
+
+// Observation is everything the imperative shell read from the world, as
+// plain data. It is gathered in two phases: the base fields first, then the
+// transcripts that Plan says are needed.
+type Observation struct {
+	Hooks    []HookRecord
+	Registry []RegistryRecord
+	Tmux     TmuxView
+	// Agents are the agent processes found in tmux panes' process trees.
+	Agents []AgentProc
+
+	OnBattery bool
+	Hostname  string
+
+	// AgyConversations is agy's conversation summary table, by id.
+	AgyConversations map[string]model.AgyConversation
+
+	// Second phase, filled according to Plan's Needs.
+	ClaudeTranscripts map[string]ClaudeTranscript    // by session id
+	AgyTranscripts    map[string]AgyTranscript       // by conversation id
+	Projects          map[string][]ProjectTranscript // by cwd; a present key means "listed" (possibly empty)
+
+	// Problems are read errors worth showing the user.
+	Problems []string
+}
+
+// HookRecord is one hook state file.
+type HookRecord struct {
+	Path  string
+	State model.HookState
+	// ProcAlive: the agent process the hook recorded (pid and start time)
+	// still runs.
+	ProcAlive bool
+}
+
+// RegistryRecord is one Claude Code registry file.
+type RegistryRecord struct {
+	Path  string
+	Entry model.RegistryEntry
+	// Alive: the registered process (pid and start time) still runs.
+	Alive bool
+}
+
+// TmuxView is the tmux server's panes and clients.
+type TmuxView struct {
+	OK      bool
+	Err     string
+	Panes   []model.TmuxPane
+	Clients []model.TmuxClient
+}
+
+// AgentProc is an agent process found under a tmux pane.
+type AgentProc struct {
+	PID       int
+	Start     uint64 // /proc start time, guards against pid reuse
+	StartedAt time.Time
+	Agent     model.Agent
+	Pane      string
+	// Depth below the pane's own process (0 = the pane process itself).
+	Depth   int
+	Cmdline []string
+	Cwd     string
+}
+
+// ClaudeTranscript is a located and parsed Claude transcript.
+type ClaudeTranscript struct {
+	Path string
+	Meta model.ClaudeMeta
+}
+
+// AgyTranscript is a located and parsed agy transcript.
+type AgyTranscript struct {
+	Path string
+	Meta model.AgyMeta
+}
+
+// ProjectTranscript is one transcript in a Claude project directory, used to
+// match an unmanaged session's pane title to its conversation.
+type ProjectTranscript struct {
+	SessionID string
+	Path      string
+	ModTime   time.Time
+	Meta      model.ClaudeMeta
+}
+
+// Needs lists the transcripts Compute will use, so the shell reads only
+// those.
+type Needs struct {
+	Claude []ClaudeNeed
+	Agy    []AgyNeed
+	// Projects are working directories whose Claude transcripts must be
+	// listed (to match unmanaged sessions by title).
+	Projects []string
+}
+
+// ClaudeNeed asks for one Claude transcript.
+type ClaudeNeed struct {
+	SessionID string
+	Cwd       string // where to look first
+	Hint      string // a path the hook reported, if any
+}
+
+// AgyNeed asks for one agy transcript.
+type AgyNeed struct {
+	ConversationID string
+	Hint           string
+}

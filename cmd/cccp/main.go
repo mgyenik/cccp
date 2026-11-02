@@ -1,4 +1,5 @@
-// Command cccp is the Claude Code control panel.
+// Command cccp is the control panel for Claude Code and Antigravity CLI
+// sessions in tmux.
 package main
 
 import (
@@ -14,30 +15,34 @@ func main() {
 	if len(args) > 0 {
 		cmd, args = args[0], args[1:]
 	}
+	// The hook path stays minimal: it must never fail or print.
+	if cmd == "hook" {
+		os.Exit(runHook(newApp(), args, start))
+	}
+	if cmd == "notify" {
+		os.Exit(runNotify(newApp(), args))
+	}
+	a := newApp()
 	var err error
 	switch cmd {
-	case "hook":
-		os.Exit(runHook(args, start))
 	case "ls", "list":
-		err = runList(args)
+		err = runList(a, args)
 	case "status":
-		err = runStatus(args)
+		err = runStatus(a, args)
 	case "daemon":
-		err = runDaemon(args)
-	case "notify":
-		os.Exit(runNotify(args))
+		err = runDaemon(a, args)
 	case "jump":
-		err = runJump(args)
+		err = runJump(a, args)
 	case "ui":
-		err = runUI(args)
+		err = runUI(a, args)
 	case "search":
-		err = runSearch(args)
+		err = runSearch(a, args)
 	case "install":
-		err = runInstall(args)
+		err = runInstall(a, args)
 	case "uninstall":
-		err = runUninstall(args)
+		err = runUninstall(a, args)
 	case "doctor":
-		err = runDoctor(args)
+		err = runDoctor(a, args)
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -55,19 +60,21 @@ func usage() {
 	fmt.Fprint(os.Stderr, `cccp — control panel for Claude Code and Antigravity CLI sessions in tmux
 
 usage:
-  cccp [ui]              cockpit TUI (run inside tmux; see cccp.tmux for the popup binding)
-  cccp ls [--json] [--all]
+  cccp [ui] [--client NAME]
+                         cockpit TUI (prefix A in tmux, via cccp.tmux)
+  cccp ls [--json] [--all] [--local]
                          list sessions
-  cccp status            one-line counts (as shown in the tmux status line)
+  cccp status [--tmux]   one-line counts (as in the tmux status line)
   cccp jump [--next] [--client NAME] [KEY]
                          switch a tmux client to a session (--next: most urgent)
-  cccp search [--json] QUERY
+  cccp search [--json] [-n N] TERMS…
                          full-text search over transcripts
   cccp daemon            run the daemon (normally via systemd --user)
-  cccp install [--yes]   install hooks, tmux integration and the systemd unit
-  cccp uninstall         remove them
+  cccp install [--yes] [--only bin,claude,agy,systemd,tmux]
+                         install hooks, tmux integration and the systemd unit
+  cccp uninstall [--yes] remove them
   cccp doctor            check the installation
   cccp hook claude|agy   hook entry point (called by the agents)
-  cccp notify tmux EVENT hook entry point (called by tmux)
+  cccp notify tmux EVENT tmux hook entry point (called by tmux)
 `)
 }

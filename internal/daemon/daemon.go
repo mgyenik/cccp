@@ -1,288 +1,336 @@
-// Package daemon runs cccpd: it watches every source, keeps the engine's
-// snapshot current, decorates tmux, notifies, summarises, and serves the
-// snapshot over a unix socket.
+// Package daemon is the imperative shell around the machine: it turns OS
+// events (file changes, process exits, socket requests, the timer) into
+// machine inputs, and executes the machine's effects through ports.
 //
-// One goroutine (run) owns the engine and all state; everything else only
-// feeds it events. Idle, every goroutine is blocked in the kernel.
+// It contains no policy. Every decision (what to notify, what to write to
+// tmux, when to save, what to summarise) is made by package machine; the
+// only judgement here is which sources an event makes stale (see Scope).
 package daemon
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"net"
 	"os"
-	"os/exec"
-	"os/signal"
 	"path/filepath"
-	"strings"
-	"syscall"
-	"testing"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
 
 	"cccp/internal/claudereg"
 	"cccp/internal/config"
-	"cccp/internal/engine"
+	"cccp/internal/core"
 	"cccp/internal/ipc"
-	"cccp/internal/paths"
-	"cccp/internal/present"
+	"cccp/internal/machine"
 	"cccp/internal/store"
 )
 
+// Observer is the read side of the world (implemented by gather.Gatherer).
+type Observer interface {
+	Reload()
+	HookFileChanged(path string) (rediscover bool)
+	RegistryFileChanged(path string) (rediscover bool)
+	RefreshTmux()
+	Discover()
+	Observe(now time.Time) core.Observation
+}
+
+// TmuxWriter sets cccp's tmux options.
+type TmuxWriter interface {
+	SetStatus(value string) error
+	SetGlyph(window, value string) error
+}
+
+// Notifier shows a desktop notification.
+type Notifier interface {
+	Notify(argv []string) error
+}
+
+// Summarizer produces a one-line summary.
+type Summarizer interface {
+	Summarize(ctx context.Context, model, input string) (string, error)
+}
+
+// MemoryStore persists the machine's memory.
+type MemoryStore interface {
+	Save(core.Memory) error
+}
+
+// FileRemover deletes expired state files.
+type FileRemover interface {
+	Remove(path string) error
+}
+
+// Ports are the daemon's dependencies on the world.
+type Ports struct {
+	Observer   Observer
+	Tmux       TmuxWriter
+	Notifier   Notifier
+	Summarizer Summarizer
+	Memory     MemoryStore
+	Files      FileRemover
+	// LoadConfig rereads the configuration (on SIGHUP or a reload request).
+	LoadConfig func() (config.Config, error)
+	Now        func() time.Time
+	Log        *log.Logger
+}
+
+// Options are the daemon's locations.
+type Options struct {
+	SessionsDir string // hook state files (watched)
+	RegistryDir string // Claude registry (watched if it exists)
+	Socket      string
+	// SummaryTimeout bounds one summary.
+	SummaryTimeout time.Duration
+}
+
+// Scope says whether the world must be observed and which sources an event
+// made stale.
+type Scope struct {
+	Observe  bool // something relevant changed
+	Reload   bool // reread every hook and registry file
+	Tmux     bool // reread panes and clients
+	Discover bool // rescan processes (implies Tmux)
+}
+
+func (s *Scope) add(o Scope) {
+	s.Observe = s.Observe || o.Observe
+	s.Reload = s.Reload || o.Reload
+	s.Tmux = s.Tmux || o.Tmux
+	s.Discover = s.Discover || o.Discover
+}
+
+var (
+	scopeAll      = Scope{Observe: true, Reload: true, Tmux: true, Discover: true}
+	scopeDiscover = Scope{Observe: true, Tmux: true, Discover: true}
+	scopeTmux     = Scope{Observe: true, Tmux: true}
+	scopeSources  = Scope{Observe: true} // the changed file is already reread
+)
+
+// TmuxEventScope maps a tmux hook name to what it makes stale: layout
+// changes can add or remove agent processes; focus changes only change what
+// is visible.
+func TmuxEventScope(event string) Scope {
+	switch event {
+	case "pane-exited", "after-new-window", "after-split-window", "session-created", "session-closed", "client-attached":
+		return scopeDiscover
+	}
+	return scopeTmux
+}
+
+// Daemon is a running daemon.
+type Daemon struct {
+	opt   Options
+	ports Ports
+	m     *machine.Machine
+
+	reqs chan request
+	pids chan int
+	sums chan machine.SummaryDone
+
+	subs    map[*subscriber]bool
+	replies []chan ipc.Response // waiting for the next published snapshot
+	pidw    *pidWatcher
+	timer   *time.Timer
+	ctx     context.Context
+}
+
 type request struct {
 	req   ipc.Request
-	reply chan ipc.Response // nil for fire-and-forget
-	sub   *subscriber       // set for OpSubscribe
+	reply chan ipc.Response // nil when no reply is expected
+	sub   *subscriber
 }
 
 type subscriber struct {
-	ch chan engine.Snapshot // capacity 1: the latest snapshot wins
+	ch chan core.Snapshot // capacity 1: the latest snapshot wins
 }
 
-// notifyRunner is the notifier new daemons use. Tests must replace it (see
-// testNotifier in the tests) so no test can reach the real desktop.
-var notifyRunner = execNotifier
-
-// Daemon is the running daemon.
-type Daemon struct {
-	eng  *engine.Engine
-	log  *log.Logger
-	reqs chan request
-	pids chan int
-	sums chan summaryResult
-
-	watcher *fsnotify.Watcher
-	pidw    *pidWatcher
-
-	subs map[*subscriber]bool
-	last engine.Snapshot
-	have bool
-
-	// tmux decoration state, to set options only when values change
-	appliedStatus string
-	appliedWin    map[string]string
-	tmuxWasOK     bool
-
-	notified map[string]string // key → signature of the last notified state
-
-	sumq *sumQueue
-	// runSummary executes one summary job (replaced in tests).
-	runSummary func(job summaryJob, model string) summaryResult
-	// notifier delivers a desktop notification (replaced in tests).
-	notifier func(argv []string) error
-
-	timer     *time.Timer
-	saveDue   time.Time
-	lastPrune time.Time
-
-	// pendingReply collects replies to send with the next snapshot.
-	pendingReply []chan ipc.Response
-	// tmuxOnly: re-read tmux (but skip the process scan) on the next
-	// recompute.
-	tmuxOnly bool
+// New creates a daemon around machine m.
+func New(opt Options, ports Ports, m *machine.Machine) *Daemon {
+	if opt.SummaryTimeout == 0 {
+		opt.SummaryTimeout = 60 * time.Second
+	}
+	return &Daemon{
+		opt: opt, ports: ports, m: m,
+		reqs: make(chan request, 64),
+		pids: make(chan int, 64),
+		sums: make(chan machine.SummaryDone, 4),
+		subs: map[*subscriber]bool{},
+	}
 }
 
-// Run starts the daemon and blocks until SIGINT/SIGTERM or until stop is
-// closed (stop may be nil).
-func Run(logger *log.Logger, stop <-chan struct{}) error {
-	if c, err := net.DialTimeout("unix", paths.Socket(), 200*time.Millisecond); err == nil {
+// Run serves until ctx is cancelled; reload delivers configuration reload
+// requests (may be nil).
+func (d *Daemon) Run(ctx context.Context, reload <-chan struct{}) error {
+	d.ctx = ctx
+	if c, err := net.DialTimeout("unix", d.opt.Socket, 200*time.Millisecond); err == nil {
 		c.Close()
-		return fmt.Errorf("another daemon is listening on %s", paths.Socket())
+		return fmt.Errorf("another daemon is listening on %s", d.opt.Socket)
 	}
-	_ = os.Remove(paths.Socket())
-
-	cfg, err := config.Load()
-	if err != nil {
-		logger.Printf("config: %v (using defaults)", err)
-	}
-	persist, err := engine.LoadPersist()
-	if err != nil {
-		logger.Printf("daemon state: %v (starting fresh)", err)
-	}
-	d := &Daemon{
-		eng:        engine.New(cfg, persist),
-		log:        logger,
-		reqs:       make(chan request, 64),
-		pids:       make(chan int, 64),
-		sums:       make(chan summaryResult, 4),
-		subs:       map[*subscriber]bool{},
-		appliedWin: map[string]string{},
-		notified:   map[string]string{},
-		timer:      time.NewTimer(time.Hour),
-		sumq:       newSumQueue(),
-		runSummary: summaryRunner,
-		notifier:   notifyRunner,
-	}
-	d.timer.Stop()
-
-	if err := os.MkdirAll(paths.SessionsDir(), 0o700); err != nil {
+	_ = os.Remove(d.opt.Socket)
+	if err := os.MkdirAll(d.opt.SessionsDir, 0o700); err != nil {
 		return err
 	}
-	d.watcher, err = fsnotify.NewWatcher()
+	w, err := fsnotify.NewWatcher()
 	if err != nil {
 		return err
 	}
-	defer d.watcher.Close()
-	if err := d.watcher.Add(paths.SessionsDir()); err != nil {
+	defer w.Close()
+	if err := w.Add(d.opt.SessionsDir); err != nil {
 		return err
 	}
-	if err := d.watcher.Add(paths.ClaudeRegistryDir()); err != nil {
-		logger.Printf("not watching the Claude registry: %v", err)
+	if err := w.Add(d.opt.RegistryDir); err != nil {
+		d.ports.Log.Printf("not watching the Claude registry: %v", err)
 	}
 	if d.pidw, err = newPidWatcher(d.pids); err != nil {
 		return err
 	}
-
-	ln, err := net.Listen("unix", paths.Socket())
+	defer d.pidw.Close()
+	ln, err := net.Listen("unix", d.opt.Socket)
 	if err != nil {
 		return err
 	}
-	_ = os.Chmod(paths.Socket(), 0o600)
+	_ = os.Chmod(d.opt.Socket, 0o600)
 	defer func() {
 		ln.Close()
-		os.Remove(paths.Socket())
+		os.Remove(d.opt.Socket)
 	}()
 	go d.accept(ln)
 
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	d.timer = time.NewTimer(time.Hour)
+	d.timer.Stop()
+	defer d.timer.Stop()
 
-	d.eng.LoadAll()
-	d.recompute(true)
-	d.prune()
-	logger.Printf("cccp daemon started: %d sessions, socket %s", len(d.last.Sessions), paths.Socket())
+	d.observe(scopeAll)
+	if snap, ok := d.m.Snapshot(); ok {
+		d.ports.Log.Printf("cccp daemon started: %d sessions, socket %s", len(snap.Sessions), d.opt.Socket)
+	}
 
 	for {
 		select {
-		case <-stop:
-			d.shutdown()
+		case <-ctx.Done():
+			d.exec(d.m.Step(machine.Stop{At: d.ports.Now()}))
+			d.ports.Log.Printf("cccp daemon stopped")
 			return nil
-		case s := <-sig:
-			if s == syscall.SIGHUP {
-				d.reloadConfig()
-				continue
-			}
-			d.shutdown()
-			return nil
-		case ev, ok := <-d.watcher.Events:
+		case <-reload:
+			d.reloadConfig()
+		case ev, ok := <-w.Events:
 			if !ok {
 				return errors.New("file watcher closed")
 			}
-			full := d.handleFS(ev)
-			d.drain(&full)
-			d.recompute(full)
-		case err := <-d.watcher.Errors:
-			logger.Printf("watcher: %v", err)
-			// Overflow or similar: resynchronise from disk.
-			d.eng.LoadHooks()
-			d.eng.LoadRegistry()
-			d.recompute(true)
+			var sc Scope
+			d.fileEvent(ev, &sc)
+			d.drainAndObserve(w, sc)
+		case err := <-w.Errors:
+			// E.g. an inotify queue overflow: resynchronise from disk.
+			d.ports.Log.Printf("watcher: %v", err)
+			d.drainAndObserve(w, scopeAll)
 		case <-d.pids:
-			full := true
-			d.drain(&full)
-			d.recompute(true)
+			d.drainAndObserve(w, scopeDiscover)
 		case r := <-d.reqs:
-			full := d.handleReq(r)
-			d.drain(&full)
-			d.recompute(full)
-		case res := <-d.sums:
-			d.handleSummary(res)
-			d.recompute(false)
+			var sc Scope
+			d.request(r, &sc)
+			d.drainAndObserve(w, sc)
+		case done := <-d.sums:
+			d.exec(d.m.Step(done))
 		case <-d.timer.C:
-			d.recompute(false)
+			d.exec(d.m.Step(machine.TimerFired{At: d.ports.Now()}))
 		}
 	}
 }
 
-// drain applies already-queued events so one recompute covers a burst.
-func (d *Daemon) drain(full *bool) {
+// drainAndObserve applies already-queued events, so one observation covers
+// a burst, then observes if anything relevant happened.
+func (d *Daemon) drainAndObserve(w *fsnotify.Watcher, sc Scope) {
+drain:
 	for i := 0; i < 256; i++ {
 		select {
-		case ev := <-d.watcher.Events:
-			if d.handleFS(ev) {
-				*full = true
-			}
+		case ev := <-w.Events:
+			d.fileEvent(ev, &sc)
 		case <-d.pids:
-			*full = true
+			sc.add(scopeDiscover)
 		case r := <-d.reqs:
-			if d.handleReq(r) {
-				*full = true
-			}
+			d.request(r, &sc)
 		default:
+			break drain
+		}
+	}
+	if sc.Observe {
+		d.observe(sc)
+	}
+}
+
+// fileEvent applies one watched-file change to the observer.
+func (d *Daemon) fileEvent(ev fsnotify.Event, sc *Scope) {
+	name := filepath.Base(ev.Name)
+	switch filepath.Dir(ev.Name) {
+	case filepath.Clean(d.opt.SessionsDir):
+		if !store.IsStateFile(name) {
+			return // lock and temp files
+		}
+		sc.add(scopeSources)
+		if d.ports.Observer.HookFileChanged(ev.Name) {
+			sc.add(scopeDiscover)
+		}
+	case filepath.Clean(d.opt.RegistryDir):
+		if !claudereg.IsEntryFile(name) {
 			return
 		}
+		sc.add(scopeSources)
+		if d.ports.Observer.RegistryFileChanged(ev.Name) {
+			sc.add(scopeDiscover)
+		}
 	}
 }
 
-// handleFS applies one file event; it returns true when tmux/proc
-// rediscovery is needed (a session appeared or disappeared).
-func (d *Daemon) handleFS(ev fsnotify.Event) bool {
-	dir, name := filepath.Dir(ev.Name), filepath.Base(ev.Name)
-	switch dir {
-	case paths.SessionsDir():
-		if !store.IsStateFile(name) {
-			return false
-		}
-		before, had := d.eng.HookFile(ev.Name)
-		d.eng.LoadHookFile(ev.Name)
-		after, has := d.eng.HookFile(ev.Name)
-		// Rediscover when a session appears or goes away, or moves to
-		// another process or pane (resume, restart).
-		return had != has || before.PID != after.PID || before.Pane != after.Pane
-	case paths.ClaudeRegistryDir():
-		if !claudereg.IsEntryFile(name) {
-			return false
-		}
-		before, had := d.eng.RegistryFile(ev.Name)
-		d.eng.LoadRegistryFile(ev.Name)
-		after, has := d.eng.RegistryFile(ev.Name)
-		return had != has || before.SessionID != after.SessionID || before.Tmux != after.Tmux
+// observe refreshes the stale sources and steps the machine.
+func (d *Daemon) observe(sc Scope) {
+	o := d.ports.Observer
+	if sc.Reload {
+		o.Reload()
 	}
-	return false
+	if sc.Tmux || sc.Discover {
+		o.RefreshTmux()
+	}
+	if sc.Discover {
+		o.Discover()
+	}
+	now := d.ports.Now()
+	d.exec(d.m.Step(machine.Observed{Obs: o.Observe(now), At: now}))
 }
 
-// handleReq applies one request; it returns true when rediscovery is needed.
-func (d *Daemon) handleReq(r request) bool {
+// request handles one socket request. Refreshes and tmux events widen sc
+// (and are answered after the observation); the rest are answered here.
+func (d *Daemon) request(r request, sc *Scope) {
+	now := d.ports.Now()
 	switch r.req.Op {
 	case ipc.OpSubscribe:
 		d.subs[r.sub] = true
-		if d.have {
-			offer(r.sub, d.last)
+		if snap, ok := d.m.Snapshot(); ok {
+			offer(r.sub, snap)
 		}
-		return false
-	case "unsubscribe":
+	case opUnsubscribe:
 		delete(d.subs, r.sub)
-		return false
 	case ipc.OpSnapshot:
-		d.pendingReply = append(d.pendingReply, r.reply)
-		return false
-	case ipc.OpRefresh:
-		d.eng.LoadHooks()
-		d.eng.LoadRegistry()
-		d.pendingReply = append(d.pendingReply, r.reply)
-		return true
-	case ipc.OpTmux:
-		switch r.req.Event {
-		case "pane-exited", "after-new-window", "after-split-window", "session-created", "session-closed", "client-attached":
-			return true
+		if snap, ok := d.m.Snapshot(); ok {
+			reply(r.reply, ipc.Response{OK: true, Snapshot: &snap})
+		} else {
+			d.replies = append(d.replies, r.reply)
 		}
-		d.tmuxOnly = true
-		return false
+	case ipc.OpRefresh:
+		sc.add(scopeAll)
+		d.replies = append(d.replies, r.reply)
+	case ipc.OpTmux:
+		sc.add(TmuxEventScope(r.req.Event))
 	case ipc.OpSeen:
-		d.eng.Persist.Seen[r.req.Key] = time.Now()
-		d.eng.PersistDirty = true
+		d.exec(d.m.Step(machine.MarkSeen{Key: r.req.Key, At: now}))
 		reply(r.reply, ipc.Response{OK: true})
 	case ipc.OpAlias:
-		if v := strings.TrimSpace(r.req.Value); v == "" {
-			delete(d.eng.Persist.Aliases, r.req.Key)
-		} else {
-			d.eng.Persist.Aliases[r.req.Key] = v
-		}
-		d.eng.PersistDirty = true
+		d.exec(d.m.Step(machine.SetAlias{Key: r.req.Key, Value: r.req.Value, At: now}))
 		reply(r.reply, ipc.Response{OK: true})
 	case ipc.OpReload:
 		d.reloadConfig()
@@ -290,8 +338,106 @@ func (d *Daemon) handleReq(r request) bool {
 	default:
 		reply(r.reply, ipc.Response{Error: "unknown op " + r.req.Op})
 	}
-	return false
 }
+
+func (d *Daemon) reloadConfig() {
+	cfg, err := d.ports.LoadConfig()
+	if err != nil {
+		d.ports.Log.Printf("config: %v (keeping the current configuration)", err)
+		return
+	}
+	d.exec(d.m.Step(machine.ConfigChanged{Config: cfg, At: d.ports.Now()}))
+	d.ports.Log.Printf("config reloaded")
+}
+
+// exec carries out the machine's effects, in order.
+func (d *Daemon) exec(effs []machine.Effect) {
+	tmuxFailed := false
+	for _, e := range effs {
+		switch e := e.(type) {
+		case machine.Publish:
+			d.publish(e.Snapshot)
+		case machine.SetStatus:
+			if err := d.ports.Tmux.SetStatus(e.Value); err != nil {
+				tmuxFailed = true
+			}
+		case machine.SetGlyph:
+			if err := d.ports.Tmux.SetGlyph(e.Window, e.Value); err != nil {
+				tmuxFailed = true
+			}
+		case machine.Notify:
+			if err := d.ports.Notifier.Notify(e.Argv); err != nil {
+				d.ports.Log.Printf("notify %s: %v", e.Key, err)
+			}
+		case machine.StartSummary:
+			go d.summarize(e)
+		case machine.SaveMemory:
+			if err := d.ports.Memory.Save(e.Memory); err != nil {
+				d.ports.Log.Printf("saving memory: %v", err)
+			}
+		case machine.RemoveFiles:
+			for _, p := range e.Paths {
+				if err := d.ports.Files.Remove(p); err != nil {
+					d.ports.Log.Printf("removing %s: %v", p, err)
+				}
+			}
+		case machine.ArmTimer:
+			d.arm(e.At)
+		case machine.Log:
+			d.ports.Log.Print(e.Msg)
+		default:
+			d.ports.Log.Printf("daemon: unknown effect %T", e)
+		}
+	}
+	if tmuxFailed {
+		d.ports.Log.Printf("tmux: setting options failed; they will be re-sent")
+		d.m.Step(machine.TmuxFailed{})
+	}
+}
+
+func (d *Daemon) publish(snap core.Snapshot) {
+	for s := range d.subs {
+		offer(s, snap)
+	}
+	for _, ch := range d.replies {
+		reply(ch, ipc.Response{OK: true, Snapshot: &snap})
+	}
+	d.replies = nil
+	for _, s := range snap.Sessions {
+		if s.Alive && s.PID > 0 {
+			d.pidw.Watch(s.PID)
+		}
+	}
+}
+
+func (d *Daemon) arm(at time.Time) {
+	if !d.timer.Stop() {
+		select {
+		case <-d.timer.C:
+		default:
+		}
+	}
+	if !at.IsZero() {
+		// +50ms so the snapshot computed when it fires is past the deadline.
+		d.timer.Reset(time.Until(at) + 50*time.Millisecond)
+	}
+}
+
+// summarize runs one summary and reports back (unless shutting down).
+func (d *Daemon) summarize(e machine.StartSummary) {
+	ctx, cancel := context.WithTimeout(d.ctx, d.opt.SummaryTimeout)
+	defer cancel()
+	text, err := d.ports.Summarizer.Summarize(ctx, e.Model, e.Input)
+	done := machine.SummaryDone{Key: e.Key, Hash: e.Hash, Text: text, Err: err, At: d.ports.Now()}
+	select {
+	case d.sums <- done:
+	case <-d.ctx.Done():
+	}
+}
+
+// ---- socket -------------------------------------------------------------------
+
+const opUnsubscribe = "unsubscribe"
 
 func reply(ch chan ipc.Response, r ipc.Response) {
 	if ch != nil {
@@ -299,7 +445,7 @@ func reply(ch chan ipc.Response, r ipc.Response) {
 	}
 }
 
-func offer(s *subscriber, snap engine.Snapshot) {
+func offer(s *subscriber, snap core.Snapshot) {
 	select {
 	case <-s.ch:
 	default:
@@ -307,272 +453,16 @@ func offer(s *subscriber, snap engine.Snapshot) {
 	s.ch <- snap
 }
 
-func (d *Daemon) reloadConfig() {
-	cfg, err := config.Load()
-	if err != nil {
-		d.log.Printf("config: %v (keeping current)", err)
-		return
-	}
-	d.eng.SetConfig(cfg)
-	d.log.Printf("config reloaded")
-}
-
-// recompute refreshes the snapshot and applies side effects. full also
-// re-reads tmux and rescans processes.
-func (d *Daemon) recompute(full bool) {
-	if full || d.tmuxOnly {
-		d.eng.RefreshTmux()
-	}
-	if full {
-		d.eng.Discover()
-	}
-	d.tmuxOnly = false
-	now := time.Now()
-	snap := d.eng.Snapshot(now)
-	snap.FromDaemon = true
-	prev, hadPrev := d.last, d.have
-	d.last, d.have = snap, true
-
-	for _, s := range snap.Sessions {
-		if s.Alive && s.PID > 0 {
-			d.pidw.Watch(s.PID)
-		}
-	}
-	d.decorateTmux(snap)
-	if hadPrev {
-		d.notify(prev, snap)
-	} else {
-		d.primeNotified(snap)
-	}
-	d.queueSummaries(snap)
-	for s := range d.subs {
-		offer(s, snap)
-	}
-	for _, ch := range d.pendingReply {
-		reply(ch, ipc.Response{OK: true, Snapshot: &snap})
-	}
-	d.pendingReply = nil
-
-	if d.eng.PersistDirty && d.saveDue.IsZero() {
-		d.saveDue = now.Add(5 * time.Second)
-	}
-	if !d.saveDue.IsZero() && !now.Before(d.saveDue) {
-		d.save()
-	}
-	if now.Sub(d.lastPrune) > 6*time.Hour {
-		d.prune()
-	}
-	d.arm(snap, now)
-}
-
-func (d *Daemon) save() {
-	if err := d.eng.Persist.Save(); err != nil {
-		d.log.Printf("saving daemon state: %v", err)
-	}
-	d.eng.PersistDirty = false
-	d.saveDue = time.Time{}
-}
-
-func (d *Daemon) prune() {
-	d.lastPrune = time.Now()
-	if n := d.eng.PruneEnded(d.last); n > 0 {
-		d.log.Printf("pruned %d ended sessions", n)
+// send delivers a request to the loop unless the daemon is stopping.
+func (d *Daemon) send(r request) bool {
+	select {
+	case d.reqs <- r:
+		return true
+	case <-d.ctx.Done():
+		return false
 	}
 }
 
-// arm sets the single timer to the earliest deadline: a cache expiring or a
-// pending state save.
-func (d *Daemon) arm(snap engine.Snapshot, now time.Time) {
-	t := engine.NextDeadline(snap)
-	if !d.saveDue.IsZero() && (t.IsZero() || d.saveDue.Before(t)) {
-		t = d.saveDue
-	}
-	if !d.timer.Stop() {
-		select {
-		case <-d.timer.C:
-		default:
-		}
-	}
-	if !t.IsZero() {
-		// +50ms so the snapshot computed at fire time is past the deadline.
-		d.timer.Reset(t.Sub(now) + 50*time.Millisecond)
-	}
-}
-
-func (d *Daemon) shutdown() {
-	d.save()
-	tm := d.eng.Tmux()
-	_ = tm.SetGlobalOption("@cccp_status", "")
-	for w := range d.appliedWin {
-		_ = tm.SetWindowOption(w, "@cccp_glyph", "")
-	}
-	d.log.Printf("cccp daemon stopped")
-}
-
-// decorateTmux writes @cccp_status and per-window @cccp_glyph, only for
-// values that changed.
-func (d *Daemon) decorateTmux(snap engine.Snapshot) {
-	if !snap.TmuxOK {
-		d.tmuxWasOK = false
-		return
-	}
-	if !d.tmuxWasOK {
-		// A (re)started tmux server has none of our options.
-		d.appliedStatus = "\x00"
-		d.appliedWin = map[string]string{}
-		d.tmuxWasOK = true
-	}
-	tm := d.eng.Tmux()
-	status := present.StatusSegment(snap)
-	if status != d.appliedStatus {
-		if err := tm.SetGlobalOption("@cccp_status", status); err != nil {
-			d.log.Printf("tmux: %v", err)
-		} else {
-			d.appliedStatus = status
-		}
-	}
-	want := present.WindowGlyphs(snap)
-	for w, g := range want {
-		if d.appliedWin[w] != g {
-			if err := tm.SetWindowOption(w, "@cccp_glyph", g); err == nil {
-				d.appliedWin[w] = g
-			}
-		}
-	}
-	for w := range d.appliedWin {
-		if _, ok := want[w]; !ok {
-			_ = tm.SetWindowOption(w, "@cccp_glyph", "")
-			delete(d.appliedWin, w)
-		}
-	}
-}
-
-func orDash(s string) string {
-	if s == "" {
-		return "-"
-	}
-	return s
-}
-
-// execNotifier runs the notification command without waiting for it.
-func execNotifier(argv []string) error {
-	if testing.Testing() {
-		return errors.New("refusing to send a real desktop notification from a test binary")
-	}
-	cmd := exec.Command(argv[0], argv[1:]...)
-	if err := cmd.Start(); err != nil {
-		return err
-	}
-	go cmd.Wait()
-	return nil
-}
-
-// signature identifies an attention state for notification de-duplication.
-func signature(s engine.Session) string {
-	if !s.NeedsAttention() || !s.Alive {
-		return ""
-	}
-	return fmt.Sprintf("%d|%s|%d", s.Group, s.Activity, s.ActivitySince.UnixMilli())
-}
-
-func (d *Daemon) primeNotified(snap engine.Snapshot) {
-	for _, s := range snap.Sessions {
-		if sig := signature(s); sig != "" {
-			d.notified[s.Key] = sig
-		}
-	}
-}
-
-// notify sends a desktop notification for sessions that newly need
-// attention while their pane is not visible.
-func (d *Daemon) notify(prev, snap engine.Snapshot) {
-	cfg := d.eng.Config()
-	for _, s := range snap.Sessions {
-		sig := signature(s)
-		if sig == "" {
-			delete(d.notified, s.Key)
-			continue
-		}
-		if d.notified[s.Key] == sig {
-			continue
-		}
-		d.notified[s.Key] = sig
-		if !cfg.Notify || s.Visible || len(cfg.NotifyCommand) == 0 {
-			continue
-		}
-		title := "cccp: " + s.Group.String() + " — " + s.DisplayTitle()
-		body := present.Detail(s)
-		if s.Inferred {
-			body = "(inferred) " + body
-		}
-		if s.Location != "" {
-			body = s.Location + "  " + body
-		}
-		argv := append(append([]string{}, cfg.NotifyCommand...), title, body)
-		d.log.Printf("notify %s (%s, pane %s): %s", s.Key, s.Group, orDash(s.Location), title)
-		if err := d.notifier(argv); err != nil {
-			d.log.Printf("notify: %v", err)
-		}
-	}
-}
-
-// queueSummaries schedules one-line summaries for sessions that need you,
-// when the configuration and power state allow it.
-func (d *Daemon) queueSummaries(snap engine.Snapshot) {
-	cfg := d.eng.Config()
-	switch cfg.Summaries {
-	case "off":
-		return
-	case "ac":
-		if snap.OnBattery {
-			return
-		}
-	}
-	now := snap.At
-	keep := map[string]bool{}
-	for _, s := range snap.Sessions {
-		keep[s.Key] = true
-		if !s.NeedsAttention() || !s.Alive || (s.LastMessage == "" && s.Question == "") {
-			continue
-		}
-		in, hash := summaryInput(s)
-		if rec, ok := d.eng.Persist.Summaries[s.Key]; ok && rec.InputHash == hash {
-			continue
-		}
-		d.sumq.offer(summaryJob{key: s.Key, hash: hash, input: in}, now)
-	}
-	d.sumq.forget(keep)
-	d.startSummary(now)
-}
-
-func (d *Daemon) startSummary(now time.Time) {
-	job, ok := d.sumq.next(now)
-	if !ok {
-		return
-	}
-	model, run := d.eng.Config().SummaryModel, d.runSummary
-	go func() {
-		res := run(job, model)
-		res.hash = job.hash
-		d.sums <- res
-	}()
-}
-
-func (d *Daemon) handleSummary(res summaryResult) {
-	now := time.Now()
-	if d.sumq.done(res, res.hash, now) {
-		d.log.Printf("summaries paused for %v after %d consecutive failures (last: %v)", pauseFor, pauseAfter, res.err)
-	}
-	if res.err != nil {
-		d.log.Printf("summary for %s failed after %v: %v", res.key, res.took.Round(time.Millisecond), res.err)
-	} else if res.rec.Text != "" {
-		d.eng.Persist.Summaries[res.key] = res.rec
-		d.eng.PersistDirty = true
-	}
-	d.startSummary(now)
-}
-
-// accept serves socket connections.
 func (d *Daemon) accept(ln net.Listener) {
 	for {
 		c, err := ln.Accept()
@@ -580,7 +470,7 @@ func (d *Daemon) accept(ln net.Listener) {
 			if errors.Is(err, net.ErrClosed) {
 				return
 			}
-			d.log.Printf("accept: %v", err)
+			d.ports.Log.Printf("accept: %v", err)
 			continue
 		}
 		go d.serve(c)
@@ -600,16 +490,24 @@ func (d *Daemon) serve(c net.Conn) {
 		}
 		switch req.Op {
 		case ipc.OpTmux:
-			d.reqs <- request{req: req}
+			d.send(request{req: req})
 		case ipc.OpSubscribe:
-			sub := &subscriber{ch: make(chan engine.Snapshot, 1)}
-			d.reqs <- request{req: req, sub: sub}
-			d.stream(c, enc, sub)
+			sub := &subscriber{ch: make(chan core.Snapshot, 1)}
+			if d.send(request{req: req, sub: sub}) {
+				d.stream(c, enc, sub)
+			}
 			return
 		default:
 			ch := make(chan ipc.Response, 1)
-			d.reqs <- request{req: req, reply: ch}
-			if err := enc.Encode(<-ch); err != nil {
+			if !d.send(request{req: req, reply: ch}) {
+				return
+			}
+			select {
+			case resp := <-ch:
+				if err := enc.Encode(resp); err != nil {
+					return
+				}
+			case <-d.ctx.Done():
 				return
 			}
 		}
@@ -629,7 +527,7 @@ func (d *Daemon) stream(c net.Conn, enc *json.Encoder, sub *subscriber) {
 			}
 		}
 	}()
-	defer func() { d.reqs <- request{req: ipc.Request{Op: "unsubscribe"}, sub: sub} }()
+	defer d.send(request{req: ipc.Request{Op: opUnsubscribe}, sub: sub})
 	for {
 		select {
 		case snap := <-sub.ch:
@@ -638,6 +536,8 @@ func (d *Daemon) stream(c net.Conn, enc *json.Encoder, sub *subscriber) {
 				return
 			}
 		case <-gone:
+			return
+		case <-d.ctx.Done():
 			return
 		}
 	}

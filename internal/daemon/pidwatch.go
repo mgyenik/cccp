@@ -16,6 +16,17 @@ type pidWatcher struct {
 	out  chan<- int
 }
 
+// Close stops watching: the epoll fd is closed, which ends the loop.
+func (w *pidWatcher) Close() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for fd := range w.fds {
+		unix.Close(fd)
+	}
+	w.fds, w.pids = map[int]int{}, map[int]int{}
+	return unix.Close(w.epfd)
+}
+
 func newPidWatcher(out chan<- int) (*pidWatcher, error) {
 	epfd, err := unix.EpollCreate1(unix.EPOLL_CLOEXEC)
 	if err != nil {
@@ -70,7 +81,12 @@ func (w *pidWatcher) loop() {
 			}
 			w.mu.Unlock()
 			if ok {
-				w.out <- pid
+				select {
+				case w.out <- pid:
+				default:
+					// The loop already has exits queued; any one of them
+					// triggers a full rediscovery, so this one adds nothing.
+				}
 			}
 		}
 	}

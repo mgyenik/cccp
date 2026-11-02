@@ -1,172 +1,454 @@
 package daemon
 
 import (
+	"context"
 	"errors"
 	"io"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"cccp/internal/config"
+	"cccp/internal/core"
 	"cccp/internal/ipc"
+	"cccp/internal/machine"
 	"cccp/internal/model"
-	"cccp/internal/procs"
-	"cccp/internal/store"
+	"cccp/internal/tmux"
 )
 
-// TestDaemonPushesHookChanges runs the real daemon against temp dirs and
-// checks that a hook state write reaches a subscriber through the file
-// watcher and the socket.
-func TestDaemonPushesHookChanges(t *testing.T) {
-	dir := t.TempDir()
-	t.Setenv("CCCP_STATE_DIR", filepath.Join(dir, "state"))
-	t.Setenv("CCCP_CACHE_DIR", filepath.Join(dir, "cache"))
-	t.Setenv("CCCP_SOCKET", filepath.Join(dir, "d.sock"))
-	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(dir, "claude"))
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(dir, "config"))
-	t.Setenv("HOME", dir)
-	t.Setenv("CCCP_TMUX_SOCKET", filepath.Join(dir, "no-tmux"))
-	if err := os.MkdirAll(filepath.Join(dir, "claude", "sessions"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	stop := make(chan struct{})
-	done := make(chan error, 1)
-	go func() { done <- Run(log.New(io.Discard, "", 0), stop) }()
-	defer func() {
-		close(stop)
-		if err := <-done; err != nil {
-			t.Error(err)
-		}
-	}()
+// --- fakes (all guarded by one mutex; the daemon calls them from its loop) ---
 
-	var sub *ipc.Subscription
-	var err error
-	for i := 0; i < 100; i++ {
-		if sub, err = ipc.Subscribe(time.Second); err == nil {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	if err != nil {
-		t.Fatalf("daemon did not come up: %v", err)
-	}
-	defer sub.Close()
-	if _, err := sub.Next(); err != nil { // initial snapshot
-		t.Fatal(err)
-	}
+type fakes struct {
+	mu sync.Mutex
 
-	st, _ := procs.ReadStat(os.Getpid())
-	now := time.Now()
-	if err := store.Update(model.Claude, "live", func(model.HookState) model.HookState {
-		return model.HookState{Version: 1, Agent: model.Claude, SessionID: "live", PID: st.PID, PIDStart: st.StartTime,
-			Activity: model.NeedsApproval, ActivityAt: now, LastEventAt: now, Question: "Allow Bash: make"}
-	}); err != nil {
-		t.Fatal(err)
-	}
-	deadline := time.After(5 * time.Second)
-	got := make(chan bool, 1)
-	go func() {
-		for {
-			snap, err := sub.Next()
-			if err != nil {
-				return
-			}
-			for _, s := range snap.Sessions {
-				if s.Key == "claude:live" && s.Activity == model.NeedsApproval && s.Question == "Allow Bash: make" && snap.FromDaemon {
-					got <- true
-					return
-				}
-			}
-		}
-	}()
-	select {
-	case <-got:
-	case <-deadline:
-		t.Fatal("hook change did not reach the subscriber")
-	}
+	// observer: like real hook state, the activity's timestamp changes only
+	// when the activity does (set through setActivity).
+	activity  model.Activity
+	since     time.Time
+	question  string
+	message   string
+	reloads   int
+	tmuxReads int
+	discovers int
+	observes  int
+	hookFiles []string
+	regFiles  []string
+	rediscov  bool
 
-	// The session needs approval and has no visible pane: one notification
-	// (recorded by testNotifier, never shown).
-	deadlineN := time.Now().Add(2 * time.Second)
-	for len(sentNotifications()) == 0 && time.Now().Before(deadlineN) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	ns := sentNotifications()
-	if len(ns) != 1 {
-		t.Fatalf("want exactly 1 notification, got %d: %q", len(ns), ns)
-	}
-	if got := ns[0]; got[0] != "notify-send" || !strings.Contains(got[len(got)-2], "NEEDS YOU") || !strings.Contains(got[len(got)-1], "Allow Bash: make") {
-		t.Fatalf("notification argv: %q", got)
-	}
+	// effects
+	status    []string
+	glyphs    []string
+	notified  [][]string
+	summaries []string
+	saved     []core.Memory
+	removed   []string
+	tmuxErr   error
+	logs      []string
+}
 
-	// Request/response ops work too.
-	if _, err := ipc.Call(ipc.Request{Op: ipc.OpAlias, Key: "claude:live", Value: "build"}, 2*time.Second); err != nil {
-		t.Fatal(err)
-	}
-	resp, err := ipc.Call(ipc.Request{Op: ipc.OpSnapshot}, 2*time.Second)
-	if err != nil || resp.Snapshot == nil {
-		t.Fatal(err)
-	}
-	for _, s := range resp.Snapshot.Sessions {
-		if s.Key == "claude:live" && s.Alias != "build" {
-			t.Fatalf("alias not applied: %+v", s)
-		}
+func (f *fakes) Reload()      { f.mu.Lock(); f.reloads++; f.mu.Unlock() }
+func (f *fakes) RefreshTmux() { f.mu.Lock(); f.tmuxReads++; f.mu.Unlock() }
+func (f *fakes) Discover()    { f.mu.Lock(); f.discovers++; f.mu.Unlock() }
+
+func (f *fakes) HookFileChanged(p string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.hookFiles = append(f.hookFiles, p)
+	return f.rediscov
+}
+
+func (f *fakes) RegistryFileChanged(p string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.regFiles = append(f.regFiles, p)
+	return false
+}
+
+func (f *fakes) Observe(now time.Time) core.Observation {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.observes++
+	st := model.HookState{Version: 1, Agent: model.Claude, SessionID: "s1", PID: 42, PIDStart: 1, Pane: "%1",
+		Activity: f.activity, ActivityAt: f.since, Question: f.question,
+		LastMessage: f.message, StartedAt: time.Unix(0, 0)}
+	return core.Observation{
+		Hooks: []core.HookRecord{{Path: "/state/s1.json", State: st, ProcAlive: true}},
+		Tmux: core.TmuxView{OK: true, Panes: []tmux.Pane{{ID: "%1", Session: "s", WindowID: "@1", WindowIndex: 1, WindowPanes: 1}},
+			Clients: []tmux.ClientInfo{{Name: "c", Pane: "%9", Focused: true}}},
 	}
 }
 
-// TestFailingSummariesDoNotLoop: a summarizer that always fails (logged out,
-// usage limit) must be called once per input, not respawned on every
-// recompute.
-func TestFailingSummariesDoNotLoop(t *testing.T) {
+func (f *fakes) SetStatus(v string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.status = append(f.status, v)
+	return f.tmuxErr
+}
+
+func (f *fakes) SetGlyph(w, v string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.glyphs = append(f.glyphs, w+"="+v)
+	return f.tmuxErr
+}
+
+func (f *fakes) Notify(argv []string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.notified = append(f.notified, argv)
+	return nil
+}
+
+func (f *fakes) Summarize(ctx context.Context, model, input string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.summaries = append(f.summaries, input)
+	return "Approve make install", nil
+}
+
+func (f *fakes) Save(m core.Memory) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.saved = append(f.saved, m)
+	return nil
+}
+
+func (f *fakes) Remove(p string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.removed = append(f.removed, p)
+	return nil
+}
+
+func (f *fakes) Write(p []byte) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.logs = append(f.logs, string(p))
+	return len(p), nil
+}
+
+// setActivity changes the observed activity, as a hook event would.
+func (f *fakes) setActivity(a model.Activity, question, message string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.activity, f.question, f.message = a, question, message
+	f.since = time.Now()
+}
+
+func (f *fakes) set(fn func(*fakes)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	fn(f)
+}
+
+func (f *fakes) get(fn func(*fakes) bool) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return fn(f)
+}
+
+// eventually polls cond until it holds or the deadline passes.
+func eventually(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for: %s", what)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+type harness struct {
+	f      *fakes
+	dir    string
+	client ipc.Client
+	cancel context.CancelFunc
+	done   chan error
+	reload chan struct{}
+}
+
+func start(t *testing.T, cfg config.Config) *harness {
+	t.Helper()
 	dir := t.TempDir()
-	t.Setenv("CCCP_STATE_DIR", filepath.Join(dir, "state"))
-	t.Setenv("CCCP_CACHE_DIR", filepath.Join(dir, "cache"))
-	t.Setenv("CCCP_SOCKET", filepath.Join(dir, "d.sock"))
-	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(dir, "claude"))
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(dir, "config"))
-	t.Setenv("HOME", dir)
-	t.Setenv("CCCP_TMUX_SOCKET", filepath.Join(dir, "no-tmux"))
-	os.MkdirAll(filepath.Join(dir, "claude", "sessions"), 0o700)
-	os.MkdirAll(filepath.Join(dir, "config", "cccp"), 0o700)
-	if err := os.WriteFile(filepath.Join(dir, "config", "cccp", "config.toml"), []byte("summaries = \"always\"\nnotify = false\n"), 0o600); err != nil {
+	f := &fakes{activity: model.Working, since: time.Unix(1, 0)}
+	opt := Options{
+		SessionsDir: filepath.Join(dir, "sessions"),
+		RegistryDir: filepath.Join(dir, "registry"),
+		Socket:      filepath.Join(dir, "d.sock"),
+	}
+	if err := os.MkdirAll(opt.RegistryDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	calls := make(chan struct{}, 100)
-	old := summaryRunner
-	summaryRunner = func(job summaryJob, model string) summaryResult {
-		calls <- struct{}{}
-		return summaryResult{key: job.key, err: errors.New("simulated: usage limit reached")}
+	ports := Ports{
+		Observer: f, Tmux: f, Notifier: f, Summarizer: f, Memory: f, Files: f,
+		LoadConfig: func() (config.Config, error) { return cfg, nil },
+		Now:        time.Now,
+		Log:        log.New(f, "", 0),
 	}
-	defer func() { summaryRunner = old }()
+	mem := core.NewMemory()
+	mem.Initialized = true
+	d := New(opt, ports, machine.New(cfg, mem, time.Unix(0, 0)))
+	ctx, cancel := context.WithCancel(context.Background())
+	h := &harness{f: f, dir: dir, client: ipc.Client{Socket: opt.Socket}, cancel: cancel, done: make(chan error, 1), reload: make(chan struct{}, 1)}
+	go func() { h.done <- d.Run(ctx, h.reload) }()
+	eventually(t, "daemon socket", func() bool {
+		_, err := h.client.Call(ipc.Request{Op: ipc.OpSnapshot}, time.Second)
+		return err == nil
+	})
+	t.Cleanup(func() { h.stop(t) })
+	return h
+}
 
-	stop := make(chan struct{})
-	done := make(chan error, 1)
-	go func() { done <- Run(log.New(io.Discard, "", 0), stop) }()
-	defer func() { close(stop); <-done }()
-	for i := 0; i < 100; i++ {
-		if _, err := ipc.Call(ipc.Request{Op: ipc.OpSnapshot}, time.Second); err == nil {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
+func (h *harness) stop(t *testing.T) {
+	if h.cancel == nil {
+		return
 	}
+	h.cancel()
+	h.cancel = nil
+	select {
+	case err := <-h.done:
+		if err != nil {
+			t.Errorf("Run: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Error("daemon did not stop")
+	}
+}
 
-	st, _ := procs.ReadStat(os.Getpid())
-	// 20 events for a session that needs you, each forcing a recompute.
-	for i := 0; i < 20; i++ {
-		now := time.Now()
-		if err := store.Update(model.Claude, "blocked", func(model.HookState) model.HookState {
-			return model.HookState{Version: 1, Agent: model.Claude, SessionID: "blocked", PID: st.PID, PIDStart: st.StartTime,
-				Activity: model.NeedsApproval, ActivityAt: now.Add(-time.Minute), LastEventAt: now,
-				Question: "Allow Bash: make install", LastMessage: "Ready to install."}
-		}); err != nil {
-			t.Fatal(err)
-		}
-		time.Sleep(15 * time.Millisecond)
+func testCfg() config.Config {
+	c := config.Default()
+	c.NotifyCommand = []string{"notify"}
+	c.Summaries = "off"
+	return c
+}
+
+// --- tests ---------------------------------------------------------------------
+
+func TestStartupObservesEverythingAndServesSnapshots(t *testing.T) {
+	h := start(t, testCfg())
+	if !h.f.get(func(f *fakes) bool { return f.reloads == 1 && f.tmuxReads == 1 && f.discovers == 1 && f.observes >= 1 }) {
+		t.Fatalf("startup scope: %+v", h.f)
 	}
-	time.Sleep(300 * time.Millisecond)
-	if n := len(calls); n != 1 {
-		t.Fatalf("summarizer called %d times for one unchanged input; want 1", n)
+	resp, err := h.client.Call(ipc.Request{Op: ipc.OpSnapshot}, time.Second)
+	if err != nil || resp.Snapshot == nil || len(resp.Snapshot.Sessions) != 1 || !resp.Snapshot.FromDaemon {
+		t.Fatalf("%v %+v", err, resp)
+	}
+	sub, err := h.client.Subscribe(time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+	if snap, err := sub.Next(); err != nil || len(snap.Sessions) != 1 {
+		t.Fatalf("subscription: %v %+v", err, snap)
+	}
+	if !h.f.get(func(f *fakes) bool {
+		return len(f.status) == 1 && strings.Contains(f.status[0], "●1") && len(f.glyphs) == 1
+	}) {
+		t.Fatalf("tmux decoration: %v %v", h.f.status, h.f.glyphs)
+	}
+}
+
+func TestHookFileChangeIsObservedAndNotifies(t *testing.T) {
+	h := start(t, testCfg())
+	sub, _ := h.client.Subscribe(time.Second)
+	defer sub.Close()
+	sub.Next()
+	before := 0
+	h.f.get(func(f *fakes) bool { before = f.observes; return true })
+
+	// Temp and lock files are ignored.
+	os.WriteFile(filepath.Join(h.dir, "sessions", ".claude-s1.json.123.tmp"), []byte("{}"), 0o600)
+	os.WriteFile(filepath.Join(h.dir, "sessions", ".lock"), nil, 0o600)
+
+	h.f.setActivity(model.NeedsApproval, "Allow Bash: make install", "")
+	p := filepath.Join(h.dir, "sessions", "claude-s1.json")
+	os.WriteFile(p, []byte("{}"), 0o600)
+	snap, err := sub.Next()
+	if err != nil || snap.Sessions[0].Group != core.GroupNeedsYou {
+		t.Fatalf("%v %+v", err, snap)
+	}
+	if !h.f.get(func(f *fakes) bool {
+		for _, x := range f.hookFiles {
+			if x != p {
+				return false // a temp or lock file reached the observer
+			}
+		}
+		return len(f.hookFiles) >= 1 && f.observes > before
+	}) {
+		t.Fatalf("hook files %v", h.f.hookFiles)
+	}
+	eventually(t, "notification", func() bool {
+		return h.f.get(func(f *fakes) bool {
+			return len(f.notified) == 1 && f.notified[0][0] == "notify" && strings.Contains(f.notified[0][2], "Allow Bash: make install")
+		})
+	})
+}
+
+func TestTmuxEventScopes(t *testing.T) {
+	for event, want := range map[string]Scope{
+		"session-window-changed": scopeTmux,
+		"client-focus-in":        scopeTmux,
+		"pane-exited":            scopeDiscover,
+		"after-new-window":       scopeDiscover,
+	} {
+		if got := TmuxEventScope(event); got != want {
+			t.Errorf("%s: %+v want %+v", event, got, want)
+		}
+	}
+	h := start(t, testCfg())
+	var tmux0, disc0 int
+	h.f.get(func(f *fakes) bool { tmux0, disc0 = f.tmuxReads, f.discovers; return true })
+	h.client.Send(ipc.Request{Op: ipc.OpTmux, Event: "client-focus-in"}, time.Second)
+	eventually(t, "tmux reread", func() bool { return h.f.get(func(f *fakes) bool { return f.tmuxReads == tmux0+1 }) })
+	if h.f.get(func(f *fakes) bool { return f.discovers != disc0 }) {
+		t.Fatal("a focus change rescanned processes")
+	}
+	h.client.Send(ipc.Request{Op: ipc.OpTmux, Event: "pane-exited"}, time.Second)
+	eventually(t, "rediscovery", func() bool { return h.f.get(func(f *fakes) bool { return f.discovers == disc0+1 }) })
+}
+
+func TestSeenAliasAndRefreshRequests(t *testing.T) {
+	h := start(t, testCfg())
+	if _, err := h.client.Call(ipc.Request{Op: ipc.OpAlias, Key: "claude:s1", Value: "box"}, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.client.Call(ipc.Request{Op: ipc.OpSeen, Key: "claude:s1"}, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := h.client.Call(ipc.Request{Op: ipc.OpRefresh}, time.Second)
+	if err != nil || resp.Snapshot.Sessions[0].Alias != "box" {
+		t.Fatalf("%v %+v", err, resp)
+	}
+	if !h.f.get(func(f *fakes) bool { return f.reloads == 2 && f.discovers == 2 }) {
+		t.Fatalf("refresh scope: reloads=%d discovers=%d", h.f.reloads, h.f.discovers)
+	}
+	if _, err := h.client.Call(ipc.Request{Op: "bogus"}, time.Second); err == nil {
+		t.Fatal("unknown op accepted")
+	}
+}
+
+func TestSummariesRunThroughThePort(t *testing.T) {
+	cfg := testCfg()
+	cfg.Summaries = "always"
+	h := start(t, cfg)
+	h.f.setActivity(model.NeedsApproval, "Allow Bash: make install", "Ready.")
+	h.client.Call(ipc.Request{Op: ipc.OpRefresh}, time.Second)
+	eventually(t, "summary shown", func() bool {
+		resp, err := h.client.Call(ipc.Request{Op: ipc.OpSnapshot}, time.Second)
+		return err == nil && resp.Snapshot.Sessions[0].Summary == "Approve make install"
+	})
+	if !h.f.get(func(f *fakes) bool { return len(f.summaries) == 1 && strings.Contains(f.summaries[0], "make install") }) {
+		t.Fatalf("summaries %v", h.f.summaries)
+	}
+}
+
+func TestStopSavesAndClearsTmux(t *testing.T) {
+	h := start(t, testCfg())
+	h.stop(t)
+	if !h.f.get(func(f *fakes) bool {
+		return len(f.saved) >= 1 && f.status[len(f.status)-1] == "" && f.glyphs[len(f.glyphs)-1] == "@1="
+	}) {
+		t.Fatalf("saved=%d status=%q glyphs=%q", len(h.f.saved), h.f.status, h.f.glyphs)
+	}
+}
+
+func TestFailingTmuxWritesAreResent(t *testing.T) {
+	h := start(t, testCfg())
+	h.f.set(func(f *fakes) { f.tmuxErr = errors.New("server gone") })
+	h.f.setActivity(model.NeedsApproval, "", "")
+	h.client.Call(ipc.Request{Op: ipc.OpRefresh}, time.Second)
+	var n int
+	h.f.get(func(f *fakes) bool { n = len(f.status); return true })
+	h.f.set(func(f *fakes) { f.tmuxErr = nil })
+	// Same state: normally nothing would be re-sent, but the failure forces it.
+	h.client.Call(ipc.Request{Op: ipc.OpRefresh}, time.Second)
+	if !h.f.get(func(f *fakes) bool { return len(f.status) == n+1 }) {
+		t.Fatalf("status writes: before %d after %d", n, len(h.f.status))
+	}
+	if !h.f.get(func(f *fakes) bool {
+		for _, l := range f.logs {
+			if strings.Contains(l, "tmux") {
+				return true
+			}
+		}
+		return false
+	}) {
+		t.Fatal("tmux failure not logged")
+	}
+}
+
+func TestConfigReload(t *testing.T) {
+	h := start(t, testCfg())
+	h.reload <- struct{}{}
+	eventually(t, "reload logged", func() bool {
+		return h.f.get(func(f *fakes) bool {
+			for _, l := range f.logs {
+				if strings.Contains(l, "config reloaded") {
+					return true
+				}
+			}
+			return false
+		})
+	})
+}
+
+func TestSecondDaemonRefusesToStart(t *testing.T) {
+	h := start(t, testCfg())
+	d := New(Options{SessionsDir: filepath.Join(h.dir, "s2"), RegistryDir: h.dir, Socket: h.client.Socket},
+		Ports{Log: log.New(io.Discard, "", 0), Now: time.Now}, machine.New(testCfg(), core.NewMemory(), time.Now()))
+	if err := d.Run(context.Background(), nil); err == nil || !strings.Contains(err.Error(), "another daemon") {
+		t.Fatalf("%v", err)
+	}
+}
+
+// --- pidfd watcher contract test (real child process) ---------------------------
+
+func TestPidWatcherReportsExit(t *testing.T) {
+	cmd := exec.Command("sleep", "30")
+	if err := cmd.Start(); err != nil {
+		t.Skip("cannot start sleep:", err)
+	}
+	ch := make(chan int, 4)
+	w, err := newPidWatcher(ch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	w.Watch(cmd.Process.Pid)
+	w.Watch(cmd.Process.Pid) // idempotent
+	select {
+	case pid := <-ch:
+		t.Fatalf("reported %d before it exited", pid)
+	case <-time.After(50 * time.Millisecond):
+	}
+	cmd.Process.Kill()
+	cmd.Wait()
+	select {
+	case pid := <-ch:
+		if pid != cmd.Process.Pid {
+			t.Fatalf("pid %d", pid)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("exit not reported")
+	}
+}
+
+// --- real adapters refuse inside tests ------------------------------------------
+
+func TestRealAdaptersRefuseInTests(t *testing.T) {
+	if err := (ExecNotifier{}).Notify([]string{"notify-send", "x"}); err == nil {
+		t.Fatal("ExecNotifier ran from a test")
+	}
+	if _, err := (ClaudeSummarizer{}).Summarize(context.Background(), "haiku", "x"); err == nil {
+		t.Fatal("ClaudeSummarizer ran from a test")
+	}
+	if err := (TmuxOptions{Client: tmux.New("")}).SetStatus("x"); err == nil {
+		t.Fatal("TmuxOptions touched the default tmux server from a test")
 	}
 }

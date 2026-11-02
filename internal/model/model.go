@@ -1,7 +1,10 @@
 // Package model defines the types shared by the hook, engine, daemon and UI.
 package model
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // Agent identifies the coding agent a session belongs to.
 type Agent string
@@ -113,4 +116,22 @@ type Event struct {
 	SubAgent         bool // event fired inside a subagent
 	TerminationCause string
 	FirstInvocation  bool
+}
+
+// IsPrintMode reports whether an agent command line runs non-interactively.
+// Both claude and agy use -p / --print (agy also --prompt).
+func IsPrintMode(args []string) bool {
+	if len(args) == 0 {
+		return false
+	}
+	for _, a := range args[1:] {
+		switch {
+		case a == "--":
+			return false
+		case a == "-p", a == "--print", a == "--prompt",
+			strings.HasPrefix(a, "--print="), strings.HasPrefix(a, "--prompt="):
+			return true
+		}
+	}
+	return false
 }

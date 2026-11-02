@@ -3,6 +3,9 @@ package hook
 import (
 	"strings"
 	"testing"
+	"time"
+
+	"cccp/internal/model"
 )
 
 func TestParseClaudePermissionRequest(t *testing.T) {
@@ -68,8 +71,7 @@ func TestToolDetail(t *testing.T) {
 func TestParseAgy(t *testing.T) {
 	// Payload captured from agy 1.4.8 (see docs/agy-hooks.md).
 	raw := `{"artifactDirectoryPath":"/b/e24","conversationId":"e2419653-70bd","error":"","lastUserInput":"<USER_REQUEST>\nRun the shell command\n</USER_REQUEST>","modelName":"gemini-4-argon-high","stepIdx":2,"toolCall":{"args":{"CommandLine":"echo cccp-probe","WaitMsBeforeAsync":5000,"toolSummary":"Echo cccp-probe string"},"name":"run_command"},"transcriptPath":"/b/t.jsonl","workspacePaths":["/w/ws"]}`
-	t.Setenv(AgyEventEnv, "PostToolUse")
-	ev, err := ParseAgy([]byte(raw))
+	ev, err := ParseAgy([]byte(raw), "PostToolUse")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,17 +79,15 @@ func TestParseAgy(t *testing.T) {
 		ev.ToolDetail != "Echo cccp-probe string" || ev.Prompt != "Run the shell command" {
 		t.Fatalf("%+v", ev)
 	}
-	t.Setenv(AgyEventEnv, "PreInvocation")
-	ev, _ = ParseAgy([]byte(`{"conversationId":"c","invocationNum":0,"initialNumSteps":1}`))
+	ev, _ = ParseAgy([]byte(`{"conversationId":"c","invocationNum":0,"initialNumSteps":1}`), "PreInvocation")
 	if !ev.FirstInvocation {
 		t.Fatal("invocationNum 0 is the first invocation")
 	}
-	ev, _ = ParseAgy([]byte(`{"conversationId":"c","invocationNum":1}`))
+	ev, _ = ParseAgy([]byte(`{"conversationId":"c","invocationNum":1}`), "PreInvocation")
 	if ev.FirstInvocation {
 		t.Fatal("invocationNum 1 is not the first invocation")
 	}
-	t.Setenv(AgyEventEnv, "")
-	if _, err := ParseAgy([]byte(raw)); err == nil {
+	if _, err := ParseAgy([]byte(raw), ""); err == nil {
 		t.Fatal("missing event name must be an error")
 	}
 }
@@ -96,5 +96,87 @@ func TestClipKeepsUTF8(t *testing.T) {
 	s := clip(strings.Repeat("é", 10), 5)
 	if s != "éé…" {
 		t.Fatalf("%q", s)
+	}
+}
+
+// --- Handle, with fake dependencies --------------------------------------------
+
+type memStore map[string]model.HookState
+
+func (m memStore) Update(a model.Agent, sid string, fn func(model.HookState) model.HookState) error {
+	m[string(a)+":"+sid] = fn(m[string(a)+":"+sid])
+	return nil
+}
+
+func deps(env map[string]string, agent *Agent, st memStore) Deps {
+	return Deps{
+		Getenv: func(k string) string { return env[k] },
+		FindAgent: func(model.Agent) (Agent, bool) {
+			if agent == nil {
+				return Agent{}, false
+			}
+			return *agent, true
+		},
+		Store: st,
+	}
+}
+
+var hookNow = time.Date(2026, 11, 2, 12, 0, 0, 0, time.UTC)
+
+func TestHandleRecordsEvent(t *testing.T) {
+	st := memStore{}
+	d := deps(map[string]string{"TMUX_PANE": "%7"}, &Agent{PID: 42, Start: 9, Cmdline: []string{"claude"}}, st)
+	err := Handle(d, model.Claude, strings.NewReader(`{"session_id":"s","hook_event_name":"UserPromptSubmit","prompt":"hi","cwd":"/w"}`), hookNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := st["claude:s"]
+	if s.Activity != model.Working || s.Pane != "%7" || s.PID != 42 || s.PIDStart != 9 || s.LastPrompt != "hi" ||
+		s.Cwd != "/w" || !s.ActivityAt.Equal(hookNow) || s.PrintMode {
+		t.Fatalf("%+v", s)
+	}
+}
+
+func TestHandlePrintModeAndMissingAgent(t *testing.T) {
+	st := memStore{}
+	d := deps(nil, &Agent{PID: 42, Cmdline: []string{"claude", "-p", "x"}}, st)
+	Handle(d, model.Claude, strings.NewReader(`{"session_id":"s","hook_event_name":"Stop"}`), hookNow)
+	if !st["claude:s"].PrintMode {
+		t.Fatal("print mode not recorded")
+	}
+	d = deps(nil, nil, st)
+	Handle(d, model.Claude, strings.NewReader(`{"session_id":"t","hook_event_name":"Stop"}`), hookNow)
+	if s := st["claude:t"]; s.PID != 0 || s.Activity != model.Idle {
+		t.Fatalf("%+v", s)
+	}
+}
+
+func TestHandleInternalIsNoOp(t *testing.T) {
+	st := memStore{}
+	d := deps(map[string]string{"CCCP_INTERNAL": "1"}, nil, st)
+	if err := Handle(d, model.Claude, strings.NewReader(`{"session_id":"s","hook_event_name":"Stop"}`), hookNow); err != nil || len(st) != 0 {
+		t.Fatalf("%v %v", err, st)
+	}
+}
+
+func TestHandleAgyAndErrors(t *testing.T) {
+	st := memStore{}
+	d := deps(map[string]string{AgyEventEnv: "Stop"}, nil, st)
+	if err := Handle(d, model.Agy, strings.NewReader(`{"conversationId":"c","terminationReason":"NO_TOOL_CALL"}`), hookNow); err != nil {
+		t.Fatal(err)
+	}
+	if s := st["agy:c"]; s.Activity != model.Idle || !s.TurnEndedAt.Equal(hookNow) {
+		t.Fatalf("%+v", s)
+	}
+	for name, in := range map[string]string{
+		"no session id": `{"hook_event_name":"Stop"}`,
+		"bad json":      `{`,
+	} {
+		if err := Handle(d, model.Claude, strings.NewReader(in), hookNow); err == nil {
+			t.Errorf("%s: no error", name)
+		}
+	}
+	if err := Handle(d, "other", strings.NewReader(`{}`), hookNow); err == nil {
+		t.Error("unknown agent accepted")
 	}
 }

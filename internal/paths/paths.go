@@ -1,101 +1,118 @@
-// Package paths centralises every filesystem location cccp reads or writes.
+// Package paths resolves every location cccp uses. Resolve is a pure
+// function of the environment; only the composition root (cmd/cccp) calls
+// it, and everything else receives the paths it needs as values.
 package paths
 
 import (
 	"fmt"
-	"os"
 	"path/filepath"
 	"regexp"
 )
 
-func home() string {
-	if h, err := os.UserHomeDir(); err == nil {
-		return h
-	}
-	return os.Getenv("HOME")
+// Layout is the resolved set of locations.
+type Layout struct {
+	Home string
+
+	// cccp's own state, cache and config.
+	StateDir     string // ~/.local/state/cccp
+	SessionsDir  string // hook-written session state files
+	MemoryFile   string // daemon memory (seen marks, aliases, summaries)
+	HookErrorLog string
+	CacheDir     string // ~/.cache/cccp
+	TextDir      string // extracted transcript text for search
+	ConfigFile   string
+	Socket       string
+	// TmuxSocket selects a tmux server; empty means tmux's default.
+	TmuxSocket string
+
+	// Claude Code.
+	ClaudeDir         string
+	ClaudeRegistryDir string
+	ClaudeProjectsDir string
+
+	// Antigravity CLI.
+	AgyDir         string
+	AgySummariesDB string
+	AgyBrainDir    string
+	AgyPluginDir   string
+
+	// Installed artefacts.
+	ShareDir       string // ~/.local/share/cccp
+	MarketplaceDir string
+	TmuxSnippet    string
+	TmuxRestore    string
+	BinPath        string
+	SystemdUnit    string
+	TmuxConf       string
 }
 
-func xdg(env, fallback string) string {
-	if v := os.Getenv(env); v != "" && filepath.IsAbs(v) {
-		return v
+// Resolve computes the layout from environment variables (getenv) and the
+// home directory. Overrides: CCCP_STATE_DIR, CCCP_CACHE_DIR, CCCP_SOCKET,
+// CCCP_TMUX_SOCKET, XDG_STATE_HOME, XDG_CACHE_HOME, XDG_CONFIG_HOME,
+// XDG_RUNTIME_DIR, CLAUDE_CONFIG_DIR.
+func Resolve(getenv func(string) string, home string, uid int) Layout {
+	xdg := func(env, fallback string) string {
+		if v := getenv(env); v != "" && filepath.IsAbs(v) {
+			return v
+		}
+		return filepath.Join(home, fallback)
 	}
-	return filepath.Join(home(), fallback)
-}
-
-// StateDir holds cccp's persistent state (hook-written session files, daemon state).
-func StateDir() string {
-	if v := os.Getenv("CCCP_STATE_DIR"); v != "" {
-		return v
+	or := func(v, fallback string) string {
+		if v != "" {
+			return v
+		}
+		return fallback
 	}
-	return filepath.Join(xdg("XDG_STATE_HOME", ".local/state"), "cccp")
-}
-
-// SessionsDir holds one JSON file per hook-observed session.
-func SessionsDir() string { return filepath.Join(StateDir(), "sessions") }
-
-// SessionsLock is the lock file serialising hook read-modify-write cycles.
-func SessionsLock() string { return filepath.Join(SessionsDir(), ".lock") }
-
-// DaemonStateFile holds seen-times and aliases.
-func DaemonStateFile() string { return filepath.Join(StateDir(), "daemon.json") }
-
-// LogFile is the daemon's log.
-func LogFile() string { return filepath.Join(StateDir(), "daemon.log") }
-
-// CacheDir holds derived, rebuildable data (extracted transcript text).
-func CacheDir() string {
-	if v := os.Getenv("CCCP_CACHE_DIR"); v != "" {
-		return v
+	l := Layout{Home: home}
+	l.StateDir = or(getenv("CCCP_STATE_DIR"), filepath.Join(xdg("XDG_STATE_HOME", ".local/state"), "cccp"))
+	l.SessionsDir = filepath.Join(l.StateDir, "sessions")
+	l.MemoryFile = filepath.Join(l.StateDir, "daemon.json")
+	l.HookErrorLog = filepath.Join(l.StateDir, "hook-errors.log")
+	l.CacheDir = or(getenv("CCCP_CACHE_DIR"), filepath.Join(xdg("XDG_CACHE_HOME", ".cache"), "cccp"))
+	l.TextDir = filepath.Join(l.CacheDir, "text")
+	l.ConfigFile = filepath.Join(xdg("XDG_CONFIG_HOME", ".config"), "cccp", "config.toml")
+	switch {
+	case getenv("CCCP_SOCKET") != "":
+		l.Socket = getenv("CCCP_SOCKET")
+	case getenv("XDG_RUNTIME_DIR") != "":
+		l.Socket = filepath.Join(getenv("XDG_RUNTIME_DIR"), "cccp.sock")
+	default:
+		l.Socket = filepath.Join("/tmp", fmt.Sprintf("cccp-%d.sock", uid))
 	}
-	return filepath.Join(xdg("XDG_CACHE_HOME", ".cache"), "cccp")
+	l.TmuxSocket = getenv("CCCP_TMUX_SOCKET")
+
+	l.ClaudeDir = or(getenv("CLAUDE_CONFIG_DIR"), filepath.Join(home, ".claude"))
+	l.ClaudeRegistryDir = filepath.Join(l.ClaudeDir, "sessions")
+	l.ClaudeProjectsDir = filepath.Join(l.ClaudeDir, "projects")
+
+	l.AgyDir = filepath.Join(home, ".gemini", "antigravity-cli")
+	l.AgySummariesDB = filepath.Join(l.AgyDir, "conversation_summaries.db")
+	l.AgyBrainDir = filepath.Join(l.AgyDir, "brain")
+	l.AgyPluginDir = filepath.Join(home, ".gemini", "config", "plugins", "cccp")
+
+	l.ShareDir = filepath.Join(home, ".local", "share", "cccp")
+	l.MarketplaceDir = filepath.Join(l.ShareDir, "marketplace")
+	l.TmuxSnippet = filepath.Join(l.ShareDir, "cccp.tmux")
+	l.TmuxRestore = filepath.Join(l.ShareDir, "tmux-restore.json")
+	l.BinPath = filepath.Join(home, ".local", "bin", "cccp")
+	l.SystemdUnit = filepath.Join(xdg("XDG_CONFIG_HOME", ".config"), "systemd", "user", "cccp.service")
+	l.TmuxConf = filepath.Join(home, ".tmux.conf")
+	return l
 }
-
-// ConfigFile is the user's config.
-func ConfigFile() string {
-	return filepath.Join(xdg("XDG_CONFIG_HOME", ".config"), "cccp", "config.toml")
-}
-
-// Socket is the daemon's unix socket.
-func Socket() string {
-	if v := os.Getenv("CCCP_SOCKET"); v != "" {
-		return v
-	}
-	if rt := os.Getenv("XDG_RUNTIME_DIR"); rt != "" {
-		return filepath.Join(rt, "cccp.sock")
-	}
-	return filepath.Join(os.TempDir(), fmt.Sprintf("cccp-%d.sock", os.Getuid()))
-}
-
-// ClaudeDir is Claude Code's config directory.
-func ClaudeDir() string {
-	if v := os.Getenv("CLAUDE_CONFIG_DIR"); v != "" {
-		return v
-	}
-	return filepath.Join(home(), ".claude")
-}
-
-// ClaudeRegistryDir holds Claude Code's live session registry (<pid>.json).
-func ClaudeRegistryDir() string { return filepath.Join(ClaudeDir(), "sessions") }
-
-// ClaudeProjectsDir holds Claude Code transcripts, one directory per cwd.
-func ClaudeProjectsDir() string { return filepath.Join(ClaudeDir(), "projects") }
 
 var slugRe = regexp.MustCompile(`[^A-Za-z0-9]`)
 
-// ClaudeProjectDir returns the transcript directory Claude Code uses for cwd.
-// Verified against existing directories: every non-alphanumeric byte becomes '-'.
-func ClaudeProjectDir(cwd string) string {
-	return filepath.Join(ClaudeProjectsDir(), slugRe.ReplaceAllString(cwd, "-"))
+// ProjectSlug is the name of the directory under ~/.claude/projects that
+// Claude Code uses for cwd. Verified against existing directories: every
+// non-alphanumeric byte becomes '-'.
+func ProjectSlug(cwd string) string { return slugRe.ReplaceAllString(cwd, "-") }
+
+// ClaudeProjectDir is the transcript directory for cwd.
+func (l Layout) ClaudeProjectDir(cwd string) string {
+	return filepath.Join(l.ClaudeProjectsDir, ProjectSlug(cwd))
 }
 
-// AgyDir is the Antigravity CLI data directory.
-func AgyDir() string { return filepath.Join(home(), ".gemini", "antigravity-cli") }
-
-// AgySummariesDB is agy's conversation summary database.
-func AgySummariesDB() string { return filepath.Join(AgyDir(), "conversation_summaries.db") }
-
-// AgyPluginDir is where the cccp agy plugin is installed.
-func AgyPluginDir() string { return filepath.Join(home(), ".gemini", "config", "plugins", "cccp") }
-
-// Home returns the user's home directory.
-func Home() string { return home() }
+// AgyTranscript is an agy conversation's full transcript.
+func (l Layout) AgyTranscript(id string) string {
+	return filepath.Join(l.AgyBrainDir, id, ".system_generated", "logs", "transcript_full.jsonl")
+}

@@ -9,8 +9,7 @@ import (
 	"net"
 	"time"
 
-	"cccp/internal/engine"
-	"cccp/internal/paths"
+	"cccp/internal/core"
 )
 
 // Ops.
@@ -36,17 +35,22 @@ type Request struct {
 
 // Response is a daemon message.
 type Response struct {
-	OK       bool             `json:"ok"`
-	Error    string           `json:"error,omitempty"`
-	Snapshot *engine.Snapshot `json:"snapshot,omitempty"`
+	OK       bool           `json:"ok"`
+	Error    string         `json:"error,omitempty"`
+	Snapshot *core.Snapshot `json:"snapshot,omitempty"`
 }
 
 // ErrNoDaemon means nothing is listening on the socket.
 var ErrNoDaemon = errors.New("daemon not running")
 
+// Client talks to the daemon listening on Socket.
+type Client struct {
+	Socket string
+}
+
 // Dial connects to the daemon.
-func Dial(timeout time.Duration) (net.Conn, error) {
-	c, err := net.DialTimeout("unix", paths.Socket(), timeout)
+func (cl Client) Dial(timeout time.Duration) (net.Conn, error) {
+	c, err := net.DialTimeout("unix", cl.Socket, timeout)
 	if err != nil {
 		return nil, ErrNoDaemon
 	}
@@ -54,8 +58,8 @@ func Dial(timeout time.Duration) (net.Conn, error) {
 }
 
 // Send sends one request without waiting for a reply.
-func Send(req Request, timeout time.Duration) error {
-	c, err := Dial(timeout)
+func (cl Client) Send(req Request, timeout time.Duration) error {
+	c, err := cl.Dial(timeout)
 	if err != nil {
 		return err
 	}
@@ -65,8 +69,8 @@ func Send(req Request, timeout time.Duration) error {
 }
 
 // Call sends a request and reads one response.
-func Call(req Request, timeout time.Duration) (Response, error) {
-	c, err := Dial(timeout)
+func (cl Client) Call(req Request, timeout time.Duration) (Response, error) {
+	c, err := cl.Dial(timeout)
 	if err != nil {
 		return Response{}, err
 	}
@@ -92,8 +96,8 @@ type Subscription struct {
 }
 
 // Subscribe opens a subscription.
-func Subscribe(timeout time.Duration) (*Subscription, error) {
-	c, err := Dial(timeout)
+func (cl Client) Subscribe(timeout time.Duration) (*Subscription, error) {
+	c, err := cl.Dial(timeout)
 	if err != nil {
 		return nil, err
 	}
@@ -107,13 +111,13 @@ func Subscribe(timeout time.Duration) (*Subscription, error) {
 }
 
 // Next blocks for the next snapshot.
-func (s *Subscription) Next() (engine.Snapshot, error) {
+func (s *Subscription) Next() (core.Snapshot, error) {
 	var r Response
 	if err := s.dec.Decode(&r); err != nil {
-		return engine.Snapshot{}, err
+		return core.Snapshot{}, err
 	}
 	if r.Snapshot == nil {
-		return engine.Snapshot{}, errors.New("subscription message without snapshot")
+		return core.Snapshot{}, errors.New("subscription message without snapshot")
 	}
 	return *r.Snapshot, nil
 }

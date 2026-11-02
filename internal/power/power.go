@@ -38,3 +38,9 @@ func read(p string) string {
 	}
 	return strings.TrimSpace(string(b))
 }
+
+// System reads the real power supply state.
+type System struct{}
+
+// OnBattery implements the gatherer's Power source.
+func (System) OnBattery() bool { return OnBattery() }

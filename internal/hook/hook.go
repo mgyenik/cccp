@@ -2,15 +2,14 @@
 // normalised event and records it in the session's state file.
 //
 // Contract with the agents: never fail, never block, never print anything
-// that could be read as a decision. Run() always returns nil to its caller's
-// exit path; errors are only logged.
+// that could be read as a decision. The caller (cmd/cccp) always exits 0 and
+// only logs Handle's errors.
 package hook
 
 import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"os"
 	"sort"
 	"strings"
 	"time"
@@ -19,7 +18,6 @@ import (
 	"cccp/internal/model"
 	"cccp/internal/procs"
 	"cccp/internal/reduce"
-	"cccp/internal/store"
 )
 
 // Limits on stored text, in bytes.
@@ -31,10 +29,31 @@ const (
 	maxStdin    = 64 << 20
 )
 
-// Run handles one hook invocation for agent, reading the payload from r.
-// now must be taken as early as possible in the process.
-func Run(agent model.Agent, r io.Reader, now time.Time) error {
-	if os.Getenv("CCCP_INTERNAL") == "1" {
+// Updater applies a reduction to a session's stored state (store.Store).
+type Updater interface {
+	Update(agent model.Agent, sessionID string, fn func(model.HookState) model.HookState) error
+}
+
+// Agent identifies the agent process that ran the hook.
+type Agent struct {
+	PID     int
+	Start   uint64
+	Cmdline []string
+}
+
+// Deps are the hook's dependencies on its environment.
+type Deps struct {
+	Getenv func(string) string
+	// FindAgent walks up from the hook's parent to the agent process
+	// (claude or agy); ok is false when it cannot be found.
+	FindAgent func(agent model.Agent) (Agent, bool)
+	Store     Updater
+}
+
+// Handle processes one hook invocation for agent, reading the payload from
+// r. now must be taken as early as possible in the process.
+func Handle(d Deps, agent model.Agent, r io.Reader, now time.Time) error {
+	if d.Getenv("CCCP_INTERNAL") == "1" {
 		_, _ = io.Copy(io.Discard, r)
 		return nil
 	}
@@ -47,7 +66,7 @@ func Run(agent model.Agent, r io.Reader, now time.Time) error {
 	case model.Claude:
 		ev, err = ParseClaude(raw)
 	case model.Agy:
-		ev, err = ParseAgy(raw)
+		ev, err = ParseAgy(raw, d.Getenv(AgyEventEnv))
 	default:
 		return fmt.Errorf("unknown agent %q", agent)
 	}
@@ -58,14 +77,25 @@ func Run(agent model.Agent, r io.Reader, now time.Time) error {
 		return fmt.Errorf("%s %s: no session id in payload", agent, ev.Name)
 	}
 	ev.Time = now
-	ev.Pane = os.Getenv("TMUX_PANE")
-	if st, ok := procs.FindAncestor(os.Getppid(), string(agent), 8); ok {
-		ev.PID, ev.PIDStart = st.PID, st.StartTime
-		ev.PrintMode = procs.IsPrintMode(procs.Cmdline(st.PID))
+	ev.Pane = d.Getenv("TMUX_PANE")
+	if a, ok := d.FindAgent(agent); ok {
+		ev.PID, ev.PIDStart = a.PID, a.Start
+		ev.PrintMode = model.IsPrintMode(a.Cmdline)
 	}
-	return store.Update(agent, ev.SessionID, func(s model.HookState) model.HookState {
+	return d.Store.Update(agent, ev.SessionID, func(s model.HookState) model.HookState {
 		return reduce.Apply(s, ev)
 	})
+}
+
+// SystemFindAgent finds the agent process among the ancestors of ppid.
+func SystemFindAgent(ppid int) func(model.Agent) (Agent, bool) {
+	return func(agent model.Agent) (Agent, bool) {
+		st, ok := procs.FindAncestor(ppid, string(agent), 8)
+		if !ok {
+			return Agent{}, false
+		}
+		return Agent{PID: st.PID, Start: st.StartTime, Cmdline: procs.Cmdline(st.PID)}, true
+	}
 }
 
 // claudePayload covers the fields cccp reads from every Claude Code hook event.
@@ -171,14 +201,13 @@ type agyPayload struct {
 // command line passes the event name (agy payloads do not carry it).
 const AgyEventEnv = "CCCP_AGY_EVENT"
 
-// ParseAgy parses an agy hook payload; the event name comes from the
-// CCCP_AGY_EVENT environment variable set by the hook command line.
-func ParseAgy(raw []byte) (model.Event, error) {
+// ParseAgy parses an agy hook payload. agy payloads do not carry the event
+// name; the hook command line passes it in CCCP_AGY_EVENT.
+func ParseAgy(raw []byte, name string) (model.Event, error) {
 	var p agyPayload
 	if err := json.Unmarshal(raw, &p); err != nil {
 		return model.Event{}, fmt.Errorf("agy payload: %w", err)
 	}
-	name := os.Getenv(AgyEventEnv)
 	if name == "" {
 		return model.Event{}, fmt.Errorf("agy hook: %s not set", AgyEventEnv)
 	}

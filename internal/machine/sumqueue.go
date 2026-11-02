@@ -1,8 +1,15 @@
-package daemon
+package machine
 
 import (
 	"time"
 )
+
+// summaryJob asks for a one-line summary of one session's input.
+type summaryJob struct {
+	key   string
+	hash  string
+	input string
+}
 
 // Summary scheduling policy.
 const (
@@ -73,14 +80,14 @@ func (q *sumQueue) next(now time.Time) (summaryJob, bool) {
 
 // done records a finished job. It returns true when this failure paused
 // all summaries (so the caller can log it once).
-func (q *sumQueue) done(res summaryResult, hash string, now time.Time) (paused bool) {
+func (q *sumQueue) done(key, hash string, failed bool, now time.Time) (paused bool) {
 	q.running, q.runningHash = "", ""
-	if res.err == nil {
-		delete(q.failures, res.key)
+	if !failed {
+		delete(q.failures, key)
 		q.consecutive = 0
 		return false
 	}
-	f := q.failures[res.key]
+	f := q.failures[key]
 	if f.hash != hash {
 		f = failure{hash: hash}
 	}
@@ -90,7 +97,7 @@ func (q *sumQueue) done(res summaryResult, hash string, now time.Time) (paused b
 		d = backoffMax
 	}
 	f.retryAt = now.Add(d)
-	q.failures[res.key] = f
+	q.failures[key] = f
 	q.consecutive++
 	if q.consecutive >= pauseAfter {
 		q.consecutive = 0

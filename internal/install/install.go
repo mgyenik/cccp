@@ -1,0 +1,448 @@
+// Package install installs and removes cccp's integrations: the binary, the
+// Claude Code plugin, the agy plugin, the systemd user unit and the tmux
+// snippet. Every external effect goes through injected dependencies (a
+// command runner, a tmux runner, the embedded assets, the layout), and the
+// tmux.conf edits are pure functions.
+package install
+
+import (
+	"bufio"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"cccp/internal/paths"
+	"cccp/internal/store"
+	"cccp/internal/tmux"
+)
+
+// Runner runs an external command and returns its combined output.
+type Runner interface {
+	Run(name string, args ...string) (string, error)
+}
+
+// Tmux runs tmux commands (tmux.Client).
+type Tmux interface {
+	Run(args ...string) (string, error)
+}
+
+// Installer holds the installation's dependencies.
+type Installer struct {
+	L      paths.Layout
+	Assets fs.FS // the embedded integrations (cccp.Assets)
+	Cmd    Runner
+	Tmux   Tmux
+	Self   string // path of the running binary
+	Out    io.Writer
+	In     *bufio.Reader
+	Yes    bool // do every step without asking
+}
+
+// Step names, in order.
+const (
+	StepBin     = "bin"
+	StepClaude  = "claude"
+	StepAgy     = "agy"
+	StepSystemd = "systemd"
+	StepTmux    = "tmux"
+)
+
+type step struct {
+	name  string
+	what  string
+	apply func() error
+}
+
+func (i *Installer) printf(format string, a ...any) { fmt.Fprintf(i.Out, format, a...) }
+
+func (i *Installer) confirm() bool {
+	if i.Yes {
+		return true
+	}
+	i.printf("  proceed? [y/N] ")
+	line, _ := i.In.ReadString('\n')
+	line = strings.ToLower(strings.TrimSpace(line))
+	return line == "y" || line == "yes"
+}
+
+// Install runs the install steps (all of them when only is empty).
+func (i *Installer) Install(only map[string]bool) error {
+	l := i.L
+	steps := []step{
+		{StepBin, "copy this binary to " + l.BinPath, i.installBin},
+		{StepClaude, "install the Claude Code plugin (observe-only hooks) from a local marketplace at " + l.MarketplaceDir +
+			"\n    runs: claude plugin marketplace add …; claude plugin install cccp@cccp" +
+			"\n    takes effect in sessions started (or /reload-plugins'd) afterwards", i.installClaude},
+		{StepAgy, "install the agy plugin (observe-only hooks: SessionStart, PreInvocation, PostToolUse, Stop) to " + l.AgyPluginDir, i.installAgy},
+		{StepSystemd, "install and start the systemd user unit " + l.SystemdUnit, i.installSystemd},
+		{StepTmux, "add `" + SourceLine(l.TmuxSnippet) + "` to " + l.TmuxConf +
+			"\n    sets focus-events on, hooks [97], prefix a / prefix A, status-right and window-status formats" +
+			"\n    (current values are saved to " + l.TmuxRestore + " for uninstall)", i.installTmux},
+	}
+	for _, s := range steps {
+		if len(only) > 0 && !only[s.name] {
+			continue
+		}
+		i.printf("\n[%s] %s\n", s.name, s.what)
+		if !i.confirm() {
+			i.printf("  skipped\n")
+			continue
+		}
+		if err := s.apply(); err != nil {
+			return fmt.Errorf("%s: %w", s.name, err)
+		}
+		i.printf("  done\n")
+	}
+	i.printf("\nRun `cccp doctor` to check the installation.\n")
+	return nil
+}
+
+// Uninstall reverses every step, continuing past failures.
+func (i *Installer) Uninstall() error {
+	l := i.L
+	steps := []step{
+		{StepTmux, "remove the cccp line from " + l.TmuxConf + ", unset cccp's hooks and options and restore saved settings", i.uninstallTmux},
+		{StepSystemd, "stop, disable and remove the systemd user unit", i.uninstallSystemd},
+		{StepClaude, "uninstall the Claude Code plugin and remove the cccp marketplace", i.uninstallClaude},
+		{StepAgy, "remove " + l.AgyPluginDir, func() error { return os.RemoveAll(l.AgyPluginDir) }},
+	}
+	var failed []string
+	for _, s := range steps {
+		i.printf("\n[%s] %s\n", s.name, s.what)
+		if !i.confirm() {
+			i.printf("  skipped\n")
+			continue
+		}
+		if err := s.apply(); err != nil {
+			i.printf("  error: %v\n", err)
+			failed = append(failed, s.name)
+			continue
+		}
+		i.printf("  done\n")
+	}
+	i.printf("\nState (%s), cache (%s) and the binary (%s) are left in place; delete them by hand if you want.\n",
+		l.StateDir, l.CacheDir, l.BinPath)
+	if len(failed) > 0 {
+		return fmt.Errorf("steps failed: %s", strings.Join(failed, ", "))
+	}
+	return nil
+}
+
+// ---- files ----------------------------------------------------------------------
+
+func (i *Installer) writeAsset(src, dst string, mode os.FileMode) error {
+	b, err := fs.ReadFile(i.Assets, src)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return err
+	}
+	if err := store.WriteAtomic(dst, b); err != nil {
+		return err
+	}
+	return os.Chmod(dst, mode)
+}
+
+func (i *Installer) writeTree(src, dst string) error {
+	return fs.WalkDir(i.Assets, src, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(src, p)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(dst, rel)
+		if d.IsDir() {
+			return os.MkdirAll(target, 0o755)
+		}
+		return i.writeAsset(p, target, 0o644)
+	})
+}
+
+// ---- steps ------------------------------------------------------------------------
+
+func (i *Installer) installBin() error {
+	self, err := filepath.EvalSymlinks(i.Self)
+	if err != nil {
+		return err
+	}
+	if dst, _ := filepath.EvalSymlinks(i.L.BinPath); dst == self {
+		i.printf("  already running from %s\n", i.L.BinPath)
+		return nil
+	}
+	b, err := os.ReadFile(self)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(i.L.BinPath), 0o755); err != nil {
+		return err
+	}
+	// Atomic replace: a running daemon keeps its (unlinked) old binary.
+	if err := store.WriteAtomic(i.L.BinPath, b); err != nil {
+		return err
+	}
+	return os.Chmod(i.L.BinPath, 0o755)
+}
+
+func (i *Installer) installClaude() error {
+	mp := i.L.MarketplaceDir
+	if err := i.writeAsset(".claude-plugin/marketplace.json", filepath.Join(mp, ".claude-plugin", "marketplace.json"), 0o644); err != nil {
+		return err
+	}
+	if err := i.writeTree("integrations/claude-plugin", filepath.Join(mp, "integrations", "claude-plugin")); err != nil {
+		return err
+	}
+	list, err := i.Cmd.Run("claude", "plugin", "marketplace", "list")
+	if err != nil {
+		return fmt.Errorf("claude plugin marketplace list: %v: %s", err, list)
+	}
+	if !strings.Contains(list, mp) {
+		if out, err := i.Cmd.Run("claude", "plugin", "marketplace", "add", mp); err != nil {
+			return fmt.Errorf("marketplace add: %v: %s", err, out)
+		}
+	}
+	plugins, err := i.Cmd.Run("claude", "plugin", "list")
+	if err != nil {
+		return fmt.Errorf("claude plugin list: %v: %s", err, plugins)
+	}
+	if strings.Contains(plugins, "cccp@cccp") {
+		i.printf("  plugin already installed; files updated in place\n")
+		return nil
+	}
+	if out, err := i.Cmd.Run("claude", "plugin", "install", "cccp@cccp"); err != nil {
+		return fmt.Errorf("plugin install: %v: %s", err, out)
+	}
+	return nil
+}
+
+func (i *Installer) installAgy() error {
+	cfg := filepath.Dir(filepath.Dir(i.L.AgyPluginDir)) // ~/.gemini/config
+	if _, err := os.Stat(cfg); err != nil {
+		i.printf("  %s not found; skipping (agy not installed?)\n", cfg)
+		return nil
+	}
+	return i.writeTree("integrations/agy-plugin", i.L.AgyPluginDir)
+}
+
+func (i *Installer) installSystemd() error {
+	if err := i.writeAsset("integrations/systemd/cccp.service", i.L.SystemdUnit, 0o644); err != nil {
+		return err
+	}
+	// restart, not start: picks up a replaced binary on reinstall.
+	for _, args := range [][]string{{"daemon-reload"}, {"enable", "cccp.service"}, {"restart", "cccp.service"}} {
+		if out, err := i.Cmd.Run("systemctl", append([]string{"--user"}, args...)...); err != nil {
+			return fmt.Errorf("systemctl --user %s: %v: %s", strings.Join(args, " "), err, out)
+		}
+	}
+	return nil
+}
+
+// RestoredOptions are the tmux options cccp.tmux changes; their values from
+// before the install are saved so uninstall can put them back.
+var RestoredOptions = []string{"focus-events", "status-right", "status-right-length", "window-status-format", "window-status-current-format"}
+
+// RestoredKeys are the prefix-table keys cccp.tmux binds.
+var RestoredKeys = []string{"a", "A"}
+
+// Hooks are the tmux hooks cccp.tmux sets, at index [97].
+var Hooks = []string{
+	"client-session-changed", "session-window-changed", "window-pane-changed", "client-focus-in",
+	"client-focus-out", "client-attached", "client-detached", "after-new-window", "after-split-window",
+	"pane-exited", "session-created", "session-closed",
+}
+
+// Saved is the tmux state cccp.tmux overrides. It is stored as data and
+// restored with set-option calls, so no value has to survive config-file
+// quoting. Keys hold tmux's own list-keys output ("" = unbound).
+type Saved struct {
+	Options map[string]string `json:"options"`
+	Keys    map[string]string `json:"keys"`
+}
+
+func (i *Installer) installTmux() error {
+	l := i.L
+	if err := i.writeAsset("integrations/tmux/cccp.tmux", l.TmuxSnippet, 0o644); err != nil {
+		return err
+	}
+	// Save the pre-install state once; a reinstall must not overwrite it
+	// with cccp's own values.
+	if _, err := os.Stat(l.TmuxRestore); errors.Is(err, os.ErrNotExist) {
+		saved := Saved{Options: map[string]string{}, Keys: map[string]string{}}
+		for _, o := range RestoredOptions {
+			if v, err := i.Tmux.Run("show-options", "-gv", o); err == nil {
+				saved.Options[o] = strings.TrimSuffix(v, "\n")
+			}
+		}
+		for _, k := range RestoredKeys {
+			out, _ := i.Tmux.Run("list-keys", "-T", "prefix", k)
+			saved.Keys[k] = strings.TrimSpace(out)
+		}
+		b, err := json.MarshalIndent(saved, "", "  ")
+		if err != nil {
+			return err
+		}
+		if err := store.WriteAtomic(l.TmuxRestore, b); err != nil {
+			return err
+		}
+	}
+	conf, err := os.ReadFile(l.TmuxConf)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if next, changed := AddSourceLine(conf, l.TmuxSnippet); changed {
+		if len(conf) > 0 {
+			if err := store.WriteAtomic(l.TmuxConf+".cccp-backup", conf); err != nil {
+				return err
+			}
+		}
+		if err := store.WriteAtomic(l.TmuxConf, next); err != nil {
+			return err
+		}
+	}
+	if _, err := i.Tmux.Run("source-file", l.TmuxSnippet); err != nil && !errors.Is(err, tmux.ErrNoServer) {
+		return err
+	}
+	return nil
+}
+
+func (i *Installer) uninstallTmux() error {
+	l := i.L
+	if conf, err := os.ReadFile(l.TmuxConf); err == nil {
+		if err := store.WriteAtomic(l.TmuxConf, RemoveSourceLine(conf, l.TmuxSnippet)); err != nil {
+			return err
+		}
+	}
+	for _, h := range Hooks {
+		_, _ = i.Tmux.Run("set-hook", "-gu", h+"[97]")
+	}
+	_, _ = i.Tmux.Run("set-option", "-gqu", "@cccp_status")
+	b, err := os.ReadFile(l.TmuxRestore)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var saved Saved
+	if err := json.Unmarshal(b, &saved); err != nil {
+		return fmt.Errorf("%s: %w", l.TmuxRestore, err)
+	}
+	for _, o := range RestoredOptions {
+		v, ok := saved.Options[o]
+		if !ok {
+			continue
+		}
+		if _, err := i.Tmux.Run("set-option", "-g", o, v); err != nil && !errors.Is(err, tmux.ErrNoServer) {
+			return err
+		}
+	}
+	for _, k := range RestoredKeys {
+		line := saved.Keys[k]
+		if line == "" {
+			_, _ = i.Tmux.Run("unbind-key", "-T", "prefix", k)
+			continue
+		}
+		// list-keys output is valid tmux config: source it back.
+		tmp := l.TmuxRestore + ".keys"
+		if err := os.WriteFile(tmp, []byte(line+"\n"), 0o600); err != nil {
+			return err
+		}
+		_, err := i.Tmux.Run("source-file", tmp)
+		os.Remove(tmp)
+		if err != nil && !errors.Is(err, tmux.ErrNoServer) {
+			return err
+		}
+	}
+	return os.Remove(l.TmuxRestore)
+}
+
+func (i *Installer) uninstallSystemd() error {
+	_, _ = i.Cmd.Run("systemctl", "--user", "disable", "--now", "cccp.service")
+	if err := os.Remove(i.L.SystemdUnit); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	_, _ = i.Cmd.Run("systemctl", "--user", "daemon-reload")
+	return nil
+}
+
+func (i *Installer) uninstallClaude() error {
+	plugins, err := i.Cmd.Run("claude", "plugin", "list")
+	if err != nil {
+		return fmt.Errorf("claude plugin list: %v: %s", err, plugins)
+	}
+	if strings.Contains(plugins, "cccp@cccp") {
+		if out, err := i.Cmd.Run("claude", "plugin", "uninstall", "cccp@cccp"); err != nil {
+			return fmt.Errorf("plugin uninstall: %v: %s", err, out)
+		}
+	}
+	list, err := i.Cmd.Run("claude", "plugin", "marketplace", "list")
+	if err != nil {
+		return fmt.Errorf("claude plugin marketplace list: %v: %s", err, list)
+	}
+	if strings.Contains(list, i.L.MarketplaceDir) {
+		if out, err := i.Cmd.Run("claude", "plugin", "marketplace", "remove", "cccp"); err != nil {
+			return fmt.Errorf("marketplace remove: %v: %s", err, out)
+		}
+	}
+	return os.RemoveAll(i.L.MarketplaceDir)
+}
+
+// ---- tmux.conf edits (pure) -----------------------------------------------------
+
+// SourceLine is the line install adds to tmux.conf.
+func SourceLine(snippet string) string { return "source-file " + snippet + "  # cccp" }
+
+// AddSourceLine appends the source line unless the configuration already
+// sources the snippet. It reports whether conf changed.
+func AddSourceLine(conf []byte, snippet string) ([]byte, bool) {
+	if sourcesSnippet(conf, snippet) {
+		return conf, false
+	}
+	out := append([]byte(nil), conf...)
+	if len(out) > 0 && out[len(out)-1] != '\n' {
+		out = append(out, '\n')
+	}
+	return append(out, []byte("\n"+SourceLine(snippet)+"\n")...), true
+}
+
+// RemoveSourceLine removes what AddSourceLine added (the line and the blank
+// line before it), and any other line sourcing the snippet.
+func RemoveSourceLine(conf []byte, snippet string) []byte {
+	s := strings.TrimSuffix(string(conf), "\n"+SourceLine(snippet)+"\n")
+	var keep []string
+	for _, l := range strings.SplitAfter(s, "\n") {
+		if !isSourceLine(l, snippet) {
+			keep = append(keep, l)
+		}
+	}
+	return []byte(strings.Join(keep, ""))
+}
+
+func sourcesSnippet(conf []byte, snippet string) bool {
+	for _, l := range strings.Split(string(conf), "\n") {
+		if isSourceLine(l, snippet) {
+			return true
+		}
+	}
+	return false
+}
+
+// isSourceLine reports whether a config line sources the snippet:
+// `source-file [-q] PATH [# comment]` (or `source`), not commented out.
+func isSourceLine(line, snippet string) bool {
+	if i := strings.Index(line, "#"); i >= 0 {
+		line = line[:i]
+	}
+	f := strings.Fields(line)
+	if len(f) < 2 || (f[0] != "source-file" && f[0] != "source") {
+		return false
+	}
+	return strings.Trim(f[len(f)-1], `"'`) == snippet
+}

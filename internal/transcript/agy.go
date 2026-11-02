@@ -9,22 +9,6 @@ import (
 	"time"
 )
 
-// AgyMeta is what cccp knows from an agy transcript
-// (brain/<id>/.system_generated/logs/transcript_full.jsonl).
-type AgyMeta struct {
-	LastStepAt     time.Time
-	LastStepType   string
-	LastStepStatus string
-	LastPrompt     string
-	LastPromptAt   time.Time
-	LastMessage    string
-	LastMessageAt  time.Time
-	// PendingTools is true when the last planner response requested tools
-	// and no later step exists.
-	PendingTools  bool
-	ContextTokens int
-}
-
 type agyEntry struct {
 	off  int64
 	size int64

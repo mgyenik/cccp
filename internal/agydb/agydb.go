@@ -11,27 +11,23 @@ import (
 
 	_ "modernc.org/sqlite"
 
-	"cccp/internal/paths"
+	"cccp/internal/model"
 )
 
-// Conversation is one row of conversation_summaries.
-type Conversation struct {
-	ID           string
-	Title        string
-	Preview      string
-	Workspaces   []string // absolute paths
-	LastModified time.Time
-}
+// Conversation is one row of agy's conversation summaries (plain data, in
+// model so the functional core can use it).
+type Conversation = model.AgyConversation
 
-// Cache re-reads the database only when it (or its WAL) changed.
+// Cache re-reads the database at Path only when it (or its WAL) changed.
 type Cache struct {
+	Path  string
 	mu    sync.Mutex
 	stamp string
 	rows  map[string]Conversation
 }
 
-// NewCache returns an empty cache.
-func NewCache() *Cache { return &Cache{} }
+// NewCache returns a cache for the database at path.
+func NewCache(path string) *Cache { return &Cache{Path: path} }
 
 func stamp(p string) string {
 	var b strings.Builder
@@ -48,7 +44,7 @@ func stamp(p string) string {
 func (c *Cache) All() map[string]Conversation {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	p := paths.AgySummariesDB()
+	p := c.Path
 	st := stamp(p)
 	if st == "" {
 		return nil

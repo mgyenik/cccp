@@ -3,13 +3,9 @@ package config
 
 import (
 	"errors"
-	"fmt"
-	"os"
 	"time"
 
 	"github.com/BurntSushi/toml"
-
-	"cccp/internal/paths"
 )
 
 // Config is the user configuration. Every field has a default.
@@ -67,23 +63,17 @@ func Default() Config {
 	}
 }
 
-// Load reads the config file over the defaults. A missing file is not an error.
-func Load() (Config, error) {
+// Parse reads a TOML configuration over the defaults. On error the defaults
+// are returned with the error.
+func Parse(data []byte) (Config, error) {
 	c := Default()
-	b, err := os.ReadFile(paths.ConfigFile())
-	if errors.Is(err, os.ErrNotExist) {
-		return c, nil
-	}
-	if err != nil {
-		return c, err
-	}
-	if _, err := toml.Decode(string(b), &c); err != nil {
-		return Default(), fmt.Errorf("%s: %w", paths.ConfigFile(), err)
+	if _, err := toml.Decode(string(data), &c); err != nil {
+		return Default(), err
 	}
 	switch c.Summaries {
 	case "off", "ac", "always":
 	default:
-		return Default(), fmt.Errorf("%s: summaries must be off, ac or always", paths.ConfigFile())
+		return Default(), errors.New("summaries must be off, ac or always")
 	}
 	return c, nil
 }

@@ -1,0 +1,779 @@
+package core
+
+import (
+	"reflect"
+	"strings"
+	"testing"
+	"time"
+
+	"cccp/internal/config"
+	"cccp/internal/model"
+)
+
+// --- fixtures ----------------------------------------------------------------
+
+var t0 = time.Date(2026, 11, 2, 12, 0, 0, 0, time.UTC)
+
+func at(sec int) time.Time { return t0.Add(time.Duration(sec) * time.Second) }
+
+var cfg = config.Default()
+
+// pane is a single-pane window in session "s".
+func pane(id, window string, idx int) model.TmuxPane {
+	return model.TmuxPane{ID: id, Session: "s", WindowID: window, WindowIndex: idx, WindowPanes: 1}
+}
+
+func hookRec(sid string, pid int, alive bool, f func(*model.HookState)) HookRecord {
+	st := model.HookState{Version: 1, Agent: model.Claude, SessionID: sid, PID: pid, PIDStart: 1}
+	if f != nil {
+		f(&st)
+	}
+	return HookRecord{Path: "/state/" + sid + ".json", State: st, ProcAlive: alive}
+}
+
+func regRec(sid string, pid int, status string, statusAt time.Time, f func(*model.RegistryEntry)) RegistryRecord {
+	e := model.RegistryEntry{PID: pid, SessionID: sid, Kind: "interactive", Entrypoint: "cli", Status: status,
+		StatusUpdatedMs: statusAt.UnixMilli(), Cwd: "/w/" + sid, Name: sid + "-1", NameSource: "derived"}
+	if f != nil {
+		f(&e)
+	}
+	return RegistryRecord{Path: "/reg/" + sid, Entry: e, Alive: true}
+}
+
+func find(t *testing.T, s Snapshot, key string) Session {
+	t.Helper()
+	for _, x := range s.Sessions {
+		if x.Key == key {
+			return x
+		}
+	}
+	t.Fatalf("no session %q in %v", key, keys(s))
+	return Session{}
+}
+
+func absent(t *testing.T, s Snapshot, key string) {
+	t.Helper()
+	for _, x := range s.Sessions {
+		if x.Key == key {
+			t.Fatalf("session %q should not be listed: %+v", key, x)
+		}
+	}
+}
+
+func keys(s Snapshot) []string {
+	var k []string
+	for _, x := range s.Sessions {
+		k = append(k, x.Key)
+	}
+	return k
+}
+
+// compute runs Plan-then-Compute like the shell does, with initialized
+// memory (not a first run) unless mem is given.
+func compute(obs Observation, mem *Memory, now time.Time) (Snapshot, Memory) {
+	m := NewMemory()
+	m.Initialized = true
+	if mem != nil {
+		m = *mem
+	}
+	return Compute(obs, m, cfg, t0, now)
+}
+
+// --- pure helpers ------------------------------------------------------------
+
+func TestMergeActivity(t *testing.T) {
+	hook := func(a model.Activity, sec int) *model.HookState {
+		return &model.HookState{Activity: a, ActivityAt: at(sec), Tool: "Bash", ToolDetail: "make", Question: "q"}
+	}
+	reg := func(status, waiting string, sec int) *model.RegistryEntry {
+		return &model.RegistryEntry{Status: status, WaitingFor: waiting, StatusUpdatedMs: at(sec).UnixMilli()}
+	}
+	cases := []struct {
+		name     string
+		h        *model.HookState
+		r        *model.RegistryEntry
+		want     model.Activity
+		wantTool string
+		since    time.Time
+	}{
+		{"hook only", hook(model.Working, 5), nil, model.Working, "Bash", at(5)},
+		{"registry only", nil, reg("waiting", "permission prompt", 5), model.NeedsApproval, "", at(5)},
+		{"same class keeps hook detail", hook(model.NeedsApproval, 5), reg("waiting", "permission prompt", 6), model.NeedsApproval, "Bash", at(5)},
+		{"same class, registry first: activity began then", hook(model.Working, 5), reg("busy", "", 2), model.Working, "Bash", at(2)},
+		{"errored refines idle", hook(model.Errored, 5), reg("idle", "", 6), model.Errored, "Bash", at(5)},
+		{"interrupt: newer registry idle wins", hook(model.Working, 5), reg("idle", "", 9), model.Idle, "", at(9)},
+		{"manual deny: newer registry busy wins", hook(model.NeedsApproval, 5), reg("busy", "", 9), model.Working, "", at(9)},
+		{"older registry loses", hook(model.Working, 9), reg("idle", "", 5), model.Working, "Bash", at(9)},
+		{"unknown registry status, newer", hook(model.Working, 5), reg("weird", "", 9), model.Unknown, "", at(9)},
+		{"neither", nil, nil, model.Unknown, "", time.Time{}},
+	}
+	for _, c := range cases {
+		var s Session
+		mergeActivity(&s, c.h, c.r, model.ClaudeMeta{})
+		if s.Activity != c.want || s.Tool != c.wantTool || !s.ActivitySince.Equal(c.since) {
+			t.Errorf("%s: got %s/%q since %v, want %s/%q since %v", c.name, s.Activity, s.Tool, s.ActivitySince, c.want, c.wantTool, c.since)
+		}
+	}
+	// A registry-only approval wait names the pending tool from the transcript.
+	var s Session
+	mergeActivity(&s, nil, reg("waiting", "permission prompt", 5), model.ClaudeMeta{PendingToolName: "Edit"})
+	if s.Tool != "Edit" || s.Question != "permission prompt" {
+		t.Fatalf("%+v", s)
+	}
+}
+
+func TestGroupOf(t *testing.T) {
+	warm := Cache{Known: true, ExpiresAt: at(60)}
+	cold := Cache{Known: true, ExpiresAt: at(-60)}
+	cases := []struct {
+		s    Session
+		want Group
+	}{
+		{Session{Alive: true, Activity: model.NeedsApproval}, GroupNeedsYou},
+		{Session{Alive: true, Activity: model.NeedsInput}, GroupNeedsYou},
+		{Session{Alive: true, Activity: model.Errored}, GroupNeedsYou},
+		{Session{Alive: true, Activity: model.Working}, GroupWorking},
+		{Session{Alive: true, Activity: model.Idle, Unseen: true, Agent: model.Claude, Cache: cold}, GroupYourTurn},
+		{Session{Alive: true, Activity: model.Idle, Agent: model.Claude, Cache: warm}, GroupIdle},
+		{Session{Alive: true, Activity: model.Idle, Agent: model.Claude, Cache: cold}, GroupCold},
+		{Session{Alive: true, Activity: model.Idle, Agent: model.Claude}, GroupIdle},
+		{Session{Alive: true, Activity: model.Idle, Agent: model.Agy, Cache: cold}, GroupIdle},
+		{Session{Alive: true, Activity: model.Unknown}, GroupUnknown},
+		{Session{Alive: false, Activity: model.Working}, GroupEnded},
+		{Session{Alive: true, Activity: model.Ended}, GroupEnded},
+	}
+	for i, c := range cases {
+		if g := groupOf(c.s, t0); g != c.want {
+			t.Errorf("case %d: got %s want %s", i, g, c.want)
+		}
+	}
+}
+
+func TestCleanPaneTitle(t *testing.T) {
+	for in, want := range map[string]string{
+		"✳ Claude Code control panel design": "Claude Code control panel design",
+		"  plain title ":                     "plain title",
+		"laptop":                             "laptop",
+		"✳":                                  "✳",
+		"":                                   "",
+	} {
+		if got := CleanPaneTitle(in); got != want {
+			t.Errorf("%q → %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestFlagValue(t *testing.T) {
+	args := []string{"claude", "--model", "x", "--resume", "abc", "--conversation=c1"}
+	if v := flagValue(args, "--resume", "-r"); v != "abc" {
+		t.Fatal(v)
+	}
+	if v := flagValue(args, "--conversation"); v != "c1" {
+		t.Fatal(v)
+	}
+	if v := flagValue([]string{"claude", "--resume", "--verbose"}, "--resume"); v != "" {
+		t.Fatalf("a following flag is not a value: %q", v)
+	}
+}
+
+// --- Compute: hook sessions --------------------------------------------------
+
+func TestHookSessionWorkingAndPane(t *testing.T) {
+	obs := Observation{
+		Hooks: []HookRecord{hookRec("s1", 42, true, func(s *model.HookState) {
+			s.Pane, s.Activity, s.ActivityAt, s.Tool, s.ToolDetail = "%3", model.Working, at(1), "Bash", "make"
+			s.Cwd, s.StartedAt, s.LastEventAt = "/w/proj", at(0), at(1)
+		})},
+		Tmux: TmuxView{OK: true, Panes: []model.TmuxPane{pane("%3", "@7", 2)}},
+	}
+	snap, _ := compute(obs, nil, at(5))
+	s := find(t, snap, "claude:s1")
+	if s.Group != GroupWorking || !s.Alive || s.Tracking != TrackHooks || s.Inferred {
+		t.Fatalf("%+v", s)
+	}
+	if s.Pane != "%3" || s.WindowID != "@7" || s.Location != "s:2" || s.Visible {
+		t.Fatalf("pane: %+v", s)
+	}
+	if s.Title != "proj" || s.TitleSource != "cwd" {
+		t.Fatalf("title %q from %q", s.Title, s.TitleSource)
+	}
+}
+
+func yourTurnObs(focused bool) Observation {
+	return Observation{
+		Hooks: []HookRecord{hookRec("s1", 42, true, func(s *model.HookState) {
+			s.Pane, s.Activity, s.ActivityAt, s.TurnEndedAt = "%3", model.Idle, at(10), at(10)
+			s.LastPromptAt, s.StartedAt, s.LastEventAt = at(2), at(1), at(10)
+		})},
+		Tmux: TmuxView{OK: true, Panes: []model.TmuxPane{pane("%3", "@7", 2), pane("%9", "@8", 3)},
+			Clients: []model.TmuxClient{{Name: "c", Pane: "%9", Focused: true}, {Name: "d", Pane: "%3", Focused: focused}}},
+	}
+}
+
+func TestYourTurnUntilSeen(t *testing.T) {
+	snap, mem := compute(yourTurnObs(false), nil, at(11))
+	s := find(t, snap, "claude:s1")
+	if s.Group != GroupYourTurn || !s.Unseen || !s.CompletedAt.Equal(at(10)) {
+		t.Fatalf("want your turn: %+v", s)
+	}
+	// Started after watchStart: first-sight seen mark is the start time.
+	if !mem.Seen["claude:s1"].Equal(at(1)) {
+		t.Fatalf("seen = %v", mem.Seen["claude:s1"])
+	}
+	// Looking at the pane on a focused client acknowledges it.
+	snap, mem = compute(yourTurnObs(true), &mem, at(20))
+	s = find(t, snap, "claude:s1")
+	if s.Unseen || s.Group == GroupYourTurn || !s.Visible {
+		t.Fatalf("visible session still flagged: %+v", s)
+	}
+	if !mem.Seen["claude:s1"].Equal(at(20)) {
+		t.Fatalf("seen = %v", mem.Seen["claude:s1"])
+	}
+	// Once seen it stays seen when the pane is no longer visible.
+	snap, _ = compute(yourTurnObs(false), &mem, at(30))
+	if s := find(t, snap, "claude:s1"); s.Unseen {
+		t.Fatal("seen completion flagged again")
+	}
+}
+
+func TestComputeDoesNotModifyMemory(t *testing.T) {
+	mem := NewMemory()
+	mem.Initialized = true
+	before := mem.Clone()
+	_, out := Compute(yourTurnObs(true), mem, cfg, t0, at(20))
+	if !mem.Persisted(before) || len(mem.Seen) != 0 {
+		t.Fatalf("input memory modified: %+v", mem)
+	}
+	if out.Persisted(before) {
+		t.Fatal("expected the returned memory to differ")
+	}
+}
+
+func TestComputeIsDeterministic(t *testing.T) {
+	obs := unmanagedAgyObs()
+	a, _ := compute(obs, nil, at(100))
+	for i := 0; i < 20; i++ {
+		b, _ := compute(obs, nil, at(100))
+		if !reflect.DeepEqual(a, b) {
+			t.Fatalf("run %d differs:\n%v\n%v", i, keys(a), keys(b))
+		}
+	}
+}
+
+func TestFirstRunTreatsExistingCompletionsAsSeen(t *testing.T) {
+	obs := yourTurnObs(false)
+	snap, mem := Compute(obs, NewMemory(), cfg, at(50), at(60)) // first run ever
+	if s := find(t, snap, "claude:s1"); s.Unseen {
+		t.Fatal("a completion from before cccp first looked must not be flagged")
+	}
+	if !mem.Initialized {
+		t.Fatal("first computation with sessions should initialise memory")
+	}
+	// No sessions: stays uninitialised.
+	_, mem = Compute(Observation{}, NewMemory(), cfg, t0, at(60))
+	if mem.Initialized {
+		t.Fatal("initialised without any session")
+	}
+}
+
+func TestSessionPredatingWatchIsSeenAtFirstSight(t *testing.T) {
+	// Not a first run, but the session started before this process began
+	// watching (e.g. it ran while the daemon was down).
+	snap, mem := Compute(yourTurnObs(false), func() Memory { m := NewMemory(); m.Initialized = true; return m }(), cfg, at(50), at(60))
+	if s := find(t, snap, "claude:s1"); s.Unseen {
+		t.Fatal("flagged a completion from before watching began")
+	}
+	if !mem.Seen["claude:s1"].Equal(at(60)) {
+		t.Fatalf("seen = %v", mem.Seen["claude:s1"])
+	}
+}
+
+func TestEndedRetention(t *testing.T) {
+	mk := func(endSec int) Observation {
+		return Observation{Hooks: []HookRecord{hookRec("s1", 42, false, func(s *model.HookState) {
+			s.Activity, s.EndedAt, s.LastEventAt = model.Ended, at(endSec), at(endSec)
+		})}}
+	}
+	snap, _ := compute(mk(0), nil, at(60))
+	if s := find(t, snap, "claude:s1"); s.Group != GroupEnded || s.Alive {
+		t.Fatalf("%+v", s)
+	}
+	snap, _ = compute(mk(0), nil, t0.Add(cfg.EndedRetention.Duration+time.Second))
+	absent(t, snap, "claude:s1")
+}
+
+func TestDeadProcessEndsSession(t *testing.T) {
+	obs := Observation{Hooks: []HookRecord{hookRec("s1", 42, false, func(s *model.HookState) {
+		s.Activity, s.ActivityAt, s.LastEventAt = model.Working, at(1), at(1)
+	})}}
+	snap, _ := compute(obs, nil, at(5))
+	s := find(t, snap, "claude:s1")
+	if s.Alive || s.Group != GroupEnded || !s.EndedAt.Equal(at(1)) {
+		t.Fatalf("%+v", s)
+	}
+}
+
+func TestHookWithoutPIDUsesPaneAgent(t *testing.T) {
+	obs := Observation{
+		Hooks: []HookRecord{hookRec("s1", 0, false, func(s *model.HookState) {
+			s.Pane, s.Activity, s.ActivityAt = "%3", model.Working, at(1)
+		})},
+		Tmux:   TmuxView{OK: true, Panes: []model.TmuxPane{pane("%3", "@7", 2)}},
+		Agents: []AgentProc{{PID: 99, Agent: model.Claude, Pane: "%3", Cmdline: []string{"claude"}}},
+	}
+	snap, _ := compute(obs, nil, at(5))
+	if s := find(t, snap, "claude:s1"); !s.Alive {
+		t.Fatalf("pane runs an agent: should be alive: %+v", s)
+	}
+	obs.Agents = nil
+	snap, _ = compute(obs, nil, at(5))
+	if s := find(t, snap, "claude:s1"); s.Alive {
+		t.Fatal("no agent in the pane: should be ended")
+	}
+}
+
+// --- Compute: registry -------------------------------------------------------
+
+func TestRegistrySupersedesHookOnSamePID(t *testing.T) {
+	obs := Observation{
+		Hooks: []HookRecord{
+			hookRec("old", 42, true, func(s *model.HookState) { s.Activity, s.ActivityAt, s.LastEventAt = model.Idle, at(1), at(1) }),
+			hookRec("new", 42, true, func(s *model.HookState) { s.Activity, s.ActivityAt, s.LastEventAt = model.Working, at(5), at(5) }),
+		},
+		Registry: []RegistryRecord{regRec("new", 42, "idle", at(9), nil)},
+	}
+	snap, _ := compute(obs, nil, at(10))
+	if s := find(t, snap, "claude:old"); s.Alive || s.Group != GroupEnded {
+		t.Fatalf("superseded: %+v", s)
+	}
+	s := find(t, snap, "claude:new")
+	if !s.Alive || s.Tracking != TrackHooksRegistry || s.Activity != model.Idle {
+		t.Fatalf("current: %+v", s)
+	}
+	// No custom or AI title: the registry's derived name beats the cwd.
+	if s.Title != "new-1" || s.TitleSource != "name" {
+		t.Fatalf("title %q (%s)", s.Title, s.TitleSource)
+	}
+}
+
+func TestHooksOnSamePIDLatestWins(t *testing.T) {
+	// /clear without SessionEnd and no registry: the later session is current.
+	obs := Observation{Hooks: []HookRecord{
+		hookRec("a", 42, true, func(s *model.HookState) { s.Activity, s.LastEventAt = model.Idle, at(1) }),
+		hookRec("b", 42, true, func(s *model.HookState) { s.Activity, s.LastEventAt = model.Idle, at(5) }),
+	}}
+	snap, _ := compute(obs, nil, at(10))
+	if find(t, snap, "claude:a").Alive || !find(t, snap, "claude:b").Alive {
+		t.Fatal("latest hook session on a pid should be the live one")
+	}
+}
+
+func TestRegistryTransitionsAreCompletions(t *testing.T) {
+	obs := func(status string, sec int) Observation {
+		return Observation{Registry: []RegistryRecord{regRec("r1", 42, status, at(sec), func(e *model.RegistryEntry) {
+			e.StartedAtMs = at(1).UnixMilli()
+		})}}
+	}
+	// First observation: no previous status, no completion.
+	snap, mem := compute(obs("idle", 2), nil, at(3))
+	if s := find(t, snap, "claude:r1"); s.Unseen || !s.CompletedAt.IsZero() {
+		t.Fatalf("first observation: %+v", s)
+	}
+	snap, mem = compute(obs("busy", 4), &mem, at(5))
+	if s := find(t, snap, "claude:r1"); s.Group != GroupWorking {
+		t.Fatalf("%+v", s)
+	}
+	snap, mem = compute(obs("idle", 8), &mem, at(9))
+	s := find(t, snap, "claude:r1")
+	if !s.Unseen || s.Group != GroupYourTurn || !s.CompletedAt.Equal(time.UnixMilli(at(8).UnixMilli())) {
+		t.Fatalf("busy→idle should be a completion: %+v", s)
+	}
+	// idle → idle is not another completion.
+	_, mem2 := compute(obs("idle", 8), &mem, at(12))
+	if !mem2.RegCompletions["claude:r1"].Equal(mem.RegCompletions["claude:r1"]) {
+		t.Fatal("idle→idle changed the completion")
+	}
+	// waiting → idle (permission answered, turn ended) counts too.
+	_, mem = compute(obs("waiting", 20), &mem, at(21))
+	_, mem = compute(obs("idle", 25), &mem, at(26))
+	if !mem.RegCompletions["claude:r1"].Equal(time.UnixMilli(at(25).UnixMilli())) {
+		t.Fatalf("waiting→idle: %v", mem.RegCompletions["claude:r1"])
+	}
+}
+
+func TestDeadRegistryEntryIgnored(t *testing.T) {
+	r := regRec("r1", 42, "busy", at(1), nil)
+	r.Alive = false
+	snap, _ := compute(Observation{Registry: []RegistryRecord{r}}, nil, at(2))
+	absent(t, snap, "claude:r1")
+}
+
+func TestPrintModeExcludedEverywhere(t *testing.T) {
+	obs := Observation{
+		Hooks: []HookRecord{hookRec("script", 41, true, func(s *model.HookState) {
+			s.PrintMode, s.Activity = true, model.Idle
+		})},
+		// claude -p registers as kind "interactive" with entrypoint "sdk-cli".
+		Registry: []RegistryRecord{regRec("sdk", 42, "idle", at(1), func(e *model.RegistryEntry) { e.Entrypoint = "sdk-cli" })},
+		Tmux:     TmuxView{OK: true, Panes: []model.TmuxPane{pane("%5", "@5", 5)}},
+		Agents:   []AgentProc{{PID: 43, Agent: model.Claude, Pane: "%5", Cmdline: []string{"claude", "-p", "hi"}}},
+	}
+	snap, _ := compute(obs, nil, at(2))
+	if len(snap.Sessions) != 0 {
+		t.Fatalf("print-mode runs listed: %v", keys(snap))
+	}
+}
+
+// --- Compute: unmanaged sessions ---------------------------------------------
+
+func TestUnmanagedClaudeByResumeFlag(t *testing.T) {
+	sid := "00000000-0000-4000-8000-000000000001"
+	obs := Observation{
+		Tmux:   TmuxView{OK: true, Panes: []model.TmuxPane{pane("%3", "@3", 3)}},
+		Agents: []AgentProc{{PID: 7, Start: 5, Agent: model.Claude, Pane: "%3", Cwd: "/w", Cmdline: []string{"claude", "--resume", sid}}},
+	}
+	needs := Plan(obs)
+	if len(needs.Claude) != 1 || needs.Claude[0].SessionID != sid || needs.Claude[0].Cwd != "/w" || len(needs.Projects) != 0 {
+		t.Fatalf("needs: %+v", needs)
+	}
+	obs.ClaudeTranscripts = map[string]ClaudeTranscript{sid: {Path: "/t.jsonl", Meta: model.ClaudeMeta{
+		AITitle: "Gain staging", LastAssistantAt: at(10), LastStopReason: "end_turn", TTL: model.TTL1h,
+	}}}
+	snap, _ := compute(obs, nil, at(20))
+	s := find(t, snap, "claude:"+sid)
+	if s.Tracking != TrackUnmanaged || !s.Inferred || s.Activity != model.Idle || s.Title != "Gain staging" {
+		t.Fatalf("%+v", s)
+	}
+	if !s.Cache.Known || !s.Cache.ExpiresAt.Equal(at(10).Add(time.Hour)) || s.Group != GroupIdle {
+		t.Fatalf("cache: %+v", s.Cache)
+	}
+}
+
+func TestUnmanagedClaudeMatchedByTitle(t *testing.T) {
+	obs := Observation{
+		Hooks: []HookRecord{hookRec("tracked", 50, true, func(s *model.HookState) { s.Activity = model.Idle })},
+		Tmux: TmuxView{OK: true, Panes: []model.TmuxPane{func() model.TmuxPane {
+			p := pane("%3", "@3", 3)
+			p.Title = "✳ AX96 simulation"
+			return p
+		}()}},
+		Agents: []AgentProc{{PID: 7, Agent: model.Claude, Pane: "%3", Cwd: "/w", Cmdline: []string{"claude"}}},
+	}
+	if needs := Plan(obs); len(needs.Projects) != 1 || needs.Projects[0] != "/w" {
+		t.Fatalf("needs: %+v", needs)
+	}
+	m := model.ClaudeMeta{AITitle: "AX96 simulation", LastAssistantAt: at(3), LastStopReason: "end_turn"}
+	obs.Projects = map[string][]ProjectTranscript{"/w": {
+		{SessionID: "older", ModTime: at(1), Meta: m},
+		{SessionID: "newer", ModTime: at(2), Meta: m},
+		{SessionID: "tracked", ModTime: at(9), Meta: m}, // tracked elsewhere: never matched
+		{SessionID: "other", ModTime: at(9), Meta: model.ClaudeMeta{AITitle: "Something else"}},
+	}}
+	snap, _ := compute(obs, nil, at(20))
+	s := find(t, snap, "claude:newer")
+	if s.Title != "AX96 simulation" || s.Activity != model.Idle || !strings.Contains(strings.Join(s.Notes, ";"), "several transcripts") {
+		t.Fatalf("%+v", s)
+	}
+}
+
+func TestUnmanagedClaudeNoTranscript(t *testing.T) {
+	p := pane("%3", "@3", 3)
+	p.Title = "✳ Long gone"
+	p.WindowActivity = at(-3600)
+	obs := Observation{
+		Tmux:     TmuxView{OK: true, Panes: []model.TmuxPane{p}},
+		Agents:   []AgentProc{{PID: 7, Agent: model.Claude, Pane: "%3", Cwd: "/w", Cmdline: []string{"claude"}}},
+		Projects: map[string][]ProjectTranscript{"/w": nil},
+	}
+	snap, _ := compute(obs, nil, at(0))
+	s := find(t, snap, "claude:pane:%3")
+	if s.Group != GroupUnknown || s.Title != "Long gone" || s.TitleSource != "pane" || s.SessionID != "" {
+		t.Fatalf("%+v", s)
+	}
+}
+
+func TestUnmanagedInference(t *testing.T) {
+	sid := "00000000-0000-4000-8000-000000000001"
+	mk := func(meta model.ClaudeMeta, outputAgo time.Duration, panes int) Session {
+		p := pane("%3", "@3", 3)
+		p.WindowPanes = panes
+		p.WindowActivity = at(100).Add(-outputAgo)
+		obs := Observation{
+			Tmux:              TmuxView{OK: true, Panes: []model.TmuxPane{p}},
+			Agents:            []AgentProc{{PID: 7, Agent: model.Claude, Pane: "%3", Cmdline: []string{"claude", "-r", sid}}},
+			ClaudeTranscripts: map[string]ClaudeTranscript{sid: {Path: "/t", Meta: meta}},
+		}
+		snap, _ := compute(obs, nil, at(100))
+		return find(t, snap, "claude:"+sid)
+	}
+	pending := model.ClaudeMeta{PendingTool: true, PendingToolName: "Bash", LastAssistantAt: at(50)}
+	if s := mk(pending, time.Minute, 1); s.Activity != model.NeedsApproval || s.Tool != "Bash" || !s.Inferred {
+		t.Errorf("pending tool, quiet pane: %+v", s)
+	}
+	if s := mk(pending, time.Second, 1); s.Activity != model.Working {
+		t.Errorf("pending tool, pane producing output: %+v", s)
+	}
+	if s := mk(pending, time.Minute, 2); s.Activity != model.Working {
+		t.Errorf("split window: output age unknown, must not infer a wait: %+v", s)
+	}
+	thinking := model.ClaudeMeta{LastUserAt: at(90), LastAssistantAt: at(10)}
+	if s := mk(thinking, time.Second, 1); s.Activity != model.Working {
+		t.Errorf("prompt sent: %+v", s)
+	}
+	if s := mk(thinking, 2*time.Minute, 1); s.Activity != model.Unknown {
+		t.Errorf("prompt sent, long quiet: %+v", s)
+	}
+	interrupted := model.ClaudeMeta{LastUserAt: at(90), LastAssistantAt: at(10), Interrupted: true}
+	if s := mk(interrupted, time.Minute, 1); s.Activity != model.Idle {
+		t.Errorf("interrupted: %+v", s)
+	}
+}
+
+func unmanagedAgyObs() Observation {
+	return Observation{
+		Tmux: TmuxView{OK: true, Panes: []model.TmuxPane{pane("%1", "@1", 1), pane("%2", "@2", 2)}},
+		Agents: []AgentProc{
+			{PID: 10, Start: 100, StartedAt: at(0), Agent: model.Agy, Pane: "%1", Cwd: "/w", Cmdline: []string{"agy"}},
+			{PID: 11, Start: 200, StartedAt: at(30), Agent: model.Agy, Pane: "%2", Cwd: "/w", Cmdline: []string{"agy"}},
+		},
+		AgyConversations: map[string]model.AgyConversation{
+			"conv-old":   {ID: "conv-old", Title: "Old", Workspaces: []string{"/w"}, LastModified: at(20)},
+			"conv-new":   {ID: "conv-new", Title: "New", Workspaces: []string{"/w"}, LastModified: at(40)},
+			"conv-other": {ID: "conv-other", Workspaces: []string{"/elsewhere"}, LastModified: at(50)},
+			"conv-stale": {ID: "conv-stale", Workspaces: []string{"/w"}, LastModified: at(-10)},
+		},
+	}
+}
+
+func TestUnmanagedAgyProcessesGetDistinctConversations(t *testing.T) {
+	obs := unmanagedAgyObs()
+	needs := Plan(obs)
+	if len(needs.Agy) != 2 {
+		t.Fatalf("needs: %+v", needs)
+	}
+	snap, _ := compute(obs, nil, at(60))
+	byPane := map[string]Session{}
+	for _, s := range snap.Sessions {
+		byPane[s.Pane] = s
+	}
+	// The newest process owns the newest conversation; the older process
+	// gets the newest conversation modified since it started.
+	if byPane["%2"].SessionID != "conv-new" || byPane["%1"].SessionID != "conv-old" {
+		t.Fatalf("%%1=%s %%2=%s", byPane["%1"].SessionID, byPane["%2"].SessionID)
+	}
+	if byPane["%2"].Title != "New" {
+		t.Fatalf("title %q", byPane["%2"].Title)
+	}
+}
+
+func TestHostnamePaneTitleIgnored(t *testing.T) {
+	p := pane("%1", "@1", 1)
+	p.Title = "laptop"
+	obs := Observation{
+		Hostname: "laptop",
+		Tmux:     TmuxView{OK: true, Panes: []model.TmuxPane{p}},
+		Agents:   []AgentProc{{PID: 10, Agent: model.Agy, Pane: "%1", Cwd: "/w/logger", Cmdline: []string{"agy"}}},
+	}
+	snap, _ := compute(obs, nil, at(1))
+	if s := snap.Sessions[0]; s.Title != "logger" || s.TitleSource != "cwd" {
+		t.Fatalf("title %q (%s)", s.Title, s.TitleSource)
+	}
+}
+
+func TestPaneAgentsPickShallowestNonPrintMode(t *testing.T) {
+	got := paneAgents([]AgentProc{
+		{PID: 1, Pane: "%1", Depth: 1, Cmdline: []string{"claude", "-p", "x"}},
+		{PID: 2, Pane: "%1", Depth: 2, Cmdline: []string{"claude"}},
+		{PID: 3, Pane: "%1", Depth: 3, Cmdline: []string{"claude"}},
+	})
+	if len(got) != 1 || got[2].PID != 2 {
+		t.Fatalf("%+v", got)
+	}
+}
+
+// --- cache, ordering, deadlines, navigation, pruning ---------------------------
+
+func cacheObs(sid string, last time.Time, ttl time.Duration) Observation {
+	return Observation{
+		Hooks: []HookRecord{hookRec(sid, 42, true, func(s *model.HookState) { s.Activity, s.ActivityAt = model.Idle, last })},
+		ClaudeTranscripts: map[string]ClaudeTranscript{sid: {Path: "/t", Meta: model.ClaudeMeta{
+			LastAssistantAt: last, TTL: ttl,
+		}}},
+	}
+}
+
+func TestCacheWarmColdAndAssumedTTL(t *testing.T) {
+	snap, _ := compute(cacheObs("s1", at(0), model.TTL5m), nil, at(60))
+	if s := find(t, snap, "claude:s1"); s.Group != GroupIdle || s.Cache.TTLAssumed {
+		t.Fatalf("%+v", s)
+	}
+	snap, _ = compute(cacheObs("s1", at(0), model.TTL5m), nil, at(301))
+	if s := find(t, snap, "claude:s1"); s.Group != GroupCold {
+		t.Fatalf("%+v", s)
+	}
+	snap, _ = compute(cacheObs("s1", at(0), 0), nil, at(60))
+	if s := find(t, snap, "claude:s1"); !s.Cache.TTLAssumed || s.Cache.TTL != cfg.DefaultCacheTTL.Duration {
+		t.Fatalf("%+v", s.Cache)
+	}
+}
+
+func TestOrderingAndDeadline(t *testing.T) {
+	obs := cacheObs("a", at(0), model.TTL1h)
+	b := cacheObs("b", at(100), model.TTL5m)
+	obs.Hooks = append(obs.Hooks, b.Hooks...)
+	obs.Hooks[1].State.PID = 43
+	obs.ClaudeTranscripts["b"] = b.ClaudeTranscripts["b"]
+	wait := hookRec("w", 44, true, func(s *model.HookState) { s.Activity, s.ActivityAt = model.NeedsApproval, at(50) })
+	obs.Hooks = append(obs.Hooks, wait)
+	snap, _ := compute(obs, nil, at(200))
+	if got := keys(snap); !reflect.DeepEqual(got, []string{"claude:w", "claude:b", "claude:a"}) {
+		t.Fatalf("order %v (needs you first; idle by soonest expiry)", got)
+	}
+	if d := NextDeadline(snap); !d.Equal(at(100).Add(5 * time.Minute)) {
+		t.Fatalf("deadline %v", d)
+	}
+}
+
+func TestNextAttention(t *testing.T) {
+	snap := Snapshot{Sessions: []Session{
+		{Key: "1", Group: GroupNeedsYou, Alive: true, Pane: "%1"},
+		{Key: "2", Group: GroupYourTurn, Alive: true, Pane: "%2"},
+		{Key: "3", Group: GroupWorking, Alive: true, Pane: "%3"},
+		{Key: "4", Group: GroupYourTurn, Alive: true, Kind: "background"},
+		{Key: "5", Group: GroupYourTurn, Alive: true}, // no pane, not background: unreachable
+	}}
+	for cur, want := range map[string]string{"": "1", "%9": "1", "%1": "2", "%2": "4", "%3": "1"} {
+		got, ok := NextAttention(snap, cur)
+		if !ok || got.Key != want {
+			t.Errorf("from %q: got %q want %q", cur, got.Key, want)
+		}
+	}
+	if _, ok := NextAttention(Snapshot{Sessions: []Session{{Group: GroupWorking, Alive: true, Pane: "%1"}}}, ""); ok {
+		t.Fatal("nothing needs attention")
+	}
+}
+
+func TestExpired(t *testing.T) {
+	ret := cfg.EndedRetention.Duration
+	now := t0.Add(ret + time.Hour)
+	obs := Observation{Hooks: []HookRecord{
+		hookRec("live", 1, true, func(s *model.HookState) { s.Activity, s.LastEventAt = model.Idle, t0 }),
+		hookRec("ended-old", 2, false, func(s *model.HookState) { s.Activity, s.EndedAt = model.Ended, t0 }),
+		hookRec("ended-recent", 3, false, func(s *model.HookState) { s.Activity, s.EndedAt = model.Ended, now.Add(-time.Minute) }),
+		hookRec("dead-old", 4, false, func(s *model.HookState) { s.Activity, s.LastEventAt = model.Working, t0 }),
+		hookRec("print-just-ended", 5, false, func(s *model.HookState) { s.PrintMode, s.Activity, s.EndedAt = true, model.Ended, now }),
+		hookRec("print-running", 6, true, func(s *model.HookState) { s.PrintMode, s.Activity = true, model.Working }),
+	}}
+	got := Expired(obs, cfg, now)
+	want := []string{"/state/ended-old.json", "/state/dead-old.json", "/state/print-just-ended.json"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %v want %v", got, want)
+	}
+}
+
+func TestMemoryPruneKeepsAliases(t *testing.T) {
+	m := NewMemory()
+	m.Seen["a"], m.Seen["b"] = t0, t0
+	m.Aliases["b"] = "build box"
+	m.Summaries["b"] = SummaryRecord{Text: "x"}
+	p := m.Prune(map[string]bool{"a": true})
+	if _, ok := p.Seen["b"]; ok {
+		t.Fatal("seen not pruned")
+	}
+	if _, ok := p.Summaries["b"]; ok {
+		t.Fatal("summary not pruned")
+	}
+	if p.Aliases["b"] != "build box" {
+		t.Fatal("aliases must survive pruning")
+	}
+	if len(m.Seen) != 2 {
+		t.Fatal("Prune modified its receiver")
+	}
+}
+
+func TestPlanJump(t *testing.T) {
+	cases := []struct {
+		s    Session
+		want Jump
+	}{
+		{Session{Alive: true, Pane: "%3"}, Jump{Kind: JumpPane, Pane: "%3"}},
+		{Session{Alive: true, Kind: "background", SessionID: "b1", Cwd: "/w"}, Jump{Kind: JumpNewWindow, Dir: "/w", Argv: []string{"claude", "attach", "b1"}}},
+		{Session{Alive: false, Agent: model.Claude, SessionID: "c1", Cwd: "/w"}, Jump{Kind: JumpNewWindow, Dir: "/w", Argv: []string{"claude", "--resume", "c1"}}},
+		{Session{Alive: false, Agent: model.Agy, SessionID: "a1", Cwd: "/w"}, Jump{Kind: JumpNewWindow, Dir: "/w", Argv: []string{"agy", "--conversation=a1"}}},
+	}
+	for i, c := range cases {
+		if got := PlanJump(c.s); !reflect.DeepEqual(got, c.want) {
+			t.Errorf("case %d: %+v want %+v", i, got, c.want)
+		}
+	}
+	for _, s := range []Session{
+		{Alive: true, Title: "x"},                       // live, no pane, not background
+		{Alive: false, Agent: model.Claude, Title: "y"}, // ended, id unknown
+	} {
+		if j := PlanJump(s); j.Kind != JumpImpossible || j.Reason == "" {
+			t.Errorf("%+v: %+v", s, j)
+		}
+	}
+}
+
+// --- rules pinned by mutation testing ------------------------------------------
+
+func TestCompletionBeforeLatestPromptIsNotFlagged(t *testing.T) {
+	// Turn 1 completed (unseen), then the user prompted again and
+	// interrupted: idle, but the old completion predates the prompt.
+	obs := Observation{Hooks: []HookRecord{hookRec("s1", 42, true, func(s *model.HookState) {
+		s.Activity, s.ActivityAt, s.TurnEndedAt = model.Idle, at(30), at(10)
+		s.LastPromptAt, s.StartedAt = at(20), at(1)
+	})}}
+	snap, _ := compute(obs, nil, at(40))
+	if s := find(t, snap, "claude:s1"); s.Unseen {
+		t.Fatalf("stale completion flagged: %+v", s)
+	}
+}
+
+func TestTranscriptEndTurnIsACompletionOnlyForUnmanaged(t *testing.T) {
+	// A registry session whose transcript ended a turn, with no busy→idle
+	// transition observed: observed signals decide, so no completion.
+	obs := Observation{
+		Registry: []RegistryRecord{regRec("r1", 42, "idle", at(5), func(e *model.RegistryEntry) { e.StartedAtMs = at(1).UnixMilli() })},
+		ClaudeTranscripts: map[string]ClaudeTranscript{"r1": {Path: "/t", Meta: model.ClaudeMeta{
+			LastAssistantAt: at(5), LastStopReason: "end_turn"}}},
+	}
+	snap, _ := compute(obs, nil, at(6))
+	if s := find(t, snap, "claude:r1"); s.Unseen || !s.CompletedAt.IsZero() {
+		t.Fatalf("%+v", s)
+	}
+}
+
+func TestRegistryOwnsItsProcessEvenAgainstNewerHookEvents(t *testing.T) {
+	obs := Observation{
+		Hooks: []HookRecord{hookRec("old", 42, true, func(s *model.HookState) {
+			s.Activity, s.ActivityAt, s.LastEventAt = model.Working, at(20), at(20) // newer than the registry
+		})},
+		Registry: []RegistryRecord{regRec("new", 42, "idle", at(9), nil)},
+	}
+	snap, _ := compute(obs, nil, at(30))
+	if s := find(t, snap, "claude:old"); s.Alive {
+		t.Fatalf("the registry names another session for pid 42: %+v", s)
+	}
+	if s := find(t, snap, "claude:new"); !s.Alive {
+		t.Fatal("registry session not current")
+	}
+}
+
+func TestResumeFlagMustBeASessionID(t *testing.T) {
+	p := pane("%3", "@3", 3)
+	p.Title = "✳ Named session"
+	obs := Observation{
+		Tmux:     TmuxView{OK: true, Panes: []model.TmuxPane{p}},
+		Agents:   []AgentProc{{PID: 7, Agent: model.Claude, Pane: "%3", Cwd: "/w", Cmdline: []string{"claude", "--resume", "my-session-name"}}},
+		Projects: map[string][]ProjectTranscript{"/w": {{SessionID: "real-id", Meta: model.ClaudeMeta{AITitle: "Named session"}}}},
+	}
+	snap, _ := compute(obs, nil, at(1))
+	for _, s := range snap.Sessions {
+		if s.SessionID == "my-session-name" {
+			t.Fatal("a session name was taken as a session id")
+		}
+	}
+	find(t, snap, "claude:real-id") // resolved by title instead
+}

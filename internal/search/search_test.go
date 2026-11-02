@@ -18,9 +18,11 @@ func TestParseQuery(t *testing.T) {
 
 func TestExtractAndSearch(t *testing.T) {
 	dir := t.TempDir()
-	t.Setenv("CCCP_CACHE_DIR", filepath.Join(dir, "cache"))
-	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(dir, "claude"))
-	t.Setenv("HOME", dir)
+	ix := Index{
+		TextDir:           filepath.Join(dir, "cache", "text"),
+		ClaudeProjectsDir: filepath.Join(dir, "claude", "projects"),
+		AgyBrainDir:       filepath.Join(dir, "agy", "brain"),
+	}
 	proj := filepath.Join(dir, "claude", "projects", "-w")
 	if err := os.MkdirAll(proj, 0o700); err != nil {
 		t.Fatal(err)
@@ -37,10 +39,10 @@ func TestExtractAndSearch(t *testing.T) {
 		fmt.Fprintln(f, l)
 	}
 	f.Close()
-	if n, err := Update(); err != nil || n != 1 {
+	if n, err := ix.Update(); err != nil || n != 1 {
 		t.Fatalf("update: %d %v", n, err)
 	}
-	hits, err := Run(ParseQuery("oscillator"), 10)
+	hits, err := ix.Run(ParseQuery("oscillator"), 10)
 	if err != nil || len(hits) != 1 {
 		t.Fatalf("hits %v %v", hits, err)
 	}
@@ -49,20 +51,20 @@ func TestExtractAndSearch(t *testing.T) {
 		t.Fatalf("%+v", h)
 	}
 	// Tool output is not indexed.
-	if hits, _ := Run(ParseQuery("secret"), 10); len(hits) != 0 {
+	if hits, _ := ix.Run(ParseQuery("secret"), 10); len(hits) != 0 {
 		t.Fatalf("tool output leaked into the index: %+v", hits)
 	}
 	// Incremental: appended text is found without rebuilding.
 	f, _ = os.OpenFile(p, os.O_APPEND|os.O_WRONLY, 0o600)
 	fmt.Fprintln(f, `{"type":"user","sessionId":"S1","timestamp":"2026-11-01T11:00:00Z","message":{"content":"now add a granular mode"}}`)
 	f.Close()
-	if n, _ := Update(); n != 1 {
+	if n, _ := ix.Update(); n != 1 {
 		t.Fatalf("incremental update count %d", n)
 	}
-	if hits, _ := Run(ParseQuery(`"granular mode"`), 10); len(hits) != 1 {
+	if hits, _ := ix.Run(ParseQuery(`"granular mode"`), 10); len(hits) != 1 {
 		t.Fatal("appended text not found")
 	}
-	if n, _ := Update(); n != 0 {
+	if n, _ := ix.Update(); n != 0 {
 		t.Fatalf("no-op update reported %d changes", n)
 	}
 }
