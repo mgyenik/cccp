@@ -50,7 +50,7 @@ func TestParseClients(t *testing.T) {
 	}
 	// Unset option, bad numbers: unknown, never a time near 1970 that would
 	// trust every client.
-		for _, bad := range []string{"", "x", "0", "-5"} {
+	for _, bad := range []string{"", "x", "0", "-5"} {
 		if cs := ParseClients(line("/dev/pts/1", "s", "%1", "focused", bad, "1", bad) + "\n"); !cs[0].Created.IsZero() || !cs[0].FocusSince.IsZero() || cs[0].Looking() {
 			t.Fatalf("%q: %+v", bad, cs[0])
 		}

@@ -205,7 +205,7 @@ func (c *Client) EnsureFocusSince(now time.Time) error {
 	if cur, err := c.GlobalOption(FocusSinceOption); err != nil || cur != "" {
 		return err
 	}
-		// While the server starts (the snippet loading from tmux.conf) there is
+	// While the server starts (the snippet loading from tmux.conf) there is
 	// no session yet, and list-clients fails ("no current target"); no
 	// session means no client attached.
 	out, err := c.Run("display-message", "-p", "#{server_sessions}"+sep+"#{start_time}")
