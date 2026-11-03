@@ -55,6 +55,9 @@ type RegistryRecord struct {
 	Entry model.RegistryEntry
 	// ConfigDir is the profile whose registry the file is in.
 	ConfigDir string
+	// TmuxSocket is the tmux server the process runs in (from its $TMUX):
+	// Entry.Tmux names a pane but not its server.
+	TmuxSocket string
 	// Alive: the registered process (pid and start time) still runs.
 	Alive bool
 }
@@ -65,6 +68,9 @@ type TmuxView struct {
 	Err     string
 	Panes   []model.TmuxPane
 	Clients []model.TmuxClient
+	// Socket identifies the server ("" if unknown); a pane id from a hook
+	// or the registry names a pane here only if it was recorded on it.
+	Socket string
 }
 
 // AgentProc is an agent process found under a tmux pane.

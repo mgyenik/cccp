@@ -49,7 +49,8 @@ func mergeMeta(s *model.HookState, ev model.Event) {
 		s.ConfigDir = ev.ConfigDir
 	}
 	if ev.Pane != "" {
-		s.Pane = ev.Pane
+		// A pane id means nothing without its server: always set together.
+		s.Pane, s.TmuxSocket = ev.Pane, ev.TmuxSocket
 	}
 	if ev.Cwd != "" {
 		s.Cwd = ev.Cwd

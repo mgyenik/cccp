@@ -52,8 +52,10 @@ bin,claude,agy,systemd,tmux` picks steps):
 4. **systemd**: installs and starts `cccp.service` (user unit).
 5. **tmux**: adds one `source-file` line to `~/.tmux.conf`. The snippet sets
    `focus-events on`, event hooks (index `[97]`), the key bindings, and the
-   status-right / window-status formats. The previous values of those options
-   and keys are saved, and `cccp uninstall` restores them.
+      status-right / window-status formats. The previous values of those options
+   and keys are saved, and `cccp uninstall` restores them. If the installer
+   turns `focus-events` on while terminals are attached, it names them:
+   **detach and reattach each one** (see Notifications).
 
 Sessions started before the plugin was installed are still listed: Claude
 Code ≥ ~2.1.28x through its session registry, older ones and pre-plugin agy
@@ -66,6 +68,7 @@ full tracking.
 |---|---|---|
 | tmux | `Shift+PgDn` | jump to the most urgent session that needs you; repeat to cycle |
 | tmux | `Shift+PgUp` | open the cockpit popup |
+| tmux | `Shift+Up` | back to where you were before cccp's last jump (even after cycling with `Shift+PgDn`); again to toggle |
 | cockpit | `enter` | jump to the session; a closed conversation is resumed in a new window, in its own directory and profile |
 | cockpit | `tab` / `shift+tab` | next / previous session needing you |
 | cockpit | `/` | search everything, live and closed: names, projects, prompts and summaries match at once (fuzzy), conversation text after a pause in typing; `esc` clears |
@@ -77,10 +80,31 @@ full tracking.
 | shell | `cccp ls [--all] [--json]` | list sessions |
 | shell | `cccp search TERMS…` | search transcripts (`"quoted phrase"` supported) |
 | shell | `cccp status` | one-line counts |
-| shell | `cccp jump --next` / `cccp jump KEY` | jump from scripts |
+| shell | `cccp jump --next` / `--back` / `cccp jump KEY` | jump from scripts |
 
 The status line shows the counts (`⚠1 ⏎2 ●3 ○6 ❄14`), and each window name is
 prefixed with the state of the most urgent session in it.
+
+### Notifications
+
+A desktop notification fires when a session newly needs you (NEEDS YOU) or
+finishes a turn you haven't seen (YOUR TURN), in any harness, unless you are
+looking at it: its window is on screen in a tmux client whose terminal has
+focus. It fires once per change, not for states already present when the
+daemon starts, and `notify = false` turns it off.
+
+"Whose terminal has focus" needs tmux's `focus-events`, and tmux asks a
+terminal for focus reports **only when it attaches**: a terminal attached
+before `focus-events` was on never reports, and tmux keeps it flagged
+focused forever (documented in tmux's manual: "attached clients should be
+detached and attached again after changing this option"). cccp records when
+focus reporting started (`@cccp_focus_since`) and treats a terminal attached
+before that as *not* looking, so you get notified rather than silently
+missed. `cccp doctor` lists such terminals under "tmux focus reports";
+reattach them (prefix `d`, then `tmux attach -t SESSION`).
+
+Sessions started before the plugins were installed have no hooks (shown
+with `~`, state inferred) and cannot report a finished turn: restart them.
 
 ## Configure
 

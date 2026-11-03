@@ -94,7 +94,7 @@ func (i *Installer) Install(only map[string]bool) error {
 		step{StepAgy, "install the agy plugin (observe-only hooks: SessionStart, PreInvocation, PostToolUse, Stop) to " + l.AgyPluginDir, i.installAgy},
 		step{StepSystemd, "install and start the systemd user unit " + l.SystemdUnit, i.installSystemd},
 		step{StepTmux, "add `" + SourceLine(l.TmuxSnippet) + "` to " + l.TmuxConf +
-			"\n    sets focus-events on, hooks [97], Shift+PgDn / Shift+PgUp, status-right and window-status formats" +
+			"\n    sets focus-events on, hooks [97], Shift+PgDn / Shift+PgUp / Shift+Up, status-right and window-status formats" +
 			"\n    (current values are saved to " + l.TmuxRestore + " for uninstall)", i.installTmux},
 	)
 	for _, s := range steps {
@@ -275,7 +275,7 @@ type Key struct{ Table, Key string }
 func (k Key) String() string { return k.Table + " " + k.Key }
 
 // RestoredKeys are the keys cccp.tmux binds.
-var RestoredKeys = []Key{{"root", "S-NPage"}, {"root", "S-PPage"}}
+var RestoredKeys = []Key{{"root", "S-NPage"}, {"root", "S-PPage"}, {"root", "S-Up"}}
 
 // parseSavedKey reads a Saved.Keys entry: "table key", or a bare key from
 // installs before the keys moved to the root table (the prefix table).
@@ -324,10 +324,48 @@ func (i *Installer) installTmux() error {
 			return err
 		}
 	}
-	if _, err := i.Tmux.Run("source-file", l.TmuxSnippet); err != nil && !errors.Is(err, tmux.ErrNoServer) {
+	if _, err := i.Tmux.Run("source-file", l.TmuxSnippet); err != nil {
+		if errors.Is(err, tmux.ErrNoServer) {
+			return nil
+		}
 		return err
 	}
+	if stale := i.staleFocusClients(); len(stale) > 0 {
+		fmt.Fprintf(i.Out, "    %s\n", ReattachAdvice(stale))
+	}
 	return nil
+}
+
+// staleFocusClients are the attached clients whose terminals were never
+// asked for focus reports (model.TmuxClient.FocusReported).
+func (i *Installer) staleFocusClients() []tmux.ClientInfo {
+	out, err := i.Tmux.Run("list-clients", "-F", tmux.ClientFormat)
+	if err != nil {
+		return nil
+	}
+	return StaleFocusClients(tmux.ParseClients(out))
+}
+
+// StaleFocusClients filters clients whose focus is not reported.
+func StaleFocusClients(cs []tmux.ClientInfo) []tmux.ClientInfo {
+	var out []tmux.ClientInfo
+	for _, c := range cs {
+		if !c.FocusReported() {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// ReattachAdvice tells the user which clients to reattach, and why.
+func ReattachAdvice(stale []tmux.ClientInfo) string {
+	var names []string
+	for _, c := range stale {
+		names = append(names, c.Name+" (session "+c.Session+")")
+	}
+	return "these tmux clients attached before focus reporting was on, so tmux never learns when you look away from them" +
+		" and cccp treats them as not looking (notifications even while you watch); detach (prefix d) and reattach each: " +
+		strings.Join(names, ", ")
 }
 
 func (i *Installer) uninstallTmux() error {
@@ -341,6 +379,8 @@ func (i *Installer) uninstallTmux() error {
 		_, _ = i.Tmux.Run("set-hook", "-gu", h+"[97]")
 	}
 	_, _ = i.Tmux.Run("set-option", "-gqu", "@cccp_status")
+	_, _ = i.Tmux.Run("set-option", "-gqu", tmux.FocusSinceOption)
+
 	b, err := os.ReadFile(l.TmuxRestore)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil

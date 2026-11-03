@@ -78,6 +78,8 @@ func Handle(d Deps, agent model.Agent, r io.Reader, now time.Time) error {
 	}
 	ev.Time = now
 	ev.Pane = d.Getenv("TMUX_PANE")
+	ev.TmuxSocket = model.TmuxSocketFromEnv(d.Getenv("TMUX")) // kept only with a pane (reduce)
+
 	if agent == model.Claude {
 		// The hook inherits the agent's environment: this names the
 		// session's profile ("" = the default, ~/.claude).

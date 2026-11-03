@@ -23,6 +23,7 @@ var pure = map[string][]string{
 	"machine": {"core", "model", "config", "present"},
 	"profile": {"config", "model"},
 	"fuzzy":   {},
+	"nav":     {},
 }
 
 // io are standard-library packages that perform I/O or reach the process

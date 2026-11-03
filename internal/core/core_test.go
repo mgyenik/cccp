@@ -199,6 +199,12 @@ func TestHookSessionWorkingAndPane(t *testing.T) {
 	}
 }
 
+// reporting is a client that attached with focus reporting on (its focus
+// flag is real).
+func reporting(name, pane string, focused bool) model.TmuxClient {
+	return model.TmuxClient{Name: name, Pane: pane, Focused: focused, Created: t0, FocusSince: t0}
+}
+
 func yourTurnObs(focused bool) Observation {
 	return Observation{
 		Hooks: []HookRecord{hookRec("s1", 42, true, func(s *model.HookState) {
@@ -206,7 +212,7 @@ func yourTurnObs(focused bool) Observation {
 			s.LastPromptAt, s.StartedAt, s.LastEventAt = at(2), at(1), at(10)
 		})},
 		Tmux: TmuxView{OK: true, Panes: []model.TmuxPane{pane("%3", "@7", 2), pane("%9", "@8", 3)},
-			Clients: []model.TmuxClient{{Name: "c", Pane: "%9", Focused: true}, {Name: "d", Pane: "%3", Focused: focused}}},
+			Clients: []model.TmuxClient{reporting("c", "%9", true), reporting("d", "%3", focused)}},
 	}
 }
 
@@ -220,7 +226,17 @@ func TestYourTurnUntilSeen(t *testing.T) {
 	if !mem.Seen["claude:s1"].Equal(at(1)) {
 		t.Fatalf("seen = %v", mem.Seen["claude:s1"])
 	}
+	// A client that attached before focus reporting shows the pane and
+	// claims focus (tmux's initial flag, never cleared): not looking, so the
+	// turn is still unseen.
+	stale := yourTurnObs(false)
+	stale.Tmux.Clients = append(stale.Tmux.Clients, model.TmuxClient{Name: "old", Pane: "%3", Focused: true,
+		Created: t0.Add(-time.Hour), FocusSince: t0})
+	if s := find(t, func() Snapshot { s, _ := compute(stale, &mem, at(15)); return s }(), "claude:s1"); s.Visible || !s.Unseen {
+		t.Fatalf("a stale focus flag made the pane visible: %+v", s)
+	}
 	// Looking at the pane on a focused client acknowledges it.
+
 	snap, mem = compute(yourTurnObs(true), &mem, at(20))
 	s = find(t, snap, "claude:s1")
 	if s.Unseen || s.Group == GroupYourTurn || !s.Visible {
@@ -952,5 +968,59 @@ func TestPlanJumpForClosedConversations(t *testing.T) {
 	j = PlanJump(Session{Alive: true, Agent: model.Claude, SessionID: "c1", PID: 77, Title: "T"}, panes)
 	if j.Kind != JumpImpossible || !strings.Contains(j.Reason, "outside tmux (pid 77)") {
 		t.Fatalf("open outside tmux: %+v", j)
+	}
+}
+
+// --- tmux servers ----------------------------------------------------------------
+
+func TestPanesOnAnotherTmuxServerAreNotOurs(t *testing.T) {
+	const ours, other = "/tmp/tmux-1000/default", "/tmp/tmux-1000/work"
+	obs := func(regSock, hookSock string) Observation {
+		return Observation{
+			Tmux: TmuxView{OK: true, Socket: ours, Panes: []model.TmuxPane{pane("%2", "@2", 1)}},
+			Registry: []RegistryRecord{func() RegistryRecord {
+				r := regRec("r", 50, "idle", t0, func(e *model.RegistryEntry) { e.Tmux = "work:@2.%2" })
+				r.TmuxSocket = regSock
+				return r
+			}()},
+			Hooks: []HookRecord{hookRec("h", 51, true, func(s *model.HookState) {
+				s.Activity, s.Pane, s.TmuxSocket = model.Idle, "%2", hookSock
+			})},
+		}
+	}
+	// Both claim %2, recorded on another server: %2 here is someone else's.
+	snap, _ := compute(obs(other, other), nil, at(1))
+	for _, k := range []string{"claude:r", "claude:h"} {
+		if s := find(t, snap, k); s.Pane != "" || s.Location != "" || !s.Alive {
+			t.Errorf("%s: pane %q location %q alive %v; want alive, in no pane of ours", k, s.Pane, s.Location, s.Alive)
+		}
+	}
+	// Recorded on this server: theirs.
+	snap, _ = compute(obs(ours, ours), nil, at(1))
+	for _, k := range []string{"claude:r", "claude:h"} {
+		if s := find(t, snap, k); s.Pane != "%2" {
+			t.Errorf("%s: pane %q on our server", k, s.Pane)
+		}
+	}
+	// Recorded before servers were (or ours unknown): trusted, as before.
+	snap, _ = compute(obs("", ""), nil, at(1))
+	if s := find(t, snap, "claude:h"); s.Pane != "%2" {
+		t.Errorf("legacy hook state: pane %q", s.Pane)
+	}
+}
+
+func TestAHookWithoutAPidIsNotAliveInAnotherServersPane(t *testing.T) {
+	o := Observation{
+		Tmux:   TmuxView{OK: true, Socket: "/tmp/tmux-1000/default", Panes: []model.TmuxPane{pane("%2", "@2", 1)}},
+		Agents: []AgentProc{{PID: 77, Agent: model.Claude, Pane: "%2"}}, // an unrelated agent in our %2
+		Hooks: []HookRecord{hookRec("h", 0, false, func(s *model.HookState) {
+			s.Activity, s.Pane, s.TmuxSocket = model.Idle, "%2", "/tmp/tmux-1000/work"
+		})},
+	}
+	snap, _ := compute(o, nil, at(1))
+	for _, s := range snap.Sessions {
+		if s.Key == "claude:h" && s.Alive {
+			t.Fatal("liveness taken from an agent in a same-numbered pane of another server")
+		}
 	}
 }

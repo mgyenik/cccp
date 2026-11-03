@@ -135,7 +135,7 @@ actual changes:
   in full after a tmux restart or a failed write.
 * **subscribers**: the snapshot is pushed to connected cockpits.
 * **notifications**: when a session newly needs you and its pane is not
-  visible on a focused client.
+  visible on a client that is looking (4.7, focus).
 * **summaries** (optional): see 4.8.
 
 Idle cost: all goroutines block in the kernel (inotify read, epoll_wait,
@@ -163,8 +163,17 @@ Sources, in order:
    since it started. Processes are matched newest first, and each
    conversation is assigned once.
 
-Pane association: hook `$TMUX_PANE` → registry `tmux` field →
-`/proc/<pid>/environ` `TMUX_PANE`.
+Pane association, in order: the process tree (an agent below a pane's
+shell: always this server's), the registry's `tmux` field, the hook's
+`$TMUX_PANE`. Pane ids (`%3`) are unique only within one tmux server, and
+neither the registry nor `$TMUX_PANE` names the server, so each claim
+carries its server's socket: the hook records it from `$TMUX`, and for a
+registry entry it is read once from the process's own `$TMUX` in
+`/proc/<pid>/environ` (live processes only: a dead one's pid may be
+reused). A claim from another server is ignored (the session is alive but
+in no pane of ours), so a second server (`tmux -L work`) cannot lend its
+`%3` to an unrelated pane here. Hook state written before servers were
+recorded has no socket and is trusted until its next event.
 
 ### 4.4 State model
 
@@ -178,8 +187,8 @@ Derived per session:
 * **Attention**: `needs_approval` and `needs_input` always demand attention.
   A **completion** (turn ended: Stop, StopFailure, agy Stop, or a registry
   busy→idle transition) creates an attention item stamped with its time. The
-  item is cleared when the session's pane is *seen* — visible on a focused
-  tmux client — at or after that time, or when a new prompt is submitted. A
+    item is cleared when the session's pane is *seen* — visible on a tmux
+  client that is looking (4.7, focus) — at or after that time, or when a new prompt is submitted. A
   completion that happens while you are looking at the pane is seen
   immediately.
 * **Cache**: last main-thread model activity time (transcript) + TTL, where
@@ -247,9 +256,34 @@ the empirical findings and consequences.
   index `[97]` leaves the user's own hooks (normally index 0) alone and makes
   re-sourcing idempotent. `pane-title-changed` is deliberately not hooked
   (see section 9).
-* `focus-events on`, so "seen" can require the terminal to be focused.
+* **Focus.** `focus-events on`, so "seen" and "don't notify" can require
+  the terminal to have focus. tmux 3.4 starts every client flagged
+  `focused` (`server-client.c`), clears the flag only when the terminal
+  reports losing focus (`ESC[O`, `tty-keys.c`), and asks a terminal for
+  reports (`ESC[?1004h`) only in `tty_update_features()`, on attach, if
+  `focus-events` is on then (`tty.c`; the manual: "attached clients should
+  be detached and attached again after changing this option"). So a client
+  attached before the option came on stays "focused" forever. Found
+  2026-11-03: three terminals attached in September, before cccp's
+  installer turned the option on, made the current window of every
+  attached session count as watched, so turn ends there (an agy pane, in
+  the case reported) were marked seen instead of notified. The snippet
+  therefore runs `cccp tmux-focus-since` before turning the option on; it
+  sets `@cccp_focus_since` (once per server) to the server's start time if
+  no session exists yet (loading at server start: every client attaches
+  later), else to now (clients already attached may never have been
+  asked, and there is no way to tell). A client counts as looking only if
+  it attached at or after that time and is flagged focused
+  (`model.TmuxClient.Looking`); the others count as not looking (a
+  needless notification beats a missed one). `list-clients` returns
+  `client_created`, `focus-events` and `@cccp_focus_since` with each client,
+  so this costs no extra command. The installer and `cccp doctor` name the
+  clients to reattach.
 * Key bindings (root table, no prefix): `Shift+PgDn` → jump to the most
-  urgent session needing you (repeat to cycle); `Shift+PgUp` → cockpit popup.
+  urgent session needing you (repeat to cycle); `Shift+PgUp` → cockpit popup;
+  `Shift+Up` → back to where you were before cccp's last jump (repeat to
+  toggle; `internal/nav`: pressing `Shift+PgDn` repeatedly keeps the return
+  point, state in a per-client tmux option).
   The keys a binding replaces are saved per table and restored on uninstall;
   installs that bound `prefix a`/`prefix A` are migrated on reinstall.
   VTE-based terminals may keep Shift+PgUp/PgDn for their own scrollback.
@@ -322,6 +356,8 @@ socket; if the daemon is unreachable it gathers and computes in-process
 | hook binary missing/broken | Claude shows a hook error line; never blocks (always exit 0). |
 | registry format changes | parsed leniently; unknown statuses map to `unknown`; hooks still work. |
 | tmux server restarts | pane ids change; panes are rediscovered on the next tmux poke or refresh. |
+| terminals attached before `focus-events` was on | they never report focus; cccp counts them as not looking (notifications while you watch them) and `cccp doctor` names them for reattaching (4.7). |
+| several tmux servers | cccp shows the server it talks to; sessions in another server are listed, alive, without a pane (pane ids are compared with their server). |
 | pid reuse | the process start time is checked against the recorded one. |
 | clock skew between sources | all sources are on the same host clock. |
 | state dir grows | ended sessions older than the retention period (default 7 days) are pruned by the daemon. |

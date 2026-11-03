@@ -190,3 +190,22 @@ func TestAgyCancelIsNotACompletion(t *testing.T) {
 		t.Fatalf("%+v", s)
 	}
 }
+
+func TestPaneAndServerChangeTogether(t *testing.T) {
+	s := run(
+		cl("SessionStart", 0, func(e *model.Event) { e.Pane, e.TmuxSocket = "%3", "/tmp/tmux-1000/work" }),
+		cl("UserPromptSubmit", 1), // no pane: keeps both
+	)
+	if s.Pane != "%3" || s.TmuxSocket != "/tmp/tmux-1000/work" {
+		t.Fatalf("%q %q", s.Pane, s.TmuxSocket)
+	}
+	// A pane from an older hook, with no server: the old server must not
+	// stay attached to the new pane id.
+	s = run(
+		cl("SessionStart", 0, func(e *model.Event) { e.Pane, e.TmuxSocket = "%3", "/tmp/tmux-1000/work" }),
+		cl("Stop", 1, func(e *model.Event) { e.Pane = "%9" }),
+	)
+	if s.Pane != "%9" || s.TmuxSocket != "" {
+		t.Fatalf("%q %q", s.Pane, s.TmuxSocket)
+	}
+}

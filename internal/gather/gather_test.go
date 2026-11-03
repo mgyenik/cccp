@@ -64,29 +64,32 @@ func (f *fakeReg) Read(p string) (claudereg.Entry, error) {
 }
 
 type fakeTmux struct {
-	panes []tmux.Pane
-	err   error
-	calls int
+	panes  []tmux.Pane
+	err    error
+	calls  int
+	socket string
 }
 
 func (f *fakeTmux) ListPanes() ([]tmux.Pane, error) { f.calls++; return f.panes, f.err }
+func (f *fakeTmux) SocketPath() (string, error)     { return f.socket, nil }
 func (f *fakeTmux) ListClients() ([]tmux.ClientInfo, error) {
 	return []tmux.ClientInfo{{Name: "c", Pane: "%1", Focused: true}}, nil
 }
 
 type fakeProcs struct {
-	table   procs.Table
-	alive   map[int]bool
-	cmdline map[int][]string
-	cwd     map[int]string
-	env     map[int]map[string]string
+	table    procs.Table
+	alive    map[int]bool
+	cmdline  map[int][]string
+	cwd      map[int]string
+	env      map[int]map[string]string
+	envReads int
 }
 
 func (f *fakeProcs) Snapshot() procs.Table              { return f.table }
 func (f *fakeProcs) Alive(pid int, start uint64) bool   { return f.alive[pid] }
 func (f *fakeProcs) Cmdline(pid int) []string           { return f.cmdline[pid] }
 func (f *fakeProcs) Cwd(pid int) string                 { return f.cwd[pid] }
-func (f *fakeProcs) Environ(pid int, key string) string { return f.env[pid][key] }
+func (f *fakeProcs) Environ(pid int, key string) string { f.envReads++; return f.env[pid][key] }
 func (f *fakeProcs) StartWall(ticks uint64) time.Time   { return time.Unix(int64(ticks), 0) }
 
 type fakeTranscripts struct {
@@ -443,5 +446,57 @@ func TestCatalogIsReadOnlyOnRefresh(t *testing.T) {
 	obs = w.g.Observe(now)
 	if len(obs.Conversations) != 1 || len(obs.Problems) == 0 {
 		t.Fatalf("a failed refresh keeps the last catalog and reports: %+v", obs.Problems)
+	}
+}
+
+func TestTheTmuxServersAreRecorded(t *testing.T) {
+	w := newWorld()
+	w.tmux.socket = "/tmp/tmux-1000/default"
+	w.reg.files["/h/.claude/sessions/12.json"] = claudereg.Entry{PID: 12, SessionID: "r", ProcStart: "5", Tmux: "work:@2.%2"}
+	w.reg.files["/h/.claude/sessions/13.json"] = claudereg.Entry{PID: 13, SessionID: "q", ProcStart: "5"} // not in tmux
+	w.procs.alive[12], w.procs.alive[13] = true, true
+	w.procs.env[12] = map[string]string{"TMUX": "/tmp/tmux-1000/work,999,0"}
+	w.g.Reload()
+	w.g.RefreshTmux()
+	obs := w.g.Observe(now)
+	if w.procs.envReads != 1 {
+		t.Fatalf("%d environment reads: only a process whose entry names a pane needs one", w.procs.envReads)
+	}
+	if obs.Tmux.Socket != "/tmp/tmux-1000/default" {
+		t.Fatalf("our server %q", obs.Tmux.Socket)
+	}
+	socks := map[string]string{}
+	for _, r := range obs.Registry {
+		socks[r.Entry.SessionID] = r.TmuxSocket
+	}
+	if socks["r"] != "/tmp/tmux-1000/work" || socks["q"] != "" {
+		t.Fatalf("registry servers %v", socks)
+	}
+	// A process's environment never changes: it is read once, not per
+	// observation (which happens on every event).
+	reads := w.procs.envReads
+	w.g.Observe(now)
+	w.g.Observe(now)
+	if w.procs.envReads != reads {
+		t.Fatalf("environment reread: %d → %d", reads, w.procs.envReads)
+	}
+	// A registered process that has exited: its pid may now be another
+	// process's, whose environment says nothing about this session.
+	w.reg.files["/h/.claude/sessions/14.json"] = claudereg.Entry{PID: 14, SessionID: "gone", ProcStart: "5", Tmux: "x:@1.%1"}
+	w.procs.env[14] = map[string]string{"TMUX": "/tmp/tmux-1000/someone-else,1,0"}
+	w.g.RegistryFileChanged("/h/.claude/sessions/14.json")
+	for _, r := range w.g.Observe(now).Registry {
+		if r.Entry.SessionID == "gone" && r.TmuxSocket != "" {
+			t.Fatalf("server read from a reused pid: %q", r.TmuxSocket)
+		}
+	}
+	// A new process under the same pid is a different process.
+	w.reg.files["/h/.claude/sessions/12.json"] = claudereg.Entry{PID: 12, SessionID: "r2", ProcStart: "6", Tmux: "main:@0.%0"}
+	w.procs.env[12] = map[string]string{"TMUX": "/tmp/tmux-1000/default,1,0"}
+	w.g.RegistryFileChanged("/h/.claude/sessions/12.json")
+	for _, r := range w.g.Observe(now).Registry {
+		if r.Entry.SessionID == "r2" && r.TmuxSocket != "/tmp/tmux-1000/default" {
+			t.Fatalf("stale server for a new process: %q", r.TmuxSocket)
+		}
 	}
 }

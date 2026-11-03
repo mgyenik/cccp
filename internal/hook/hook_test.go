@@ -180,3 +180,18 @@ func TestHandleAgyAndErrors(t *testing.T) {
 		t.Error("unknown agent accepted")
 	}
 }
+
+func TestHandleRecordsTheTmuxServerWithThePane(t *testing.T) {
+	st := memStore{}
+	env := map[string]string{"TMUX_PANE": "%2", "TMUX": "/tmp/tmux-1000/work,999,0"}
+	Handle(deps(env, nil, st), model.Claude, strings.NewReader(`{"session_id":"s","hook_event_name":"Stop"}`), hookNow)
+	if s := st["claude:s"]; s.Pane != "%2" || s.TmuxSocket != "/tmp/tmux-1000/work" {
+		t.Fatalf("pane %q server %q", s.Pane, s.TmuxSocket)
+	}
+	// Outside tmux: neither.
+	st = memStore{}
+	Handle(deps(map[string]string{"TMUX": "/stale,1,0"}, nil, st), model.Claude, strings.NewReader(`{"session_id":"s","hook_event_name":"Stop"}`), hookNow)
+	if s := st["claude:s"]; s.Pane != "" || s.TmuxSocket != "" {
+		t.Fatalf("pane %q server %q", s.Pane, s.TmuxSocket)
+	}
+}

@@ -55,7 +55,7 @@ func (sc scene) obs() core.Observation {
 				{ID: "%1", Session: "s", WindowID: "@1", WindowIndex: 1, WindowPanes: 1},
 				{ID: "%9", Session: "s", WindowID: "@9", WindowIndex: 9, WindowPanes: 1},
 			},
-			Clients: []model.TmuxClient{{Name: "c", Pane: focus, Focused: true}}},
+			Clients: []model.TmuxClient{{Name: "c", Pane: focus, Focused: true, Created: t0, FocusSince: t0}}},
 	}
 	if sc.lastResp > 0 {
 		o.ClaudeTranscripts = map[string]core.ClaudeTranscript{"s1": {Path: "/t", Meta: model.ClaudeMeta{

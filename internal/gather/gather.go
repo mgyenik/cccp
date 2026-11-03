@@ -40,10 +40,11 @@ type Registry interface {
 	Read(path string) (claudereg.Entry, error)
 }
 
-// TmuxReader lists panes and clients.
+// TmuxReader lists panes and clients, and names the server.
 type TmuxReader interface {
 	ListPanes() ([]tmux.Pane, error)
 	ListClients() ([]tmux.ClientInfo, error)
+	SocketPath() (string, error)
 }
 
 // Procs reads process information.
@@ -124,8 +125,12 @@ type Gatherer struct {
 	hooks    map[string]model.HookState // by path
 	hookErrs []string
 	reg      map[string]claudereg.Entry // by path
-	tmux     core.TmuxView
-	agents   []core.AgentProc
+	// regTmux caches each registered process's tmux server (from its
+	// $TMUX, which never changes), by pid and start time.
+	regTmux map[procKey]string
+
+	tmux   core.TmuxView
+	agents []core.AgentProc
 	// conversations is the catalog as of the last RefreshCatalog.
 	conversations []core.Conversation
 	catalogErr    string
@@ -277,7 +282,28 @@ func (g *Gatherer) RefreshTmux() {
 	if err != nil {
 		clients = nil
 	}
-	g.tmux = core.TmuxView{OK: true, Panes: panes, Clients: clients}
+	sock, _ := g.d.Tmux.SocketPath() // "" if unknown: pane ids are then trusted
+	g.tmux = core.TmuxView{OK: true, Panes: panes, Clients: clients, Socket: sock}
+}
+
+type procKey struct {
+	pid   int
+	start uint64
+}
+
+// registryTmux is the tmux server of a live registered process, for the
+// pane its entry names; read once per process.
+func (g *Gatherer) registryTmux(e claudereg.Entry, seen map[procKey]string) string {
+	if e.Tmux == "" {
+		return ""
+	}
+	k := procKey{e.PID, e.ProcStartTicks()}
+	sock, ok := g.regTmux[k]
+	if !ok {
+		sock = model.TmuxSocketFromEnv(g.d.Procs.Environ(e.PID, "TMUX"))
+	}
+	seen[k] = sock
+	return sock
 }
 
 // Discover scans /proc for agent processes under the known panes. A Claude
@@ -342,14 +368,19 @@ func (g *Gatherer) Observe(now time.Time) core.Observation {
 		st.ConfigDir = profile.Normalize(st.ConfigDir, g.d.Home)
 		obs.Hooks = append(obs.Hooks, core.HookRecord{Path: p, State: st, ProcAlive: st.PID != 0 && g.d.Procs.Alive(st.PID, st.PIDStart)})
 	}
+	seen := map[procKey]string{}
 	for _, p := range sortedKeys(g.reg) {
 		e := g.reg[p]
 		rec := core.RegistryRecord{Path: p, Entry: e, Alive: g.d.Procs.Alive(e.PID, e.ProcStartTicks())}
+		if rec.Alive {
+			rec.TmuxSocket = g.registryTmux(e, seen)
+		}
 		if prof, ok := g.profileOfRegistry(p); ok {
 			rec.ConfigDir = prof.Dir
 		}
 		obs.Registry = append(obs.Registry, rec)
 	}
+	g.regTmux = seen // processes no longer registered are forgotten
 
 	needs := core.Plan(obs)
 	obs.ClaudeTranscripts = map[string]core.ClaudeTranscript{}

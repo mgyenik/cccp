@@ -129,7 +129,7 @@ func (c *computation) build(b *builder) (Session, bool) {
 		if hs.PID == 0 {
 			// The hook could not identify the agent process; fall back to
 			// whether its pane still runs an agent.
-			s.Alive = hs.Activity != model.Ended && c.paneHasAgent(hs.Pane)
+			s.Alive = hs.Activity != model.Ended && c.ourServer(hs.TmuxSocket) && c.paneHasAgent(hs.Pane)
 		} else {
 			s.Alive = hookLive(h) && !b.superseded
 		}
@@ -138,15 +138,15 @@ func (c *computation) build(b *builder) (Session, bool) {
 		s.Kind = "interactive"
 	}
 
-	// Pane: the process tree is authoritative, then the registry, then the
-	// hook.
+	// Pane: the process tree is authoritative (it is this server's), then
+	// the registry, then the hook, each only if recorded on this server.
 	pane := ""
 	switch {
 	case b.proc != nil && s.Alive:
 		pane = b.proc.Pane
-	case r != nil && r.Pane() != "":
+	case r != nil && r.Pane() != "" && c.ourServer(b.reg.TmuxSocket):
 		pane = r.Pane()
-	case hs != nil && s.Alive:
+	case hs != nil && s.Alive && c.ourServer(hs.TmuxSocket):
 		pane = hs.Pane
 	}
 	var tp model.TmuxPane
@@ -263,6 +263,11 @@ func (c *computation) build(b *builder) (Session, bool) {
 		return Session{}, false
 	}
 	return s, true
+}
+
+// ourServer: a pane id recorded on server sock can be looked up here.
+func (c *computation) ourServer(sock string) bool {
+	return model.SameTmuxServer(sock, c.obs.Tmux.Socket)
 }
 
 func (c *computation) paneHasAgent(pane string) bool {

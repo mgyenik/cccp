@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -21,6 +22,9 @@ type Client struct {
 	// Socket is passed as -S when set; otherwise tmux's default server is
 	// used (or $TMUX's when running inside tmux).
 	Socket string
+
+	mu         sync.Mutex
+	socketPath string // the server's socket path, once known
 }
 
 // New returns a client for the server at socket, or for tmux's default
@@ -115,24 +119,52 @@ func (c *Client) ListPanes() ([]Pane, error) {
 	return panes, nil
 }
 
+// FocusSinceOption records when the server started asking terminals for
+// focus reports (see model.TmuxClient.FocusReported).
+const FocusSinceOption = "@cccp_focus_since"
+
+// ClientFormat is list-clients' format for ParseClients. The server-wide
+// focus-events and FocusSinceOption come with every client, so one command
+// reads everything.
+var ClientFormat = strings.Join([]string{
+	"#{client_name}", "#{client_session}", "#{pane_id}", "#{client_flags}",
+	"#{client_created}", "#{focus-events}", "#{" + FocusSinceOption + "}",
+}, sep)
+
 // ListClients returns attached clients.
 func (c *Client) ListClients() ([]ClientInfo, error) {
-	out, err := c.Run("list-clients", "-F", strings.Join([]string{"#{client_name}", "#{client_session}", "#{pane_id}", "#{client_flags}"}, sep))
+	out, err := c.Run("list-clients", "-F", ClientFormat)
 	if err != nil {
 		return nil, err
 	}
-	focusEvents := c.focusEventsOn()
+	return ParseClients(out), nil
+}
+
+// ParseClients parses list-clients output in ClientFormat.
+func ParseClients(out string) []ClientInfo {
 	var cs []ClientInfo
 	for _, line := range strings.Split(strings.TrimRight(out, "\n"), "\n") {
 		f := strings.Split(line, sep)
-		if len(f) != 4 {
+		if len(f) != 7 {
 			continue
 		}
-		ci := ClientInfo{Name: f[0], Session: f[1], Pane: f[2], FocusKnown: focusEvents}
-		ci.Focused = !focusEvents || hasFlag(f[3], "focused")
+		ci := ClientInfo{Name: f[0], Session: f[1], Pane: f[2], Focused: hasFlag(f[3], "focused"),
+			Created: unixTime(f[4])}
+		if f[5] == "1" { // focus reporting means nothing while focus-events is off
+			ci.FocusSince = unixTime(f[6])
+		}
 		cs = append(cs, ci)
 	}
-	return cs, nil
+	return cs
+}
+
+// unixTime parses tmux's seconds-since-epoch times; zero when empty or bad.
+func unixTime(s string) time.Time {
+	n, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
+	if err != nil || n <= 0 {
+		return time.Time{}
+	}
+	return time.Unix(n, 0)
 }
 
 func hasFlag(flags, want string) bool {
@@ -144,9 +176,53 @@ func hasFlag(flags, want string) bool {
 	return false
 }
 
-func (c *Client) focusEventsOn() bool {
-	out, err := c.Run("show-options", "-gv", "focus-events")
-	return err == nil && strings.TrimSpace(out) == "on"
+// GlobalOption reads a global user option ("" when unset).
+func (c *Client) GlobalOption(name string) (string, error) {
+	out, err := c.Run("show-options", "-gqv", name)
+	return strings.TrimSpace(out), err
+}
+
+// SocketPath is the server's socket path: what identifies the server,
+// since pane ids (%3) are only unique within one. A Client always talks to
+// the same socket, so the path is asked for once (once the server runs).
+func (c *Client) SocketPath() (string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.socketPath != "" {
+		return c.socketPath, nil
+	}
+	out, err := c.Run("display-message", "-p", "#{socket_path}")
+	if err != nil {
+		return "", err
+	}
+	c.socketPath = strings.TrimSpace(out)
+	return c.socketPath, nil
+}
+
+// EnsureFocusSince sets FocusSinceOption if it is not set, as decided by
+// model.FocusSince. Run before focus-events is turned on.
+func (c *Client) EnsureFocusSince(now time.Time) error {
+	if cur, err := c.GlobalOption(FocusSinceOption); err != nil || cur != "" {
+		return err
+	}
+		// While the server starts (the snippet loading from tmux.conf) there is
+	// no session yet, and list-clients fails ("no current target"); no
+	// session means no client attached.
+	out, err := c.Run("display-message", "-p", "#{server_sessions}"+sep+"#{start_time}")
+	if err != nil {
+		return err
+	}
+	sessions, start, _ := strings.Cut(strings.TrimSpace(out), sep)
+	attached := 0
+	if sessions != "0" {
+		names, err := c.Run("list-clients", "-F", "#{client_name}")
+		if err != nil {
+			return err
+		}
+		attached = len(strings.Fields(names))
+	}
+	since := model.FocusSince(attached, unixTime(start), now)
+	return c.SetGlobalOption(FocusSinceOption, strconv.FormatInt(since.Unix(), 10))
 }
 
 // SetGlobalOption sets (or with an empty value, unsets) a global user option.

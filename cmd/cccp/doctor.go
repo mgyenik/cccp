@@ -85,6 +85,13 @@ func runDoctor(a *app, args []string) error {
 		check("tmux hooks", n == len(install.Hooks), fmt.Sprintf("%d of %d active in the running server", n, len(install.Hooks)))
 		fe, _ := a.tmux.Run("show-options", "-gv", "focus-events")
 		check("tmux focus-events", strings.TrimSpace(fe) == "on", "focus-events "+strings.TrimSpace(fe))
+		if clients, err := a.tmux.ListClients(); err == nil {
+			if stale := install.StaleFocusClients(clients); len(stale) > 0 {
+				check("tmux focus reports", false, install.ReattachAdvice(stale))
+			} else {
+				check("tmux focus reports", true, fmt.Sprintf("all %d attached clients report focus", len(clients)))
+			}
+		}
 	} else {
 		check("tmux", false, err.Error())
 	}

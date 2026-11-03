@@ -10,7 +10,16 @@
 # Terminal focus lets cccp tell "the pane is on screen and you are looking at
 # that terminal" apart from "the pane is on screen in a terminal you left".
 # (Claude Code's own tmux guidance recommends this setting too.)
+#
+# tmux asks a terminal for focus reports only when it attaches, and only if
+# focus-events is on then; turning it on later does not reach terminals
+# already attached, and tmux keeps them flagged "focused" forever. So cccp
+# records when focus reporting started (@cccp_focus_since, first, before
+# turning it on) and trusts the focus of clients attached since. Clients
+# attached before must be detached and reattached; `cccp doctor` lists them.
+run-shell "$HOME/.local/bin/cccp tmux-focus-since"
 set -g focus-events on
+
 
 # --- hooks: tell the daemon what is on screen ------------------------------
 # Index [97] keeps cccp's entries separate from any hooks you set yourself
@@ -32,9 +41,14 @@ set-hook -g session-closed[97]         'run-shell -b "$HOME/.local/bin/cccp noti
 # Shift+PgDn: jump to the most urgent session that needs you; press again to
 #             cycle through the others.
 # Shift+PgUp: the cockpit.
+# Shift+Up:   back to where you were before cccp's last jump (from either
+#             key above); press again to toggle.
+
 # Some terminals (e.g. VTE-based ones such as GNOME Terminal) use these keys
 # for their own scrollback and may not pass them to tmux.
 bind-key -n S-NPage run-shell -b "$HOME/.local/bin/cccp jump --next --client '#{client_name}'"
+bind-key -n S-Up    run-shell -b "$HOME/.local/bin/cccp jump --back --client '#{client_name}'"
+
 # The cockpit goes through run-shell because tmux expands #{client_name} there
 # but not in a display-popup command, and cannot tell from inside a popup
 # which client it is on.

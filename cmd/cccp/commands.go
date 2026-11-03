@@ -30,6 +30,7 @@ import (
 	"cccp/internal/ipc"
 	"cccp/internal/machine"
 	"cccp/internal/model"
+	"cccp/internal/nav"
 	"cccp/internal/paths"
 	"cccp/internal/present"
 	"cccp/internal/tmux"
@@ -184,10 +185,14 @@ func runStatus(a *app, args []string) error {
 func runJump(a *app, args []string) error {
 	fs := flag.NewFlagSet("jump", flag.ExitOnError)
 	next := fs.Bool("next", false, "jump to the most urgent session needing you; repeat to cycle")
+	back := fs.Bool("back", false, "return to where you were before cccp's last jump; repeat to toggle")
 	client := fs.String("client", "", "tmux client to switch (default: the current one)")
 	_ = fs.Parse(args)
 	if *client == "" {
 		*client = a.currentClient()
+	}
+	if *back {
+		return a.back(*client)
 	}
 	snap := a.snapshot(false)
 	var target core.Session
@@ -209,23 +214,27 @@ func runJump(a *app, args []string) error {
 			return fmt.Errorf("no session %q", fs.Arg(0))
 		}
 	default:
-		return errors.New("usage: cccp jump --next | cccp jump KEY")
+		return errors.New("usage: cccp jump --next | cccp jump --back | cccp jump KEY")
 	}
 	return a.jump(*client, target)
 }
 
-// jump executes core.PlanJump for a session on a tmux client.
+// jump executes core.PlanJump for a session on a tmux client, and records
+// where the client came from for back.
 func (a *app) jump(client string, s core.Session) error {
+	from := a.clientValue(client, "#{pane_id}")
 	panes, err := a.tmux.ListPanes()
 	if err != nil {
 		return err
 	}
 	p := core.PlanJump(s, panes)
+	var to string
 	switch p.Kind {
 	case core.JumpPane:
 		if err := a.tmux.SwitchClient(client, p.Pane); err != nil {
 			return err
 		}
+		to = p.Pane
 	case core.JumpNewWindow:
 		dir := p.Dir
 		if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
@@ -245,11 +254,49 @@ func (a *app) jump(client string, s core.Session) error {
 		if err := a.tmux.SwitchClient(client, pane); err != nil {
 			return err
 		}
+		to = pane
 	default:
 		return errors.New(p.Reason)
 	}
+	if name := a.clientName(client); name != "" {
+		opt := nav.Option(name)
+		if cur, err := a.tmux.GlobalOption(opt); err == nil {
+			_ = a.tmux.SetGlobalOption(opt, nav.Encode(nav.Jumped(nav.Decode(cur), from, to)))
+		}
+	}
 	_ = a.daemon.Send(ipc.Request{Op: ipc.OpSeen, Key: s.Key}, 300*time.Millisecond)
 	return nil
+}
+
+// back switches the client to where it was before cccp's last jump
+// (nav.Return).
+func (a *app) back(client string) error {
+	name := a.clientName(client)
+	if name == "" {
+		return errors.New("back: not in tmux (pass --client NAME)")
+	}
+	opt := nav.Option(name)
+	cur, err := a.tmux.GlobalOption(opt)
+	if err != nil {
+		return err
+	}
+	target, next, ok := nav.Return(nav.Decode(cur), a.clientValue(name, "#{pane_id}"))
+	if !ok {
+		return a.tmux.DisplayMessage(name, "cccp: nowhere to go back to")
+	}
+	if err := a.tmux.SwitchClient(name, target); err != nil {
+		_ = a.tmux.SetGlobalOption(opt, "") // the pane is gone: forget it
+		return a.tmux.DisplayMessage(name, "cccp: the pane to go back to is gone")
+	}
+	return a.tmux.SetGlobalOption(opt, nav.Encode(next))
+}
+
+// clientName is client, or the current client's name when client is "".
+func (a *app) clientName(client string) string {
+	if client != "" {
+		return client
+	}
+	return a.currentClient()
 }
 
 func (a *app) currentClient() string {
@@ -270,6 +317,15 @@ func (a *app) clientValue(client, format string) string {
 		return ""
 	}
 	return strings.TrimSpace(out)
+}
+
+// ---- tmux-focus-since ------------------------------------------------------------
+
+// runTmuxFocusSince records when the tmux server started asking terminals
+// for focus reports (tmux.EnsureFocusSince). cccp.tmux runs it just before
+// turning focus-events on.
+func runTmuxFocusSince(a *app, args []string) error {
+	return a.tmux.EnsureFocusSince(time.Now())
 }
 
 // ---- search -------------------------------------------------------------------------

@@ -48,7 +48,8 @@ func Compute(obs Observation, mem Memory, cfg config.Config, watchStart, now tim
 	return snap, c.mem
 }
 
-// visibleWindows lists windows shown on a focused tmux client.
+// visibleWindows lists windows shown on a tmux client whose terminal has
+// focus (model.TmuxClient.Looking: only clients that report focus count).
 func visibleWindows(obs Observation) map[string]bool {
 	paneWindow := map[string]string{}
 	for _, p := range obs.Tmux.Panes {
@@ -56,7 +57,7 @@ func visibleWindows(obs Observation) map[string]bool {
 	}
 	v := map[string]bool{}
 	for _, cl := range obs.Tmux.Clients {
-		if w, ok := paneWindow[cl.Pane]; ok && cl.Focused {
+		if w, ok := paneWindow[cl.Pane]; ok && cl.Looking() {
 			v[w] = true
 		}
 	}

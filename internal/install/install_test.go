@@ -96,6 +96,7 @@ type fakeTmux struct {
 	options map[string]string
 	keys    map[string]string
 	calls   []string
+	clients string // list-clients output
 }
 
 func (f *fakeTmux) Run(args ...string) (string, error) {
@@ -107,6 +108,8 @@ func (f *fakeTmux) Run(args ...string) (string, error) {
 		return f.keys[args[2]+" "+args[3]], nil
 	case len(args) == 4 && args[0] == "set-option" && args[1] == "-g":
 		f.options[args[2]] = args[3]
+	case len(args) == 3 && args[0] == "list-clients":
+		return f.clients, nil
 	case len(args) == 4 && args[0] == "unbind-key": // unbind-key -T TABLE KEY
 		delete(f.keys, args[2]+" "+args[3])
 	case len(args) == 2 && args[0] == "source-file" && strings.HasSuffix(args[1], ".keys"):
@@ -187,13 +190,17 @@ func TestInstallEverything(t *testing.T) {
 	if !strings.Contains(string(conf), SourceLine(l.TmuxSnippet)) {
 		t.Fatalf("tmux.conf %q", conf)
 	}
-	if tm.calls[len(tm.calls)-1] != "source-file "+l.TmuxSnippet {
+	sourced := false
+	for _, c := range tm.calls {
+		sourced = sourced || c == "source-file "+l.TmuxSnippet
+	}
+	if !sourced {
 		t.Fatalf("snippet not sourced: %v", tm.calls)
 	}
 	var saved Saved
 	b, _ := os.ReadFile(l.TmuxRestore)
 	json.Unmarshal(b, &saved)
-	want := map[string]string{"root S-NPage": "", "root S-PPage": "bind-key -T root S-PPage copy-mode -u"}
+	want := map[string]string{"root S-NPage": "", "root S-PPage": "bind-key -T root S-PPage copy-mode -u", "root S-Up": ""}
 	if saved.Options["status-right"] != "it's #H" || !reflect.DeepEqual(saved.Keys, want) {
 		t.Fatalf("saved %+v", saved)
 	}
@@ -321,7 +328,7 @@ func TestReinstallMigratesKeysFromPrefixToRoot(t *testing.T) {
 	var saved Saved
 	b, _ := os.ReadFile(l.TmuxRestore)
 	json.Unmarshal(b, &saved)
-	want := map[string]string{"root S-NPage": "", "root S-PPage": "bind-key -T root S-PPage copy-mode -u"}
+	want := map[string]string{"root S-NPage": "", "root S-PPage": "bind-key -T root S-PPage copy-mode -u", "root S-Up": ""}
 	if !reflect.DeepEqual(saved.Keys, want) {
 		t.Fatalf("saved keys %v", saved.Keys)
 	}
@@ -351,4 +358,45 @@ func TestUninstallOnlyTouchesProfilesWithThePlugin(t *testing.T) {
 			t.Fatalf("uninstalled from a profile without the plugin: %q", c)
 		}
 	}
+}
+
+func TestInstallNamesClientsThatDoNotReportFocus(t *testing.T) {
+	line := func(name, sess, created string) string {
+		return strings.Join([]string{name, sess, "%1", "attached,focused", created, "1", "2000"}, "␟")
+	}
+	for _, c := range []struct {
+		clients string
+		advice  bool
+	}{
+		{line("/dev/pts/0", "alpha", "1000") + "\n" + line("/dev/pts/2", "beta", "3000") + "\n", true},
+		{line("/dev/pts/2", "beta", "3000") + "\n", false},
+	} {
+		in, _, tm, _ := setup(t)
+		var out strings.Builder
+		in.Out = &out
+		tm.clients = c.clients
+		if err := in.Install(map[string]bool{"tmux": true}); err != nil {
+			t.Fatal(err)
+		}
+		got := out.String()
+		if c.advice != strings.Contains(got, "reattach") {
+			t.Fatalf("advice %v: %q", c.advice, got)
+		}
+		if c.advice && (!strings.Contains(got, "/dev/pts/0 (session alpha)") || strings.Contains(got, "/dev/pts/2")) {
+			t.Fatalf("must name exactly the stale client: %q", got)
+		}
+	}
+}
+
+func TestUninstallForgetsFocusSince(t *testing.T) {
+	in, _, tm, _ := setup(t)
+	in.Install(nil)
+	tm.calls = nil
+	in.Uninstall()
+	for _, c := range tm.calls {
+		if c == "set-option -gqu @cccp_focus_since" {
+			return
+		}
+	}
+	t.Fatalf("@cccp_focus_since left set: %v", tm.calls)
 }

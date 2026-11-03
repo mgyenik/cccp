@@ -45,6 +45,9 @@ func main() {
 		err = runUninstall(a, args)
 	case "doctor":
 		err = runDoctor(a, args)
+	case "tmux-focus-since":
+		err = runTmuxFocusSince(a, args)
+
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -69,8 +72,9 @@ usage:
   cccp ls [--json] [--all] [--local]
                          list sessions
   cccp status [--tmux]   one-line counts (as in the tmux status line)
-  cccp jump [--next] [--client NAME] [KEY]
-                         switch a tmux client to a session (--next: most urgent)
+    cccp jump [--next|--back] [--client NAME] [KEY]
+                         switch a tmux client to a session (--next: most urgent;
+                         --back: to where it was before cccp's last jump)
   cccp search [--json] [-n N] TERMS…
                          full-text search over transcripts
   cccp daemon            run the daemon (normally via systemd --user)
@@ -79,6 +83,7 @@ usage:
   cccp uninstall [--yes] remove them
   cccp doctor            check the installation
   cccp hook claude|agy   hook entry point (called by the agents)
-  cccp notify tmux EVENT tmux hook entry point (called by tmux)
+    cccp notify tmux EVENT tmux hook entry point (called by tmux)
+  cccp tmux-focus-since  record when focus reporting started (called by cccp.tmux)
 `)
 }
