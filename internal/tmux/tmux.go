@@ -38,13 +38,20 @@ func (c *Client) args(a ...string) []string {
 }
 
 // Run executes a tmux command and returns stdout.
-func (c *Client) Run(a ...string) (string, error) {
+func (c *Client) Run(a ...string) (string, error) { return c.runWithTimeout(5*time.Second, a...) }
+
+// runWithTimeout runs a tmux command; d == 0 means no timeout (for commands
+// that wait on the user, such as display-popup).
+func (c *Client) runWithTimeout(d time.Duration, a ...string) (string, error) {
 	if c.Socket == "" && testing.Testing() {
 		// Tests must name an isolated server (tmux -L / -S); never the
 		// user's default one.
 		return "", errors.New("refusing to talk to the default tmux server from a test binary")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.Background(), context.CancelFunc(func() {})
+	if d > 0 {
+		ctx, cancel = context.WithTimeout(ctx, d)
+	}
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "tmux", c.args(a...)...)
 	var out, errb bytes.Buffer
@@ -222,4 +229,48 @@ func (c *Client) DisplayMessage(client, msg string) error {
 // ShellQuote quotes s for tmux command strings run by /bin/sh.
 func ShellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// Popup describes a display-popup.
+type Popup struct {
+	Client        string // client to show it on (required: see PopupArgs)
+	Width, Height string // e.g. "92%"
+	Title         string
+	Env           []string // KEY=VALUE pairs for the popup's command
+	Argv          []string // command to run; the popup closes when it exits
+}
+
+// PopupArgs builds the display-popup arguments. The client is passed
+// explicitly because tmux (3.4) neither expands formats in a popup's
+// command nor reliably resolves "the current client" from inside a popup
+// when several clients are attached: the caller must expand
+// #{client_name} beforehand (run-shell does).
+func PopupArgs(p Popup) []string {
+	a := []string{"display-popup", "-E", "-c", p.Client}
+	if p.Width != "" {
+		a = append(a, "-w", p.Width)
+	}
+	if p.Height != "" {
+		a = append(a, "-h", p.Height)
+	}
+	if p.Title != "" {
+		a = append(a, "-T", p.Title)
+	}
+	for _, kv := range p.Env {
+		a = append(a, "-e", kv)
+	}
+	quoted := make([]string, len(p.Argv))
+	for i, s := range p.Argv {
+		quoted[i] = ShellQuote(s)
+	}
+	return append(a, strings.Join(quoted, " "))
+}
+
+// DisplayPopup opens a popup and waits until it closes.
+func (c *Client) DisplayPopup(p Popup) error {
+	if p.Client == "" {
+		return errors.New("display-popup: no client")
+	}
+	_, err := c.runWithTimeout(0, PopupArgs(p)...)
+	return err
 }

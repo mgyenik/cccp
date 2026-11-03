@@ -35,6 +35,8 @@ func main() {
 		err = runJump(a, args)
 	case "ui":
 		err = runUI(a, args)
+	case "popup":
+		err = runPopup(a, args)
 	case "search":
 		err = runSearch(a, args)
 	case "install":
@@ -62,6 +64,8 @@ func usage() {
 usage:
   cccp [ui] [--client NAME]
                          cockpit TUI (Shift+PgUp in tmux, via cccp.tmux)
+  cccp popup --client NAME
+                         open the cockpit in a tmux popup on a client
   cccp ls [--json] [--all] [--local]
                          list sessions
   cccp status [--tmux]   one-line counts (as in the tmux status line)

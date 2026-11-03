@@ -27,8 +27,10 @@ import (
 	"cccp/internal/ipc"
 	"cccp/internal/machine"
 	"cccp/internal/model"
+	"cccp/internal/paths"
 	"cccp/internal/present"
 	"cccp/internal/search"
+	"cccp/internal/tmux"
 	"cccp/internal/ui"
 )
 
@@ -341,6 +343,9 @@ func runUI(a *app, args []string) error {
 	fs := flag.NewFlagSet("ui", flag.ExitOnError)
 	client := fs.String("client", "", "tmux client to switch when jumping (default: current)")
 	_ = fs.Parse(args)
+	if strings.Contains(*client, "#{") {
+		return fmt.Errorf("ui: --client %q is an unexpanded tmux format", *client)
+	}
 	if *client == "" {
 		*client = a.currentClient()
 	}
@@ -375,6 +380,33 @@ func runUI(a *app, args []string) error {
 				return err
 			},
 		},
+	})
+}
+
+// runPopup opens the cockpit in a tmux popup on --client. The client must be
+// expanded by the caller (the Shift+PgUp binding goes through run-shell,
+// which expands #{client_name}): inside a popup tmux can no longer tell
+// which client it is on.
+func runPopup(a *app, args []string) error {
+	fs := flag.NewFlagSet("popup", flag.ExitOnError)
+	client := fs.String("client", "", "tmux client to show the popup on (required)")
+	_ = fs.Parse(args)
+	if *client == "" || strings.Contains(*client, "#{") {
+		return errors.New("popup: --client NAME is required (an expanded client name, e.g. from run-shell's #{client_name})")
+	}
+	self, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	var env []string
+	for _, k := range paths.EnvVars {
+		if v := os.Getenv(k); v != "" {
+			env = append(env, k+"="+v)
+		}
+	}
+	return a.tmux.DisplayPopup(tmux.Popup{
+		Client: *client, Width: "92%", Height: "88%", Title: " cccp ", Env: env,
+		Argv: []string{self, "ui", "--client", *client},
 	})
 }
 

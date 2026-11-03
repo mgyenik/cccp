@@ -46,6 +46,14 @@ type Layout struct {
 	TmuxConf       string
 }
 
+// EnvVars are the environment variables Resolve reads. A process that starts
+// cccp in a new environment (a tmux popup) passes these through so the child
+// resolves the same layout.
+var EnvVars = []string{
+	"CCCP_STATE_DIR", "CCCP_CACHE_DIR", "CCCP_SOCKET", "CCCP_TMUX_SOCKET",
+	"XDG_STATE_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_RUNTIME_DIR", "CLAUDE_CONFIG_DIR",
+}
+
 // Resolve computes the layout from environment variables (getenv) and the
 // home directory. Overrides: CCCP_STATE_DIR, CCCP_CACHE_DIR, CCCP_SOCKET,
 // CCCP_TMUX_SOCKET, XDG_STATE_HOME, XDG_CACHE_HOME, XDG_CONFIG_HOME,

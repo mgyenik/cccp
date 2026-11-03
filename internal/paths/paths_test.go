@@ -61,3 +61,19 @@ func TestProjectSlug(t *testing.T) {
 		}
 	}
 }
+
+func TestEnvVarsCoverEveryOverride(t *testing.T) {
+	// Every variable Resolve consults must be in EnvVars, or a popup would
+	// resolve a different layout than its parent.
+	var read []string
+	Resolve(func(k string) string { read = append(read, k); return "" }, "/h", 1)
+	for _, k := range read {
+		found := false
+		for _, e := range EnvVars {
+			found = found || e == k
+		}
+		if !found {
+			t.Errorf("Resolve reads %s but EnvVars does not list it", k)
+		}
+	}
+}
