@@ -606,3 +606,11 @@ Every conversation on disk, in any harness and profile, is a row: those
 without a process are CLOSED, below COLD. `/` searches all rows in one ranked
 list; `enter` on a closed row resumes it in a new tmux window. Design, data
 locations and battery behaviour: [conversations.md](conversations.md).
+
+## 13. Clicking a notification (designed, not built)
+
+Going to a notification's session on click needs the terminal to raise the
+right window, which on GNOME Wayland only the terminal itself can do. The
+design uses Ghostty ≥ 1.4.0 (`GHOSTTY_SURFACE_ID` and its `present-surface`
+D-Bus action) and D-Bus notifications from the daemon. It waits for that
+release: [notification-click.md](notification-click.md).

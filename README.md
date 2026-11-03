@@ -106,6 +106,9 @@ reattach them (prefix `d`, then `tmux attach -t SESSION`).
 Sessions started before the plugins were installed have no hooks (shown
 with `~`, state inferred) and cannot report a finished turn: restart them.
 
+Clicking a notification does nothing yet. Going to the session on click is
+designed for Ghostty ≥ 1.4.0: see [docs/notification-click.md](docs/notification-click.md).
+
 ## Configure
 
 `~/.config/cccp/config.toml` (all optional; `systemctl --user kill -s HUP cccp`
