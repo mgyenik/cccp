@@ -843,7 +843,7 @@ func TestUnmanagedSessionMatchedWithinItsProfile(t *testing.T) {
 	}
 	// The same title in the other profile's project must not match.
 	obs.Projects = map[ProjectKey][]ProjectTranscript{
-		{ConfigDir: "/h/.claude", Cwd: "/w"}:    {{SessionID: "personal-one", ModTime: at(9), Meta: m}},
+		{ConfigDir: "/h/.claude", Cwd: "/w"}:      {{SessionID: "personal-one", ModTime: at(9), Meta: m}},
 		{ConfigDir: "/h/.claude-work", Cwd: "/w"}: {{SessionID: "work-one", ModTime: at(1), Meta: m}},
 	}
 	snap, _ := compute(obs, nil, at(5))

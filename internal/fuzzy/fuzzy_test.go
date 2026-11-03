@@ -14,10 +14,10 @@ func TestMatchBasics(t *testing.T) {
 		{"vitrbi", "Viterbi algorithm", true}, // vit|rbi: runs of 3
 		{"96", "AX96 amplifier", true},        // one run: a substring
 		{"gnstg", "Gain staging", false},
-		{"tebi", "Viterbi algorithm", false},                                  // te|bi: two-letter runs inside a word
-		{"gsn", "Gain staging", false},                                        // g|s|n: the last run is the lone letter                                      // g|n|st|g: "n" is a lone letter mid-word
+		{"tebi", "Viterbi algorithm", false},              // te|bi: two-letter runs inside a word
+		{"gsn", "Gain staging", false},                    // g|s|n: the last run is the lone letter                                      // g|n|st|g: "n" is a lone letter mid-word
 		{"viterbi", "an avid kitten, very bitter", false}, // vi|t|e|r|bi
-		{"stag gain", "Gain staging", true},                                   // terms in any order
+		{"stag gain", "Gain staging", true},               // terms in any order
 		{"xyz", "Gain staging", false},
 		{"gain xyz", "Gain staging", false}, // every term must match
 		{"ax96", "AX96 amplifier spice simulation", true},
@@ -66,8 +66,13 @@ func TestFieldsKeepTermsInsideOneField(t *testing.T) {
 
 func TestProseNeedsASubstring(t *testing.T) {
 	prose := Field{Text: "Please validate the input, then add tests for every branch.", Prose: true}
-	if _, ok := MatchFields("vtrb", prose); ok {
-		t.Fatal("a scattered subsequence matched prose")
+	// An abbreviation of word starts matches a short field, but prose only by
+	// substring.
+	if _, ok := MatchFields("fb", Field{Text: prose.Text}); !ok {
+		t.Fatal("the abbreviation should match as a short field")
+	}
+	if _, ok := MatchFields("fb", prose); ok {
+		t.Fatal("a non-substring matched prose")
 	}
 	if _, ok := MatchFields("tests", prose); !ok {
 		t.Fatal("a word in prose did not match")
