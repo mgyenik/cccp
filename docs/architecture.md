@@ -248,8 +248,11 @@ the empirical findings and consequences.
   re-sourcing idempotent. `pane-title-changed` is deliberately not hooked
   (see section 9).
 * `focus-events on`, so "seen" can require the terminal to be focused.
-* Key bindings: `prefix a` → jump to the most urgent session needing you
-  (repeat to cycle); `prefix A` → cockpit popup
+* Key bindings (root table, no prefix): `Shift+PgDn` → jump to the most
+  urgent session needing you (repeat to cycle); `Shift+PgUp` → cockpit popup.
+  The keys a binding replaces are saved per table and restored on uninstall;
+  installs that bound `prefix a`/`prefix A` are migrated on reinstall.
+  VTE-based terminals may keep Shift+PgUp/PgDn for their own scrollback.
   (`display-popup -E -w 90% -h 85% "cccp ui --client '#{client_name}'"`).
 * Status line: `#{@cccp_status}` in `status-right`; window list:
   `#{@cccp_glyph}` in `window-status-format` / `window-status-current-format`.

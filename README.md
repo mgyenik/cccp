@@ -64,8 +64,8 @@ full tracking.
 
 | Where | Key / command | Does |
 |---|---|---|
-| tmux | `prefix a` | jump to the most urgent session that needs you; repeat to cycle |
-| tmux | `prefix A` | open the cockpit popup |
+| tmux | `Shift+PgDn` | jump to the most urgent session that needs you; repeat to cycle |
+| tmux | `Shift+PgUp` | open the cockpit popup |
 | cockpit | `enter` | jump to the session (resumes it in a new window if it ended) |
 | cockpit | `tab` / `shift+tab` | next / previous session needing you |
 | cockpit | `/` | filter by title, project, location, state, prompt |

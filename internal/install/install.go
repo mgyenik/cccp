@@ -14,6 +14,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"cccp/internal/paths"
@@ -81,7 +82,7 @@ func (i *Installer) Install(only map[string]bool) error {
 		{StepAgy, "install the agy plugin (observe-only hooks: SessionStart, PreInvocation, PostToolUse, Stop) to " + l.AgyPluginDir, i.installAgy},
 		{StepSystemd, "install and start the systemd user unit " + l.SystemdUnit, i.installSystemd},
 		{StepTmux, "add `" + SourceLine(l.TmuxSnippet) + "` to " + l.TmuxConf +
-			"\n    sets focus-events on, hooks [97], prefix a / prefix A, status-right and window-status formats" +
+			"\n    sets focus-events on, hooks [97], Shift+PgDn / Shift+PgUp, status-right and window-status formats" +
 			"\n    (current values are saved to " + l.TmuxRestore + " for uninstall)", i.installTmux},
 	}
 	for _, s := range steps {
@@ -248,8 +249,22 @@ func (i *Installer) installSystemd() error {
 // before the install are saved so uninstall can put them back.
 var RestoredOptions = []string{"focus-events", "status-right", "status-right-length", "window-status-format", "window-status-current-format"}
 
-// RestoredKeys are the prefix-table keys cccp.tmux binds.
-var RestoredKeys = []string{"a", "A"}
+// Key is a tmux key binding: a key table and a key.
+type Key struct{ Table, Key string }
+
+func (k Key) String() string { return k.Table + " " + k.Key }
+
+// RestoredKeys are the keys cccp.tmux binds.
+var RestoredKeys = []Key{{"root", "S-NPage"}, {"root", "S-PPage"}}
+
+// parseSavedKey reads a Saved.Keys entry: "table key", or a bare key from
+// installs before the keys moved to the root table (the prefix table).
+func parseSavedKey(s string) Key {
+	if t, k, ok := strings.Cut(s, " "); ok {
+		return Key{Table: t, Key: k}
+	}
+	return Key{Table: "prefix", Key: s}
+}
 
 // Hooks are the tmux hooks cccp.tmux sets, at index [97].
 var Hooks = []string{
@@ -260,7 +275,8 @@ var Hooks = []string{
 
 // Saved is the tmux state cccp.tmux overrides. It is stored as data and
 // restored with set-option calls, so no value has to survive config-file
-// quoting. Keys hold tmux's own list-keys output ("" = unbound).
+// quoting. Keys maps "table key" to tmux's own list-keys output for that
+// key before cccp bound it ("" = it was unbound).
 type Saved struct {
 	Options map[string]string `json:"options"`
 	Keys    map[string]string `json:"keys"`
@@ -271,26 +287,8 @@ func (i *Installer) installTmux() error {
 	if err := i.writeAsset("integrations/tmux/cccp.tmux", l.TmuxSnippet, 0o644); err != nil {
 		return err
 	}
-	// Save the pre-install state once; a reinstall must not overwrite it
-	// with cccp's own values.
-	if _, err := os.Stat(l.TmuxRestore); errors.Is(err, os.ErrNotExist) {
-		saved := Saved{Options: map[string]string{}, Keys: map[string]string{}}
-		for _, o := range RestoredOptions {
-			if v, err := i.Tmux.Run("show-options", "-gv", o); err == nil {
-				saved.Options[o] = strings.TrimSuffix(v, "\n")
-			}
-		}
-		for _, k := range RestoredKeys {
-			out, _ := i.Tmux.Run("list-keys", "-T", "prefix", k)
-			saved.Keys[k] = strings.TrimSpace(out)
-		}
-		b, err := json.MarshalIndent(saved, "", "  ")
-		if err != nil {
-			return err
-		}
-		if err := store.WriteAtomic(l.TmuxRestore, b); err != nil {
-			return err
-		}
+	if err := i.saveTmuxState(); err != nil {
+		return err
 	}
 	conf, err := os.ReadFile(l.TmuxConf)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -343,24 +341,99 @@ func (i *Installer) uninstallTmux() error {
 			return err
 		}
 	}
-	for _, k := range RestoredKeys {
-		line := saved.Keys[k]
-		if line == "" {
-			_, _ = i.Tmux.Run("unbind-key", "-T", "prefix", k)
-			continue
-		}
-		// list-keys output is valid tmux config: source it back.
-		tmp := l.TmuxRestore + ".keys"
-		if err := os.WriteFile(tmp, []byte(line+"\n"), 0o600); err != nil {
-			return err
-		}
-		_, err := i.Tmux.Run("source-file", tmp)
-		os.Remove(tmp)
-		if err != nil && !errors.Is(err, tmux.ErrNoServer) {
+	for _, name := range sortedKeys(saved.Keys) {
+		if err := i.restoreKey(parseSavedKey(name), saved.Keys[name]); err != nil {
 			return err
 		}
 	}
 	return os.Remove(l.TmuxRestore)
+}
+
+// saveTmuxState records, once, the tmux state cccp.tmux is about to change.
+// Options are saved on the first install only: a reinstall must not save
+// cccp's own values. Keys are saved per key, so a newly bound key is saved
+// on the install that first binds it, and keys an older version bound but
+// this one does not are restored now.
+func (i *Installer) saveTmuxState() error {
+	l := i.L
+	saved := Saved{Options: map[string]string{}, Keys: map[string]string{}}
+	b, err := os.ReadFile(l.TmuxRestore)
+	switch {
+	case err == nil:
+		if err := json.Unmarshal(b, &saved); err != nil {
+			return fmt.Errorf("%s: %w", l.TmuxRestore, err)
+		}
+		if saved.Options == nil {
+			saved.Options = map[string]string{}
+		}
+		if saved.Keys == nil {
+			saved.Keys = map[string]string{}
+		}
+	case errors.Is(err, os.ErrNotExist):
+		for _, o := range RestoredOptions {
+			if v, err := i.Tmux.Run("show-options", "-gv", o); err == nil {
+				saved.Options[o] = strings.TrimSuffix(v, "\n")
+			}
+		}
+	default:
+		return err
+	}
+	want := map[string]bool{}
+	for _, k := range RestoredKeys {
+		want[k.String()] = true
+	}
+	keys := map[string]string{}
+	for _, name := range sortedKeys(saved.Keys) {
+		k := parseSavedKey(name)
+		if want[k.String()] {
+			keys[k.String()] = saved.Keys[name]
+			continue
+		}
+		// Bound by an earlier version only: put it back as it was.
+		if err := i.restoreKey(k, saved.Keys[name]); err != nil {
+			return err
+		}
+	}
+	for _, k := range RestoredKeys {
+		if _, ok := keys[k.String()]; !ok {
+			out, _ := i.Tmux.Run("list-keys", "-T", k.Table, k.Key)
+			keys[k.String()] = strings.TrimSpace(out)
+		}
+	}
+	saved.Keys = keys
+	b, err = json.MarshalIndent(saved, "", "  ")
+	if err != nil {
+		return err
+	}
+	return store.WriteAtomic(l.TmuxRestore, b)
+}
+
+// restoreKey puts a key back as it was: unbound, or its saved binding (tmux's
+// own list-keys output, which is valid config, sourced back).
+func (i *Installer) restoreKey(k Key, line string) error {
+	if line == "" {
+		_, _ = i.Tmux.Run("unbind-key", "-T", k.Table, k.Key)
+		return nil
+	}
+	tmp := i.L.TmuxRestore + ".keys"
+	if err := os.WriteFile(tmp, []byte(line+"\n"), 0o600); err != nil {
+		return err
+	}
+	_, err := i.Tmux.Run("source-file", tmp)
+	os.Remove(tmp)
+	if err != nil && !errors.Is(err, tmux.ErrNoServer) {
+		return err
+	}
+	return nil
+}
+
+func sortedKeys(m map[string]string) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func (i *Installer) uninstallSystemd() error {

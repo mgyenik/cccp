@@ -61,7 +61,7 @@ func usage() {
 
 usage:
   cccp [ui] [--client NAME]
-                         cockpit TUI (prefix A in tmux, via cccp.tmux)
+                         cockpit TUI (Shift+PgUp in tmux, via cccp.tmux)
   cccp ls [--json] [--all] [--local]
                          list sessions
   cccp status [--tmux]   one-line counts (as in the tmux status line)

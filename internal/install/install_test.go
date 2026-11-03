@@ -80,15 +80,19 @@ func (f *fakeTmux) Run(args ...string) (string, error) {
 	switch {
 	case len(args) == 3 && args[0] == "show-options":
 		return f.options[args[2]] + "\n", nil
-	case len(args) == 4 && args[0] == "list-keys":
-		return f.keys[args[3]], nil
+	case len(args) == 4 && args[0] == "list-keys": // list-keys -T TABLE KEY
+		return f.keys[args[2]+" "+args[3]], nil
 	case len(args) == 4 && args[0] == "set-option" && args[1] == "-g":
 		f.options[args[2]] = args[3]
-	case len(args) == 4 && args[0] == "unbind-key": // unbind-key -T prefix KEY
-		delete(f.keys, args[3])
+	case len(args) == 4 && args[0] == "unbind-key": // unbind-key -T TABLE KEY
+		delete(f.keys, args[2]+" "+args[3])
 	case len(args) == 2 && args[0] == "source-file" && strings.HasSuffix(args[1], ".keys"):
+		// "bind-key -T TABLE KEY command…"
 		b, _ := os.ReadFile(args[1])
-		f.keys["a"] = strings.TrimSpace(string(b))
+		line := strings.TrimSpace(string(b))
+		if w := strings.Fields(line); len(w) >= 4 {
+			f.keys[w[2]+" "+w[3]] = line
+		}
 	}
 	return "", nil
 }
@@ -106,7 +110,8 @@ func setup(t *testing.T) (*Installer, *fakeCmd, *fakeTmux, paths.Layout) {
 	tm := &fakeTmux{
 		options: map[string]string{"status-right": "it's #H", "focus-events": "off", "status-right-length": "40",
 			"window-status-format": "#I:#W", "window-status-current-format": "#I:#W"},
-		keys: map[string]string{"a": "bind-key -T prefix a display-message hi"},
+		// S-PgUp was bound before cccp; S-PgDn was not.
+		keys: map[string]string{"root S-PPage": "bind-key -T root S-PPage copy-mode -u"},
 	}
 	return &Installer{L: l, Assets: cccp.Assets, Cmd: cmd, Tmux: tm, Self: self, Out: io.Discard,
 		In: bufio.NewReader(strings.NewReader("")), Yes: true}, cmd, tm, l
@@ -150,7 +155,8 @@ func TestInstallEverything(t *testing.T) {
 	var saved Saved
 	b, _ := os.ReadFile(l.TmuxRestore)
 	json.Unmarshal(b, &saved)
-	if saved.Options["status-right"] != "it's #H" || saved.Keys["a"] == "" || saved.Keys["A"] != "" {
+	want := map[string]string{"root S-NPage": "", "root S-PPage": "bind-key -T root S-PPage copy-mode -u"}
+	if saved.Options["status-right"] != "it's #H" || !reflect.DeepEqual(saved.Keys, want) {
 		t.Fatalf("saved %+v", saved)
 	}
 }
@@ -210,8 +216,8 @@ func TestUninstallRestoresEverything(t *testing.T) {
 	in, cmd, tm, l := setup(t)
 	in.Install(nil)
 	tm.options["status-right"] = "#{@cccp_status} …"
-	tm.keys["a"] = "bind-key -T prefix a run-shell cccp jump"
-	tm.keys["A"] = "bind-key -T prefix A display-popup cccp"
+	tm.keys["root S-NPage"] = "bind-key -T root S-NPage run-shell cccp jump"
+	tm.keys["root S-PPage"] = "bind-key -T root S-PPage display-popup cccp"
 	cmd.outputs["claude plugin list"] = "cccp@cccp"
 	cmd.outputs["claude plugin marketplace list"] = l.MarketplaceDir
 	cmd.calls = nil
@@ -222,11 +228,11 @@ func TestUninstallRestoresEverything(t *testing.T) {
 	if string(conf) != "set -g mouse on\n" {
 		t.Fatalf("tmux.conf %q", conf)
 	}
-	if tm.options["status-right"] != "it's #H" || tm.keys["a"] != "bind-key -T prefix a display-message hi" {
-		t.Fatalf("not restored: %q %q", tm.options["status-right"], tm.keys["a"])
+	if tm.options["status-right"] != "it's #H" || tm.keys["root S-PPage"] != "bind-key -T root S-PPage copy-mode -u" {
+		t.Fatalf("not restored: %q %q", tm.options["status-right"], tm.keys["root S-PPage"])
 	}
-	if _, ok := tm.keys["A"]; ok {
-		t.Fatal("prefix A should be unbound again")
+	if _, ok := tm.keys["root S-NPage"]; ok {
+		t.Fatal("S-NPage should be unbound again")
 	}
 	for _, p := range []string{l.AgyPluginDir, l.SystemdUnit, l.MarketplaceDir, l.TmuxRestore} {
 		if _, err := os.Stat(p); err == nil {
@@ -250,5 +256,45 @@ func TestUninstallRestoresEverything(t *testing.T) {
 	}
 	if hooks != len(Hooks) {
 		t.Fatalf("unset %d of %d hooks", hooks, len(Hooks))
+	}
+}
+
+func TestReinstallMigratesKeysFromPrefixToRoot(t *testing.T) {
+	in, _, tm, l := setup(t)
+	// State left by an install that bound prefix a / prefix A: the saved
+	// file records them by bare name (both unbound before cccp), and the
+	// live server still has cccp's bindings.
+	os.MkdirAll(filepath.Dir(l.TmuxRestore), 0o755)
+	os.WriteFile(l.TmuxRestore, []byte(`{"options":{"status-right":"it's #H"},"keys":{"a":"","A":""}}`), 0o644)
+	tm.keys["prefix a"] = "bind-key -T prefix a run-shell cccp jump"
+	tm.keys["prefix A"] = "bind-key -T prefix A display-popup cccp"
+	tm.options["status-right"] = "#{@cccp_status} …"
+	if err := in.Install(map[string]bool{StepTmux: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := tm.keys["prefix a"]; ok {
+		t.Fatal("old prefix a binding not removed")
+	}
+	if _, ok := tm.keys["prefix A"]; ok {
+		t.Fatal("old prefix A binding not removed")
+	}
+	var saved Saved
+	b, _ := os.ReadFile(l.TmuxRestore)
+	json.Unmarshal(b, &saved)
+	want := map[string]string{"root S-NPage": "", "root S-PPage": "bind-key -T root S-PPage copy-mode -u"}
+	if !reflect.DeepEqual(saved.Keys, want) {
+		t.Fatalf("saved keys %v", saved.Keys)
+	}
+	if saved.Options["status-right"] != "it's #H" {
+		t.Fatal("original options lost in the migration")
+	}
+}
+
+func TestParseSavedKey(t *testing.T) {
+	if k := parseSavedKey("root S-NPage"); k != (Key{"root", "S-NPage"}) {
+		t.Fatal(k)
+	}
+	if k := parseSavedKey("a"); k != (Key{"prefix", "a"}) {
+		t.Fatal("legacy bare keys are prefix-table keys:", k)
 	}
 }

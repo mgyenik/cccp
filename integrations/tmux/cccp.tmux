@@ -28,12 +28,14 @@ set-hook -g pane-exited[97]            'run-shell -b "$HOME/.local/bin/cccp noti
 set-hook -g session-created[97]        'run-shell -b "$HOME/.local/bin/cccp notify tmux session-created"'
 set-hook -g session-closed[97]         'run-shell -b "$HOME/.local/bin/cccp notify tmux session-closed"'
 
-# --- keys -------------------------------------------------------------------
-# prefix a: jump to the most urgent session that needs you; press again to
-#           cycle through the others.
-# prefix A: the cockpit.
-bind-key a run-shell -b "$HOME/.local/bin/cccp jump --next --client '#{client_name}'"
-bind-key A display-popup -E -w 92% -h 88% -T " cccp " "$HOME/.local/bin/cccp ui --client '#{client_name}'"
+# --- keys (root table: no prefix) --------------------------------------------
+# Shift+PgDn: jump to the most urgent session that needs you; press again to
+#             cycle through the others.
+# Shift+PgUp: the cockpit.
+# Some terminals (e.g. VTE-based ones such as GNOME Terminal) use these keys
+# for their own scrollback and may not pass them to tmux.
+bind-key -n S-NPage run-shell -b "$HOME/.local/bin/cccp jump --next --client '#{client_name}'"
+bind-key -n S-PPage display-popup -E -w 92% -h 88% -T " cccp " "$HOME/.local/bin/cccp ui --client '#{client_name}'"
 
 # --- status line --------------------------------------------------------------
 # @cccp_status is set by the daemon: counts of sessions that need you (⚠),
