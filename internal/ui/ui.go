@@ -3,6 +3,7 @@ package ui
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -11,10 +12,11 @@ import (
 	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
 
+	"cccp/internal/catalog"
 	"cccp/internal/core"
+	"cccp/internal/fuzzy"
 	"cccp/internal/model"
 	"cccp/internal/present"
-	"cccp/internal/search"
 )
 
 // Source feeds snapshots to the cockpit.
@@ -33,12 +35,14 @@ type Actions struct {
 	Jump  func(s core.Session) error
 	Alias func(key, value string) error
 	Seen  func(key string) error
+	// Summarize asks for a summary of a closed conversation (may be nil).
+	Summarize func(key string) error
 }
 
-// Searcher is transcript full-text search (search.Index).
+// Searcher searches the conversation text (catalog.Index). The cockpit only
+// reads it: the daemon, or the in-process source, keeps it up to date.
 type Searcher interface {
-	Update() (int, error)
-	Run(q search.Query, limit int) ([]search.Hit, error)
+	Run(q catalog.Query, limit int) ([]catalog.Hit, error)
 }
 
 // PaneCapturer captures a tmux pane's contents.
@@ -59,8 +63,6 @@ type mode int
 const (
 	modeList mode = iota
 	modeFilter
-	modeSearchInput
-	modeSearchResults
 	modeAlias
 )
 
@@ -73,10 +75,17 @@ type previewMsg struct {
 }
 type searchMsg struct {
 	query string
-	hits  []search.Hit
+	hits  []catalog.Hit
 	err   error
-	took  time.Duration
 }
+
+// contentTick fires after a pause in typing: time to search the text.
+type contentTick struct{ query string }
+
+// contentDelay is the pause in typing after which conversation text is
+// searched.
+const contentDelay = 150 * time.Millisecond
+
 type doneMsg struct{ err error }
 
 // Model is the Bubble Tea model.
@@ -89,21 +98,20 @@ type Model struct {
 
 	width, height int
 
-	mode      mode
-	cursor    int // index into visible()
-	offset    int
-	showEnded bool
-	preview   previewMode
+	mode       mode
+	cursor     int // index into visible()
+	offset     int
+	hideClosed bool
+	preview    previewMode
 
 	filter textinput.Model
-	query  textinput.Model
 	alias  textinput.Model
 
-	hits       []search.Hit
-	hitCursor  int
-	hitOffset  int
-	searching  bool
-	searchInfo string
+	// content holds the conversation-text matches for contentQuery.
+	content      map[string]catalog.Hit
+	contentQuery string
+	// summarized: closed conversations already asked to be summarised.
+	summarized map[string]bool
 
 	previewKey  string
 	previewText string
@@ -127,13 +135,10 @@ const (
 func New(opt Options) *Model {
 	f := textinput.New()
 	f.Prompt = "/ "
-	f.Placeholder = "filter by title, project, location, state…"
-	q := textinput.New()
-	q.Prompt = "? "
-	q.Placeholder = `search transcripts (all words must match; "quote phrases")`
+	f.Placeholder = "search everything: titles, projects, prompts, conversation text…"
 	a := textinput.New()
 	a.Prompt = "alias: "
-	return &Model{opt: opt, filter: f, query: q, alias: a, now: time.Now()}
+	return &Model{opt: opt, filter: f, alias: a, now: time.Now(), summarized: map[string]bool{}}
 }
 
 // Run starts the cockpit and blocks until it exits.
@@ -155,31 +160,78 @@ func (m *Model) Init() tea.Cmd { return tick() }
 
 // visible returns the sessions shown in the list, in order.
 func (m *Model) visible() []core.Session {
-	var out []core.Session
-	f := strings.ToLower(strings.TrimSpace(m.filter.Value()))
-	for _, s := range m.snap.Sessions {
-		if s.Group == core.GroupEnded && !m.showEnded && f == "" {
-			continue
+	q := strings.TrimSpace(m.filter.Value())
+	var content map[string]catalog.Hit
+	if q != "" && m.contentQuery == q {
+		content = m.content
+	}
+	return rankSessions(m.snap.Sessions, q, content, m.hideClosed)
+}
+
+// rankSessions is the list's search. Without a query: every session in
+// snapshot order (grouped), closed ones unless hidden. With a query: one
+// flat list, fuzzy matches on the session's facts ranked by score, then
+// sessions found only in their conversation text, in the text index's
+// order (newest first). Closed conversations are always searched.
+func rankSessions(ss []core.Session, q string, content map[string]catalog.Hit, hideClosed bool) []core.Session {
+	if q == "" {
+		var out []core.Session
+		for _, s := range ss {
+			if s.Group == core.GroupClosed && hideClosed {
+				continue
+			}
+			out = append(out, s)
 		}
-		if f != "" && !matches(s, f) {
-			continue
+		return out
+	}
+	type scored struct {
+		s     core.Session
+		score int
+		pos   int
+	}
+	var hits []scored
+	matched := map[string]bool{}
+	for i, s := range ss {
+		if score, ok := fuzzy.MatchFields(q, fields(s)...); ok {
+			hits = append(hits, scored{s, score, i})
+			matched[s.Key] = true
 		}
-		out = append(out, s)
+	}
+	sort.SliceStable(hits, func(i, j int) bool {
+		if hits[i].score != hits[j].score {
+			return hits[i].score > hits[j].score
+		}
+		return hits[i].pos < hits[j].pos
+	})
+	out := make([]core.Session, 0, len(hits))
+	for _, h := range hits {
+		out = append(out, h.s)
+	}
+	var text []scored
+	for i, s := range ss {
+		if _, ok := content[s.Key]; ok && !matched[s.Key] {
+			text = append(text, scored{s, 0, i})
+		}
+	}
+	sort.SliceStable(text, func(i, j int) bool {
+		return content[text[i].s.Key].At.After(content[text[j].s.Key].At)
+	})
+	for _, t := range text {
+		out = append(out, t.s)
 	}
 	return out
 }
 
-func matches(s core.Session, f string) bool {
-	hay := strings.ToLower(strings.Join([]string{
-		s.DisplayTitle(), s.Title, s.Cwd, s.Location, s.TmuxSess, string(s.Agent),
-		s.Group.String(), string(s.Activity), s.LastPrompt, s.Summary, s.SessionID,
-	}, " "))
-	for _, t := range strings.Fields(f) {
-		if !strings.Contains(hay, t) {
-			return false
-		}
+// fields is what the search matches a session against: names and paths
+// fuzzily, prompts and the summary as prose.
+func fields(s core.Session) []fuzzy.Field {
+	short := func(t string) fuzzy.Field { return fuzzy.Field{Text: t} }
+	prose := func(t string) fuzzy.Field { return fuzzy.Field{Text: t, Prose: true} }
+	return []fuzzy.Field{
+		short(s.DisplayTitle()), short(s.Title), short(s.Profile), short(string(s.Agent)),
+		short(s.Group.String()), short(s.Cwd), short(s.Location), short(s.Branch),
+		prose(s.FirstPrompt), prose(s.LastPrompt), prose(s.Summary),
 	}
-	return true
 }
 
 func (m *Model) selected() (core.Session, bool) {
@@ -200,7 +252,6 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 		m.filter.SetWidth(msg.Width - 4)
-		m.query.SetWidth(msg.Width - 4)
 		m.alias.SetWidth(msg.Width - 12)
 		return m, m.loadPreview()
 
@@ -223,19 +274,26 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case contentTick:
+		if msg.query != strings.TrimSpace(m.filter.Value()) || msg.query == "" || m.opt.Search == nil {
+			return m, nil // typing went on, or nothing to search
+		}
+		return m, runSearch(m.opt.Search, msg.query)
+
 	case searchMsg:
-		m.searching = false
-		if msg.query != m.query.Value() {
-			return m, nil
+		if msg.query != strings.TrimSpace(m.filter.Value()) {
+			return m, nil // a stale result
 		}
 		if msg.err != nil {
-			m.searchInfo = "search failed: " + msg.err.Error()
+			m.setStatus("text search: " + msg.err.Error())
 			return m, nil
 		}
-		m.hits, m.hitCursor, m.hitOffset = msg.hits, 0, 0
-		m.searchInfo = fmt.Sprintf("%d sessions match (%v)", len(msg.hits), msg.took.Round(time.Millisecond))
-		m.mode = modeSearchResults
-		return m, nil
+		m.content, m.contentQuery = map[string]catalog.Hit{}, msg.query
+		for _, h := range msg.hits {
+			m.content[h.Doc.Key()] = h
+		}
+		m.restoreSelection()
+		return m, m.loadPreview()
 
 	case doneMsg:
 		if msg.err != nil {
@@ -254,8 +312,6 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch m.mode {
 	case modeFilter:
 		m.filter, cmd = m.filter.Update(msg)
-	case modeSearchInput:
-		m.query, cmd = m.query.Update(msg)
 	case modeAlias:
 		m.alias, cmd = m.alias.Update(msg)
 	}
@@ -308,6 +364,7 @@ func (m *Model) key(k tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.filter.SetValue("")
 			m.filter.Blur()
 			m.mode = modeList
+			m.content, m.contentQuery = nil, ""
 			m.restoreSelection()
 			return m, m.loadPreview()
 		case "enter":
@@ -322,54 +379,16 @@ func (m *Model) key(k tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			return m, m.loadPreview()
 		}
 		var cmd tea.Cmd
+		before := m.filter.Value()
 		m.filter, cmd = m.filter.Update(k)
+		if m.filter.Value() == before {
+			return m, cmd
+		}
 		m.cursor = 0
 		m.rememberSelection()
-		return m, tea.Batch(cmd, m.loadPreview())
-
-	case modeSearchInput:
-		switch key {
-		case "esc":
-			m.query.Blur()
-			m.mode = modeList
-			return m, nil
-		case "enter":
-			q := m.query.Value()
-			if strings.TrimSpace(q) == "" {
-				return m, nil
-			}
-			if m.opt.Search == nil {
-				m.searchInfo = "search is not available"
-				return m, nil
-			}
-			m.searching = true
-			m.searchInfo = "searching…"
-			return m, runSearch(m.opt.Search, q)
-		}
-		var cmd tea.Cmd
-		m.query, cmd = m.query.Update(k)
-		return m, cmd
-
-	case modeSearchResults:
-		switch key {
-		case "esc", "q":
-			m.mode = modeList
-			return m, nil
-		case "?", "/":
-			m.mode = modeSearchInput
-			return m, m.query.Focus()
-		case "up", "k":
-			if m.hitCursor > 0 {
-				m.hitCursor--
-			}
-		case "down", "j":
-			if m.hitCursor < len(m.hits)-1 {
-				m.hitCursor++
-			}
-		case "enter":
-			return m, m.openHit()
-		}
-		return m, nil
+		q := strings.TrimSpace(m.filter.Value())
+		return m, tea.Batch(cmd, m.loadPreview(),
+			tea.Tick(contentDelay, func(time.Time) tea.Msg { return contentTick{query: q} }))
 
 	case modeAlias:
 		switch key {
@@ -418,11 +437,8 @@ func (m *Model) key(k tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case "/":
 		m.mode = modeFilter
 		return m, m.filter.Focus()
-	case "?":
-		m.mode = modeSearchInput
-		return m, m.query.Focus()
 	case "e":
-		m.showEnded = !m.showEnded
+		m.hideClosed = !m.hideClosed
 		m.restoreSelection()
 	case "p":
 		// Cycle from what is shown now: pane → conversation → off → pane.
@@ -483,31 +499,13 @@ func (m *Model) jumpSelected() tea.Cmd {
 	return func() tea.Msg { return doneMsg{err: jump(s)} }
 }
 
-// openHit jumps to a search hit's session: the live pane if it is running,
-// otherwise a resumed session.
-func (m *Model) openHit() tea.Cmd {
-	if m.hitCursor >= len(m.hits) || m.opt.Actions.Jump == nil {
-		return nil
-	}
-	h := m.hits[m.hitCursor]
-	target := core.Session{Key: h.Doc.Key(), Agent: h.Doc.Agent, SessionID: h.Doc.SessionID, Cwd: h.Doc.Cwd, Title: h.Doc.Title}
-	for _, s := range m.snap.Sessions {
-		if s.Key == target.Key {
-			target = s
-		}
-	}
-	jump := m.opt.Actions.Jump
-	return func() tea.Msg { return doneMsg{err: jump(target)} }
-}
-
+// runSearch searches the conversation text. The catalog is kept up to date
+// by the daemon (or was brought up to date when the cockpit started), so it
+// is only read here.
 func runSearch(ix Searcher, q string) tea.Cmd {
 	return func() tea.Msg {
-		start := time.Now()
-		if _, err := ix.Update(); err != nil {
-			return searchMsg{query: q, err: err}
-		}
-		hits, err := ix.Run(search.ParseQuery(q), 200)
-		return searchMsg{query: q, hits: hits, err: err, took: time.Since(start)}
+		hits, err := ix.Run(catalog.ParseQuery(q), 500)
+		return searchMsg{query: q, hits: hits, err: err}
 	}
 }
 
@@ -522,7 +520,8 @@ func (m *Model) effectivePreview(s core.Session) previewMode {
 	return previewConversation
 }
 
-// loadPreview captures the selected pane, when the preview shows a pane.
+// loadPreview captures the selected pane, when the preview shows a pane,
+// and asks for a summary of a selected closed conversation that has none.
 func (m *Model) loadPreview() tea.Cmd {
 	s, ok := m.selected()
 	if !ok {
@@ -532,6 +531,20 @@ func (m *Model) loadPreview() tea.Cmd {
 	if s.Key != m.previewKey {
 		m.previewKey, m.previewText = s.Key, ""
 	}
+	var ask tea.Cmd
+	if s.Group == core.GroupClosed && s.Summary == "" && !m.summarized[s.Key] && m.opt.Actions.Summarize != nil {
+		m.summarized[s.Key] = true
+		summarize, key := m.opt.Actions.Summarize, s.Key
+		ask = func() tea.Msg { _ = summarize(key); return nil }
+	}
+	if ask != nil {
+		return tea.Batch(ask, m.capture(s))
+	}
+	return m.capture(s)
+}
+
+// capture returns the command capturing s's pane, if the preview shows it.
+func (m *Model) capture(s core.Session) tea.Cmd {
 	if m.effectivePreview(s) != previewPane || s.Pane == "" || m.opt.Panes == nil {
 		return nil
 	}
@@ -571,7 +584,7 @@ func groupStyle(g core.Group) lipgloss.Style {
 		return lipgloss.NewStyle().Foreground(cCyan)
 	case core.GroupCold:
 		return lipgloss.NewStyle().Foreground(cBlue)
-	case core.GroupEnded, core.GroupUnknown:
+	case core.GroupClosed, core.GroupUnknown:
 		return lipgloss.NewStyle().Foreground(cGray)
 	}
 	return lipgloss.NewStyle()
@@ -601,20 +614,14 @@ func (m *Model) render() string {
 	if bodyH < 3 {
 		bodyH = 3
 	}
-	var body string
-	if m.mode == modeSearchResults || (m.mode == modeSearchInput && len(m.hits) > 0) {
-		body = m.renderHits(m.width, bodyH)
-	} else {
-		body = m.renderBody(bodyH)
-	}
-	return lipgloss.JoinVertical(lipgloss.Left, header, body, footer)
+	return lipgloss.JoinVertical(lipgloss.Left, header, m.renderBody(bodyH), footer)
 }
 
 func (m *Model) renderHeader() string {
 	c := m.snap.Counts()
 	var parts []string
 	for _, g := range core.Groups {
-		if g == core.GroupEnded {
+		if g == core.GroupClosed {
 			continue
 		}
 		if n := c[g]; n > 0 {
@@ -645,20 +652,17 @@ func (m *Model) renderFooter() string {
 	var line string
 	switch m.mode {
 	case modeFilter:
-		line = m.filter.View()
-	case modeSearchInput:
-		line = m.query.View()
-		if m.searchInfo != "" {
-			line += "  " + sDim.Render(m.searchInfo)
-		}
+		line = m.filter.View() + "  " + sKeyHint.Render("enter open · ↑↓ move · esc clear")
 	case modeAlias:
 		line = m.alias.View()
-	case modeSearchResults:
-		line = sKeyHint.Render("enter open/resume · ↑↓ move · ? new search · esc back") + "  " + sDim.Render(m.searchInfo)
 	default:
-		hint := "enter jump · tab next needing you · / filter · ? search · a alias · m seen · p preview · e ended · r rescan · q quit"
+		closed := "e hide closed"
+		if m.hideClosed {
+			closed = "e show closed"
+		}
+		hint := "enter open/resume · tab next needing you · / search · a alias · m seen · p preview · " + closed + " · r rescan · q quit"
 		if f := m.filter.Value(); f != "" {
-			hint = "filter: " + f + " · " + hint
+			hint = "search: " + f + " · " + hint
 		}
 		line = sKeyHint.Render(ansi.Truncate(hint, m.width, "…"))
 	}
@@ -703,8 +707,9 @@ func (m *Model) renderList(w, h int) string {
 	}
 	var lines []line
 	last := core.Group(-1)
+	searching := strings.TrimSpace(m.filter.Value()) != ""
 	for i, s := range vis {
-		if s.Group != last {
+		if s.Group != last && !searching { // search results are one ranked list
 			lines = append(lines, line{groupStyle(s.Group).Render(s.Group.String()), -1})
 			last = s.Group
 		}
@@ -712,8 +717,8 @@ func (m *Model) renderList(w, h int) string {
 	}
 	if len(vis) == 0 {
 		msg := "no sessions"
-		if m.filter.Value() != "" {
-			msg = "no sessions match the filter"
+		if searching {
+			msg = "nothing matches"
 		}
 		lines = append(lines, line{sDim.Render(msg), -1})
 	}
@@ -772,20 +777,36 @@ func (m *Model) renderRow(s core.Session, w int, cursor bool) string {
 	if loc == "" {
 		loc = "-"
 	}
+	turns := ""
+	if s.Group == core.GroupClosed {
+		turns = present.Turns(s.Turns)
+	}
 	meta := strings.Join(nonEmpty(
 		present.Since(m.now, s.ActivitySince),
 		present.CacheText(s, m.now),
 		present.Tokens(s.ContextTokens),
+		turns,
 	), "  ")
 	titleW := 34
 	if w < 90 {
 		titleW = 24
 	}
-	left := fmt.Sprintf(" %s %s %s %s ", g, present.AgentBadge(s.Agent), pad(loc, 10), pad(s.DisplayTitle(), titleW))
+	badge := present.AgentBadge(s.Agent)
+	if present.MultiProfile(m.snap) {
+		badge += " " + pad(present.ProfileTag(s, 8), 8)
+	}
+	left := fmt.Sprintf(" %s %s %s %s ", g, badge, pad(loc, 10), pad(s.DisplayTitle(), titleW))
 	detailW := w - ansi.StringWidth(left) - ansi.StringWidth(meta) - 2
 	detail := ""
 	if detailW > 8 {
-		detail = pad(present.OneLine(present.Detail(s)), detailW)
+		d := present.Detail(s)
+		if h, ok := m.content[s.Key]; ok && m.contentQuery == strings.TrimSpace(m.filter.Value()) {
+			// Found in the conversation text: show the match, the column is narrow.
+			d = "“" + present.Around(h.Snippet, catalog.ParseQuery(m.contentQuery).Terms, 10) + "”"
+		} else if s.Group == core.GroupClosed && s.Summary != "" {
+			d = s.Summary
+		}
+		detail = pad(present.OneLine(d), detailW)
 	} else {
 		detail = strings.Repeat(" ", max(0, detailW))
 	}
@@ -824,14 +845,25 @@ func (m *Model) renderPreview(s core.Session, pm previewMode, w, h int) string {
 	info := []string{
 		fmt.Sprintf("%s · %s · %s", s.Agent, s.Tracking, strings.ReplaceAll(string(s.Activity), "_", " ")),
 	}
+	if s.Profile != "" {
+		info[0] = s.Profile + " profile · " + info[0]
+	}
 	if s.Inferred {
 		info[0] += " (inferred)"
 	}
 	if s.Cwd != "" {
-		info = append(info, s.Cwd)
+		info = append(info, strings.Join(nonEmpty(s.Cwd, s.Branch), " · "))
+	}
+	if s.Group == core.GroupClosed {
+		info = append(info, strings.Join(nonEmpty("closed "+present.Since(m.now, s.ActivitySince)+" ago",
+			present.Turns(s.Turns), "enter resumes it"), " · "))
 	}
 	if s.Model != "" || s.ContextTokens > 0 {
-		info = append(info, strings.Join(nonEmpty(s.Model, present.Tokens(s.ContextTokens)+" context"), " · "))
+		ctx := ""
+		if s.ContextTokens > 0 {
+			ctx = present.Tokens(s.ContextTokens) + " context"
+		}
+		info = append(info, strings.Join(nonEmpty(s.Model, ctx), " · "))
 	}
 	if c := present.CacheText(s, m.now); c != "" {
 		ttl := s.Cache.TTL.String()
@@ -886,6 +918,11 @@ func (m *Model) conversation(s core.Session, w, h int) string {
 	if s.Summary != "" {
 		parts = append(parts, lipgloss.NewStyle().Foreground(cGreen).Render("summary: ")+s.Summary, "")
 	}
+	if s.FirstPrompt != "" && s.FirstPrompt != s.LastPrompt {
+		parts = append(parts, sHeader.Render("started with"))
+		parts = append(parts, wrapTail(s.FirstPrompt, w, max(2, h/5))...)
+		parts = append(parts, "")
+	}
 	if s.LastPrompt != "" {
 		parts = append(parts, sHeader.Render("you asked"+agoSuffix(m.now, s.LastPromptAt)))
 		parts = append(parts, wrapTail(s.LastPrompt, w, max(3, h/3))...)
@@ -916,44 +953,4 @@ func wrapTail(text string, w, n int) []string {
 		lines = append([]string{sDim.Render("…")}, lines[len(lines)-n+1:]...)
 	}
 	return lines
-}
-
-func (m *Model) renderHits(w, h int) string {
-	if len(m.hits) == 0 {
-		return sDim.Render("no matches")
-	}
-	per := 3
-	visible := h / per
-	if visible < 1 {
-		visible = 1
-	}
-	if m.hitCursor < m.hitOffset {
-		m.hitOffset = m.hitCursor
-	}
-	if m.hitCursor >= m.hitOffset+visible {
-		m.hitOffset = m.hitCursor - visible + 1
-	}
-	live := map[string]core.Session{}
-	for _, s := range m.snap.Sessions {
-		live[s.Key] = s
-	}
-	var b strings.Builder
-	for i := m.hitOffset; i < len(m.hits) && i < m.hitOffset+visible; i++ {
-		hit := m.hits[i]
-		state := "ended · resume"
-		if s, ok := live[hit.Doc.Key()]; ok && s.Alive {
-			state = s.Group.String() + " · " + s.Location
-		}
-		title := fmt.Sprintf(" %s %-5s %s", present.AgentBadge(hit.Doc.Agent), present.Since(m.now, hit.At), hit.Doc.Title)
-		meta := fmt.Sprintf("%s  %d hits  %s", state, hit.Matches, hit.Doc.Cwd)
-		l1 := pad(title, w-ansi.StringWidth(meta)-1) + " " + meta
-		l2 := "     " + hit.Role + ": " + present.OneLine(hit.Snippet)
-		if i == m.hitCursor {
-			b.WriteString(sCursor.Render(ansi.Truncate(l1, w, "…")) + "\n")
-		} else {
-			b.WriteString(sTitle.Render(ansi.Truncate(l1, w, "…")) + "\n")
-		}
-		b.WriteString(sDim.Render(ansi.Truncate(l2, w, "…")) + "\n\n")
-	}
-	return lipgloss.NewStyle().Height(h).MaxHeight(h).Render(strings.TrimRight(b.String(), "\n"))
 }

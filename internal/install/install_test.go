@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"cccp"
+	"cccp/internal/model"
 	"cccp/internal/paths"
 )
 
@@ -63,9 +64,31 @@ type fakeCmd struct {
 	outputs map[string]string // "name args…" → output
 }
 
-func (f *fakeCmd) Run(name string, args ...string) (string, error) {
+// Run records "[PROFILE ]command", where PROFILE is how a complete
+// environment selects the Claude profile: "CLAUDE_CONFIG_DIR=dir", or
+// "env -u CLAUDE_CONFIG_DIR" when the variable is removed (the default
+// profile). A complete environment that lost the rest of cccp's environment
+// is recorded as such, so tests catch it.
+func (f *fakeCmd) Run(env []string, name string, args ...string) (string, error) {
 	c := strings.Join(append([]string{name}, args...), " ")
-	f.calls = append(f.calls, c)
+	key := c
+	if env != nil {
+		sel, inherited := "env -u CLAUDE_CONFIG_DIR", false
+		for _, kv := range env {
+			if strings.HasPrefix(kv, "CLAUDE_CONFIG_DIR=") {
+				sel = kv
+			}
+			inherited = inherited || kv == "PATH=/test/bin"
+		}
+		if !inherited {
+			sel += " (environment lost)"
+		}
+		key = sel + " " + c
+	}
+	f.calls = append(f.calls, key)
+	if out, ok := f.outputs[key]; ok {
+		return out, nil
+	}
 	return f.outputs[c], nil
 }
 
@@ -113,7 +136,14 @@ func setup(t *testing.T) (*Installer, *fakeCmd, *fakeTmux, paths.Layout) {
 		// S-PgUp was bound before cccp; S-PgDn was not.
 		keys: map[string]string{"root S-PPage": "bind-key -T root S-PPage copy-mode -u"},
 	}
-	return &Installer{L: l, Assets: cccp.Assets, Cmd: cmd, Tmux: tm, Self: self, Out: io.Discard,
+	profiles := []model.Profile{
+		{Name: "personal", Dir: l.DefaultClaudeDir, Default: true},
+		{Name: "work", Dir: filepath.Join(home, ".claude-work")},
+	}
+	// The inherited environment names the work profile, as in a shell
+	// started through the claude-work alias: each profile must override it.
+	environ := []string{"PATH=/test/bin", "CLAUDE_CONFIG_DIR=" + filepath.Join(home, ".claude-work")}
+	return &Installer{L: l, Profiles: profiles, Assets: cccp.Assets, Cmd: cmd, Environ: environ, Tmux: tm, Self: self, Out: io.Discard,
 		In: bufio.NewReader(strings.NewReader("")), Yes: true}, cmd, tm, l
 }
 
@@ -133,15 +163,23 @@ func TestInstallEverything(t *testing.T) {
 			t.Errorf("missing %s", p)
 		}
 	}
-	wantCmds := []string{
-		"claude plugin marketplace list",
-		"claude plugin marketplace add " + l.MarketplaceDir,
-		"claude plugin list",
-		"claude plugin install cccp@cccp",
+	var wantCmds []string
+	// The default profile with CLAUDE_CONFIG_DIR removed (set to ~/.claude,
+	// Claude Code would use a blank ~/.claude/.claude.json), the work profile
+	// with it set.
+	for _, sel := range []string{"env -u CLAUDE_CONFIG_DIR", "CLAUDE_CONFIG_DIR=" + filepath.Join(l.Home, ".claude-work")} {
+		env := sel + " "
+		wantCmds = append(wantCmds,
+			env+"claude plugin marketplace list",
+			env+"claude plugin marketplace add "+l.MarketplaceDir,
+			env+"claude plugin list",
+			env+"claude plugin install cccp@cccp")
+	}
+	wantCmds = append(wantCmds,
 		"systemctl --user daemon-reload",
 		"systemctl --user enable cccp.service",
 		"systemctl --user restart cccp.service",
-	}
+	)
 	if !reflect.DeepEqual(cmd.calls, wantCmds) {
 		t.Fatalf("commands:\n%s", strings.Join(cmd.calls, "\n"))
 	}
@@ -218,8 +256,9 @@ func TestUninstallRestoresEverything(t *testing.T) {
 	tm.options["status-right"] = "#{@cccp_status} …"
 	tm.keys["root S-NPage"] = "bind-key -T root S-NPage run-shell cccp jump"
 	tm.keys["root S-PPage"] = "bind-key -T root S-PPage display-popup cccp"
-	cmd.outputs["claude plugin list"] = "cccp@cccp"
-	cmd.outputs["claude plugin marketplace list"] = l.MarketplaceDir
+	// Installed in the personal profile only.
+	cmd.outputs["env -u CLAUDE_CONFIG_DIR claude plugin list"] = "cccp@cccp"
+	cmd.outputs["env -u CLAUDE_CONFIG_DIR claude plugin marketplace list"] = l.MarketplaceDir
 	cmd.calls = nil
 	if err := in.Uninstall(); err != nil {
 		t.Fatal(err)
@@ -239,7 +278,8 @@ func TestUninstallRestoresEverything(t *testing.T) {
 			t.Errorf("%s left behind", p)
 		}
 	}
-	for _, want := range []string{"claude plugin uninstall cccp@cccp", "claude plugin marketplace remove cccp", "systemctl --user disable --now cccp.service"} {
+	personal := "env -u CLAUDE_CONFIG_DIR "
+	for _, want := range []string{personal + "claude plugin uninstall cccp@cccp", personal + "claude plugin marketplace remove cccp", "systemctl --user disable --now cccp.service"} {
 		found := false
 		for _, c := range cmd.calls {
 			found = found || c == want
@@ -296,5 +336,19 @@ func TestParseSavedKey(t *testing.T) {
 	}
 	if k := parseSavedKey("a"); k != (Key{"prefix", "a"}) {
 		t.Fatal("legacy bare keys are prefix-table keys:", k)
+	}
+}
+
+func TestUninstallOnlyTouchesProfilesWithThePlugin(t *testing.T) {
+	in, cmd, _, l := setup(t)
+	in.Install(nil)
+	cmd.outputs["env -u CLAUDE_CONFIG_DIR claude plugin list"] = "cccp@cccp"
+	cmd.calls = nil
+	in.Uninstall()
+	work := "CLAUDE_CONFIG_DIR=" + filepath.Join(l.Home, ".claude-work") + " claude plugin uninstall"
+	for _, c := range cmd.calls {
+		if strings.HasPrefix(c, work) {
+			t.Fatalf("uninstalled from a profile without the plugin: %q", c)
+		}
 	}
 }

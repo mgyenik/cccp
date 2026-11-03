@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode"
 
 	"cccp/internal/core"
 	"cccp/internal/model"
@@ -28,7 +29,7 @@ func Glyph(s core.Session) string {
 		return "❄"
 	case core.GroupUnknown:
 		return "?"
-	case core.GroupEnded:
+	case core.GroupClosed:
 		return "·"
 	}
 	return " "
@@ -76,7 +77,7 @@ func Since(now, t time.Time) string {
 
 // CacheText describes the cache state: "warm 42m", "cold 3h", or "".
 func CacheText(s core.Session, now time.Time) string {
-	if !s.Cache.Known || s.Group == core.GroupWorking || s.Group == core.GroupEnded {
+	if !s.Cache.Known || s.Group == core.GroupWorking || s.Group == core.GroupClosed {
 		return ""
 	}
 	suffix := ""
@@ -87,6 +88,18 @@ func CacheText(s core.Session, now time.Time) string {
 		return "warm " + Age(s.Cache.ExpiresAt.Sub(now)) + suffix
 	}
 	return "cold " + Age(now.Sub(s.Cache.ExpiresAt)) + suffix
+}
+
+// Turns formats a conversation's length: "1 turn", "12 turns", "" when
+// unknown.
+func Turns(n int) string {
+	switch {
+	case n <= 0:
+		return ""
+	case n == 1:
+		return "1 turn"
+	}
+	return fmt.Sprintf("%d turns", n)
 }
 
 // Tokens formats a token count: 254k, 1.2M.
@@ -130,6 +143,56 @@ func Detail(s core.Session) string {
 
 // OneLine collapses whitespace.
 func OneLine(s string) string { return strings.Join(strings.Fields(s), " ") }
+
+// Around returns the snippet s on one line, starting at most lead runes
+// (rounded to a word start) before the earliest occurrence of any of terms,
+// so the match stays visible in a narrow column that truncates on the
+// right. Matching is case-insensitive; with no occurrence s is unchanged.
+func Around(s string, terms []string, lead int) string {
+	cut := strings.HasPrefix(s, "…")
+	rs := []rune(OneLine(strings.TrimPrefix(s, "…")))
+	low := make([]rune, len(rs))
+	for i, r := range rs {
+		low[i] = unicode.ToLower(r)
+	}
+	at := -1
+	for _, t := range terms {
+		if i := indexRunes(low, []rune(strings.ToLower(t))); i >= 0 && (at < 0 || i < at) {
+			at = i
+		}
+	}
+	start := 0
+	if at > lead {
+		start = at - lead
+		for j := start; j < at; j++ { // begin at a word, if one starts in the lead
+			if rs[j] == ' ' {
+				start = j + 1
+				break
+			}
+		}
+	}
+	out := string(rs[start:])
+	if cut || start > 0 {
+		out = "…" + out
+	}
+	return out
+}
+
+func indexRunes(s, sub []rune) int {
+	if len(sub) == 0 {
+		return -1
+	}
+	for i := 0; i+len(sub) <= len(s); i++ {
+		j := 0
+		for j < len(sub) && s[i+j] == sub[j] {
+			j++
+		}
+		if j == len(sub) {
+			return i
+		}
+	}
+	return -1
+}
 
 // LastLine returns the last non-empty paragraph line of a message, which is
 // usually the question or the conclusion.
@@ -181,7 +244,7 @@ func PlainStatus(snap core.Snapshot) string {
 func WindowGlyphs(snap core.Snapshot) map[string]string {
 	best := map[string]core.Session{}
 	for _, s := range snap.Sessions {
-		if s.WindowID == "" || s.Group == core.GroupEnded {
+		if s.WindowID == "" || s.Group == core.GroupClosed {
 			continue
 		}
 		if cur, ok := best[s.WindowID]; !ok || s.Group < cur.Group {
@@ -206,4 +269,39 @@ func WindowGlyphs(snap core.Snapshot) map[string]string {
 		}
 	}
 	return out
+}
+
+// MultiProfile reports whether sessions from more than one Claude profile
+// are present, in which case profile tags are shown.
+func MultiProfile(snap core.Snapshot) bool {
+	seen := ""
+	for _, s := range snap.Sessions {
+		if s.Profile == "" {
+			continue
+		}
+		if seen != "" && s.Profile != seen {
+			return true
+		}
+		seen = s.Profile
+	}
+	return false
+}
+
+// ProfileTag is a session's profile label for display, at most n runes
+// ("" for sessions without a profile, such as agy's).
+func ProfileTag(s core.Session, n int) string {
+	r := []rune(s.Profile)
+	if len(r) > n {
+		r = append(r[:n-1], '…')
+	}
+	return string(r)
+}
+
+// TitleWithProfile prefixes the title with "[profile] " when profiles are
+// shown.
+func TitleWithProfile(s core.Session, show bool) string {
+	if show && s.Profile != "" {
+		return "[" + s.Profile + "] " + s.DisplayTitle()
+	}
+	return s.DisplayTitle()
 }

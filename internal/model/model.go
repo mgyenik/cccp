@@ -49,6 +49,10 @@ type HookState struct {
 	// PrintMode: the agent runs non-interactively (`claude -p`, `agy -p`),
 	// i.e. automation, not a session a person works in.
 	PrintMode bool `json:"print_mode,omitempty"`
+	// ConfigDir is the agent's CLAUDE_CONFIG_DIR ("" = the default,
+	// ~/.claude): which Claude profile, and so which account, the session
+	// belongs to.
+	ConfigDir string `json:"config_dir,omitempty"`
 
 	Cwd            string `json:"cwd,omitempty"`
 	TranscriptPath string `json:"transcript_path,omitempty"`
@@ -101,6 +105,7 @@ type Event struct {
 	PIDStart  uint64
 	Pane      string
 	PrintMode bool
+	ConfigDir string
 
 	// Event-specific fields; which are set depends on Name.
 	Source           string // SessionStart source; PreCompact trigger

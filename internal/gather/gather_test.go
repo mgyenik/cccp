@@ -3,12 +3,14 @@ package gather
 import (
 	"errors"
 	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 	"time"
 
-	"cccp/internal/agydb"
+	"cccp/internal/catalog"
 	"cccp/internal/claudereg"
+	"cccp/internal/core"
 	"cccp/internal/model"
 	"cccp/internal/procs"
 	"cccp/internal/tmux"
@@ -41,11 +43,13 @@ func (f *fakeHooks) Load(p string) (model.HookState, error) {
 
 type fakeReg struct{ files map[string]claudereg.Entry }
 
-func (f *fakeReg) ReadAll() []claudereg.Entry {
+func (f *fakeReg) ReadAll(dir string) []claudereg.Entry {
 	var out []claudereg.Entry
 	for p, e := range f.files {
-		e.Path = p
-		out = append(out, e)
+		if filepath.Dir(p) == dir {
+			e.Path = p
+			out = append(out, e)
+		}
 	}
 	return out
 }
@@ -75,13 +79,15 @@ type fakeProcs struct {
 	alive   map[int]bool
 	cmdline map[int][]string
 	cwd     map[int]string
+	env     map[int]map[string]string
 }
 
-func (f *fakeProcs) Snapshot() procs.Table            { return f.table }
-func (f *fakeProcs) Alive(pid int, start uint64) bool { return f.alive[pid] }
-func (f *fakeProcs) Cmdline(pid int) []string         { return f.cmdline[pid] }
-func (f *fakeProcs) Cwd(pid int) string               { return f.cwd[pid] }
-func (f *fakeProcs) StartWall(ticks uint64) time.Time { return time.Unix(int64(ticks), 0) }
+func (f *fakeProcs) Snapshot() procs.Table              { return f.table }
+func (f *fakeProcs) Alive(pid int, start uint64) bool   { return f.alive[pid] }
+func (f *fakeProcs) Cmdline(pid int) []string           { return f.cmdline[pid] }
+func (f *fakeProcs) Cwd(pid int) string                 { return f.cwd[pid] }
+func (f *fakeProcs) Environ(pid int, key string) string { return f.env[pid][key] }
+func (f *fakeProcs) StartWall(ticks uint64) time.Time   { return time.Unix(int64(ticks), 0) }
 
 type fakeTranscripts struct {
 	claude map[string]transcript.ClaudeMeta
@@ -108,24 +114,36 @@ func (f *fakeTranscripts) Agy(p string) (transcript.AgyMeta, error) {
 }
 
 type fakeFiles struct {
-	claude   map[string]string // sid → path
-	projects map[string][]TranscriptFile
-	finds    int
+	claude      map[string]string           // sid → path
+	projects    map[string][]TranscriptFile // configDir+"|"+cwd → files
+	profileDirs []string
+	finds       []string // "sid@configDir"
 }
 
-func (f *fakeFiles) FindClaude(sid, cwd string) string { f.finds++; return f.claude[sid] }
-func (f *fakeFiles) ListProject(cwd string) ([]TranscriptFile, error) {
-	l, ok := f.projects[cwd]
+func (f *fakeFiles) FindClaude(sid, configDir, cwd string) string {
+	f.finds = append(f.finds, sid+"@"+configDir)
+	return f.claude[sid]
+}
+func (f *fakeFiles) ListProject(configDir, cwd string) ([]TranscriptFile, error) {
+	l, ok := f.projects[configDir+"|"+cwd]
 	if !ok {
 		return nil, os.ErrNotExist
 	}
 	return l, nil
 }
 func (f *fakeFiles) AgyTranscript(id string) string { return "/agy/" + id }
+func (f *fakeFiles) ProfileDirs() []string          { return f.profileDirs }
 
 type fakeAgy struct{}
 
-func (fakeAgy) All() map[string]agydb.Conversation { return nil }
+func (fakeAgy) All() map[string]model.AgyConversation { return nil }
+
+type fakeCatalog struct {
+	docs []catalog.Doc
+	err  error
+}
+
+func (f *fakeCatalog) Docs() ([]catalog.Doc, error) { return f.docs, f.err }
 
 type fakePower bool
 
@@ -138,6 +156,7 @@ type world struct {
 	procs *fakeProcs
 	tr    *fakeTranscripts
 	files *fakeFiles
+	cat   *fakeCatalog
 	g     *Gatherer
 }
 
@@ -146,12 +165,14 @@ func newWorld() *world {
 		hooks: &fakeHooks{files: map[string]model.HookState{}},
 		reg:   &fakeReg{files: map[string]claudereg.Entry{}},
 		tmux:  &fakeTmux{},
-		procs: &fakeProcs{alive: map[int]bool{}, cmdline: map[int][]string{}, cwd: map[int]string{}},
+		procs: &fakeProcs{alive: map[int]bool{}, cmdline: map[int][]string{}, cwd: map[int]string{}, env: map[int]map[string]string{}},
 		tr:    &fakeTranscripts{claude: map[string]transcript.ClaudeMeta{}, agy: map[string]transcript.AgyMeta{}},
 		files: &fakeFiles{claude: map[string]string{}, projects: map[string][]TranscriptFile{}},
+		cat:   &fakeCatalog{},
 	}
 	w.g = New(Deps{Hooks: w.hooks, Registry: w.reg, Tmux: w.tmux, Procs: w.procs, Transcripts: w.tr,
-		Files: w.files, AgyDB: fakeAgy{}, Power: fakePower(true), Hostname: "host"})
+		Files: w.files, AgyDB: fakeAgy{}, Power: fakePower(true), Catalog: w.cat, Hostname: "host",
+		Home: "/h", DefaultClaudeDir: "/h/.claude"})
 	return w
 }
 
@@ -164,7 +185,7 @@ func TestReloadAndLiveness(t *testing.T) {
 	w.hooks.files["/s/a.json"] = model.HookState{Agent: model.Claude, SessionID: "a", PID: 10, PIDStart: 1}
 	w.hooks.files["/s/b.json"] = model.HookState{Agent: model.Claude, SessionID: "b", PID: 11, PIDStart: 1}
 	w.hooks.files["/s/c.json"] = model.HookState{Agent: model.Claude, SessionID: "c"} // no pid
-	w.reg.files["/r/12.json"] = claudereg.Entry{PID: 12, SessionID: "r", ProcStart: "5", Kind: "interactive"}
+	w.reg.files["/h/.claude/sessions/12.json"] = claudereg.Entry{PID: 12, SessionID: "r", ProcStart: "5", Kind: "interactive"}
 	w.procs.alive[10], w.procs.alive[12] = true, true
 	w.g.Reload()
 	obs := w.g.Observe(now)
@@ -175,7 +196,7 @@ func TestReloadAndLiveness(t *testing.T) {
 	if !reflect.DeepEqual(alive, map[string]bool{"a": true, "b": false, "c": false}) {
 		t.Fatalf("hook liveness %v", alive)
 	}
-	if len(obs.Registry) != 1 || !obs.Registry[0].Alive || obs.Registry[0].Path != "/r/12.json" {
+	if len(obs.Registry) != 1 || !obs.Registry[0].Alive || obs.Registry[0].Path != "/h/.claude/sessions/12.json" || obs.Registry[0].ConfigDir != "/h/.claude" {
 		t.Fatalf("registry %+v", obs.Registry)
 	}
 	if len(obs.Problems) != 1 || !obs.OnBattery || obs.Hostname != "host" {
@@ -187,23 +208,23 @@ func TestHookFileChangedRediscoverRule(t *testing.T) {
 	w := newWorld()
 	p := "/s/a.json"
 	w.hooks.files[p] = model.HookState{SessionID: "a", PID: 10, Pane: "%1"}
-	if !w.g.HookFileChanged(p) {
+	if !w.g.HookFileChanged(p).Rediscover {
 		t.Fatal("a new session must trigger rediscovery")
 	}
 	w.hooks.files[p] = model.HookState{SessionID: "a", PID: 10, Pane: "%1", Activity: model.Working}
-	if w.g.HookFileChanged(p) {
+	if w.g.HookFileChanged(p).Rediscover {
 		t.Fatal("an activity change alone must not trigger rediscovery")
 	}
 	w.hooks.files[p] = model.HookState{SessionID: "a", PID: 20, Pane: "%1"}
-	if !w.g.HookFileChanged(p) {
+	if !w.g.HookFileChanged(p).Rediscover {
 		t.Fatal("a new process must trigger rediscovery")
 	}
 	w.hooks.files[p] = model.HookState{SessionID: "a", PID: 20, Pane: "%2"}
-	if !w.g.HookFileChanged(p) {
+	if !w.g.HookFileChanged(p).Rediscover {
 		t.Fatal("a new pane must trigger rediscovery")
 	}
 	delete(w.hooks.files, p)
-	if !w.g.HookFileChanged(p) {
+	if !w.g.HookFileChanged(p).Rediscover {
 		t.Fatal("a removed session must trigger rediscovery")
 	}
 	if len(w.g.Observe(now).Hooks) != 0 {
@@ -285,13 +306,13 @@ func TestObserveReadsOnlyNeededTranscripts(t *testing.T) {
 	if !reflect.DeepEqual(w.tr.read, []string{"/t/a.jsonl", "/t/b.jsonl"}) {
 		t.Fatalf("read %v", w.tr.read)
 	}
-	if w.files.finds != 1 {
-		t.Fatalf("the hinted path must not be searched for; finds=%d", w.files.finds)
+	if len(w.files.finds) != 1 || w.files.finds[0] != "b@/h/.claude" {
+		t.Fatalf("the hinted path must not be searched for: %v", w.files.finds)
 	}
 	// A found path is cached.
 	w.g.Observe(now.Add(time.Hour))
-	if w.files.finds != 1 {
-		t.Fatalf("found path not cached: finds=%d", w.files.finds)
+	if len(w.files.finds) != 1 {
+		t.Fatalf("found path not cached: %v", w.files.finds)
 	}
 }
 
@@ -302,14 +323,14 @@ func TestMissingTranscriptRetriedAfterAMinute(t *testing.T) {
 	w.g.Reload()
 	w.g.Observe(now)
 	w.g.Observe(now.Add(30 * time.Second))
-	if w.files.finds != 1 {
-		t.Fatalf("a miss should be cached for a minute; finds=%d", w.files.finds)
+	if len(w.files.finds) != 1 {
+		t.Fatalf("a miss should be cached for a minute: %v", w.files.finds)
 	}
 	w.files.claude["b"] = "/t/b.jsonl"
 	w.tr.claude["/t/b.jsonl"] = transcript.ClaudeMeta{AITitle: "B"}
 	obs := w.g.Observe(now.Add(2 * time.Minute))
-	if w.files.finds != 2 || obs.ClaudeTranscripts["b"].Meta.AITitle != "B" {
-		t.Fatalf("finds=%d %+v", w.files.finds, obs.ClaudeTranscripts)
+	if len(w.files.finds) != 2 || obs.ClaudeTranscripts["b"].Meta.AITitle != "B" {
+		t.Fatalf("finds=%v %+v", w.files.finds, obs.ClaudeTranscripts)
 	}
 }
 
@@ -319,13 +340,108 @@ func TestProjectsListedForUnmanagedTitleMatch(t *testing.T) {
 	w.procs.table = procs.Table{ByPID: map[int]procs.Stat{101: {PID: 101, Comm: "claude"}}, Children: map[int][]int{100: {101}}}
 	w.procs.cmdline[101] = []string{"claude"}
 	w.procs.cwd[101] = "/w"
-	w.files.projects["/w"] = []TranscriptFile{{SessionID: "x", Path: "/p/x.jsonl"}, {SessionID: "y", Path: "/p/y.jsonl"}}
+	w.files.projects["/h/.claude|/w"] = []TranscriptFile{{SessionID: "x", Path: "/p/x.jsonl"}, {SessionID: "y", Path: "/p/y.jsonl"}}
 	w.tr.claude["/p/x.jsonl"] = transcript.ClaudeMeta{AITitle: "Lost session"}
 	w.tr.claude["/p/y.jsonl"] = transcript.ClaudeMeta{AITitle: "Other"}
 	w.g.RefreshTmux()
 	w.g.Discover()
 	obs := w.g.Observe(now)
-	if l := obs.Projects["/w"]; len(l) != 2 || l[0].Meta.AITitle != "Lost session" {
+	if l := obs.Projects[core.ProjectKey{ConfigDir: "/h/.claude", Cwd: "/w"}]; len(l) != 2 || l[0].Meta.AITitle != "Lost session" {
 		t.Fatalf("%+v", obs.Projects)
+	}
+}
+
+// --- profiles ----------------------------------------------------------------------
+
+func names(ps []model.Profile) []string {
+	var out []string
+	for _, p := range ps {
+		out = append(out, p.Name+"="+p.Dir)
+	}
+	return out
+}
+
+func TestProfilesDiscoveredFromDirectoriesAndReadAtOnce(t *testing.T) {
+	w := newWorld()
+	w.files.profileDirs = []string{"/h/.claude-work"}
+	w.reg.files["/h/.claude-work/sessions/7.json"] = claudereg.Entry{PID: 7, SessionID: "work1", ProcStart: "1", Kind: "interactive"}
+	w.procs.alive[7] = true
+	w.g.Reload()
+	obs := w.g.Observe(now)
+	if got := names(obs.Profiles); !reflect.DeepEqual(got, []string{"default=/h/.claude", "work=/h/.claude-work"}) {
+		t.Fatalf("profiles %v", got)
+	}
+	if len(obs.Registry) != 1 || obs.Registry[0].ConfigDir != "/h/.claude-work" {
+		t.Fatalf("registry %+v", obs.Registry)
+	}
+}
+
+func TestProfileDiscoveredFromAProcessEnvironment(t *testing.T) {
+	w := newWorld()
+	w.reg.files["/h/.claude-x/sessions/101.json"] = claudereg.Entry{PID: 101, SessionID: "x1", ProcStart: "7", Kind: "interactive"}
+	w.procs.alive[101] = true
+	w.tmux.panes = []tmux.Pane{{ID: "%1", PID: 100}}
+	w.procs.table = procs.Table{ByPID: map[int]procs.Stat{101: {PID: 101, Comm: "claude", StartTime: 7}}, Children: map[int][]int{100: {101}}}
+	w.procs.env[101] = map[string]string{"CLAUDE_CONFIG_DIR": "~/.claude-x/"}
+	w.g.Reload()
+	w.g.RefreshTmux()
+	w.g.Discover()
+	obs := w.g.Observe(now)
+	if obs.Agents[0].ConfigDir != "/h/.claude-x" {
+		t.Fatalf("agent config dir %q (want normalised)", obs.Agents[0].ConfigDir)
+	}
+	if len(obs.Registry) != 1 || obs.Registry[0].ConfigDir != "/h/.claude-x" {
+		t.Fatalf("the new profile's registry was not read: %+v", obs.Registry)
+	}
+}
+
+func TestProfileDiscoveredFromHookStateAndTranscriptLookedUpThere(t *testing.T) {
+	w := newWorld()
+	p := "/s/w.json"
+	w.hooks.files[p] = model.HookState{Agent: model.Claude, SessionID: "w", PID: 11, ConfigDir: "/h/.claude-work"}
+	w.procs.alive[11] = true
+	w.reg.files["/h/.claude-work/sessions/11.json"] = claudereg.Entry{PID: 11, SessionID: "w", ProcStart: "1", Kind: "interactive"}
+	w.g.HookFileChanged(p)
+	obs := w.g.Observe(now)
+	if len(obs.Profiles) != 2 || len(obs.Registry) != 1 {
+		t.Fatalf("profiles %v registry %+v", names(obs.Profiles), obs.Registry)
+	}
+	if len(w.files.finds) != 1 || w.files.finds[0] != "w@/h/.claude-work" {
+		t.Fatalf("transcript looked up in the wrong profile: %v", w.files.finds)
+	}
+}
+
+func TestHookChangeReportsTheSessionEnding(t *testing.T) {
+	w := newWorld()
+	p := "/s/a.json"
+	w.hooks.files[p] = model.HookState{SessionID: "a", PID: 10, Activity: model.Working}
+	if c := w.g.HookFileChanged(p); c.Ended {
+		t.Fatal("not ended yet")
+	}
+	w.hooks.files[p] = model.HookState{SessionID: "a", PID: 10, Activity: model.Ended}
+	if c := w.g.HookFileChanged(p); !c.Ended {
+		t.Fatal("the end must be reported")
+	}
+	if c := w.g.HookFileChanged(p); c.Ended {
+		t.Fatal("reported twice")
+	}
+}
+
+func TestCatalogIsReadOnlyOnRefresh(t *testing.T) {
+	w := newWorld()
+	w.cat.docs = []catalog.Doc{{Agent: model.Claude, SessionID: "c1", ConfigDir: "~/.claude-work", Title: "Old work", Turns: 3, Source: "/t/c1.jsonl"}}
+	if obs := w.g.Observe(now); len(obs.Conversations) != 0 {
+		t.Fatal("conversations before any refresh")
+	}
+	w.g.RefreshCatalog()
+	obs := w.g.Observe(now)
+	if len(obs.Conversations) != 1 || obs.Conversations[0].ConfigDir != "/h/.claude-work" || obs.Conversations[0].Turns != 3 {
+		t.Fatalf("%+v", obs.Conversations)
+	}
+	w.cat.err = errors.New("disk on fire")
+	w.g.RefreshCatalog()
+	obs = w.g.Observe(now)
+	if len(obs.Conversations) != 1 || len(obs.Problems) == 0 {
+		t.Fatalf("a failed refresh keeps the last catalog and reports: %+v", obs.Problems)
 	}
 }

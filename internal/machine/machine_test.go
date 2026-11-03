@@ -49,6 +49,7 @@ func (sc scene) obs() core.Observation {
 	o := core.Observation{
 		Hooks:     []core.HookRecord{{Path: "/state/s1.json", State: st, ProcAlive: !sc.ended}},
 		OnBattery: sc.battery,
+		Profiles:  testProfiles,
 		Tmux: core.TmuxView{OK: !sc.tmuxDown,
 			Panes: []model.TmuxPane{
 				{ID: "%1", Session: "s", WindowID: "@1", WindowIndex: 1, WindowPanes: 1},
@@ -61,6 +62,11 @@ func (sc scene) obs() core.Observation {
 			LastAssistantAt: at(sc.lastResp), TTL: model.TTL5m}}}
 	}
 	return o
+}
+
+var testProfiles = []model.Profile{
+	{Name: "personal", Dir: "/h/.claude", Default: true},
+	{Name: "work", Dir: "/h/.claude-work"},
 }
 
 func testConfig() config.Config {
@@ -473,5 +479,130 @@ func TestDeterministic(t *testing.T) {
 		if run() != first {
 			t.Fatal("same inputs produced different effects")
 		}
+	}
+}
+
+// --- summaries and profiles ------------------------------------------------------
+
+func TestSummaryRunsUnderTheSessionsProfile(t *testing.T) {
+	m := newMachine(summaryConfig("always"))
+	o := needsYou.obs()
+	o.Hooks[0].State.ConfigDir = "/h/.claude-work"
+	ss := of[StartSummary](m.Step(Observed{Obs: o, At: at(9)}))
+	if len(ss) != 1 || ss[0].Profile.Dir != "/h/.claude-work" || ss[0].Profile.Default {
+		t.Fatalf("%+v", ss)
+	}
+	// The default profile is named explicitly, not left to the environment.
+	m = newMachine(summaryConfig("always"))
+	ss = of[StartSummary](m.Step(Observed{Obs: needsYou.obs(), At: at(9)}))
+	if len(ss) != 1 || ss[0].Profile.Dir != "/h/.claude" || !ss[0].Profile.Default {
+		t.Fatalf("%+v", ss)
+	}
+}
+
+func TestPerProfileSummaryPolicy(t *testing.T) {
+	c := summaryConfig("always")
+	m := newMachine(c)
+	o := needsYou.obs()
+	o.Hooks[0].State.ConfigDir = "/h/.claude-work"
+	o.Profiles = []model.Profile{testProfiles[0], {Name: "work", Dir: "/h/.claude-work", Summaries: "off"}}
+	if ss := of[StartSummary](m.Step(Observed{Obs: o, At: at(9)})); len(ss) != 0 {
+		t.Fatalf("work profile has summaries off: %+v", ss)
+	}
+	// An "always" override beats a global "off".
+	m = newMachine(summaryConfig("off"))
+	o.Profiles = []model.Profile{testProfiles[0], {Name: "work", Dir: "/h/.claude-work", Summaries: "always"}}
+	if ss := of[StartSummary](m.Step(Observed{Obs: o, At: at(10)})); len(ss) != 1 {
+		t.Fatalf("override not applied: %+v", ss)
+	}
+}
+
+func TestNoSummaryWithoutAProfile(t *testing.T) {
+	m := newMachine(summaryConfig("always"))
+	o := needsYou.obs()
+	o.Hooks[0].State.ConfigDir = "/somewhere/unknown"
+	if ss := of[StartSummary](m.Step(Observed{Obs: o, At: at(9)})); len(ss) != 0 {
+		t.Fatalf("summarized under no known profile: %+v", ss)
+	}
+}
+
+func TestNotificationNamesTheProfileWhenSeveralExist(t *testing.T) {
+	m := newMachine(testConfig())
+	m.Step(Observed{Obs: scene{activity: model.Working, since: 5}.obs(), At: at(6)})
+	o := scene{activity: model.NeedsApproval, since: 8}.obs()
+	o.Hooks[0].State.ConfigDir = "/h/.claude-work"
+	n := of[Notify](m.Step(Observed{Obs: o, At: at(9)}))
+	if len(n) != 1 || !strings.Contains(n[0].Argv[2], "[work] ") {
+		t.Fatalf("%v", n)
+	}
+	// With a single profile, no tag.
+	m = newMachine(testConfig())
+	one := scene{activity: model.Working, since: 5}.obs()
+	one.Profiles = testProfiles[:1]
+	m.Step(Observed{Obs: one, At: at(6)})
+	w := scene{activity: model.NeedsApproval, since: 8}.obs()
+	w.Profiles = testProfiles[:1]
+	if n := of[Notify](m.Step(Observed{Obs: w, At: at(9)})); len(n) != 1 || strings.Contains(n[0].Argv[2], "[") {
+		t.Fatalf("%v", n)
+	}
+}
+
+// --- closed conversations ---------------------------------------------------------
+
+func closedObs(ids ...string) core.Observation {
+	o := core.Observation{Profiles: testProfiles}
+	for _, id := range ids {
+		o.Conversations = append(o.Conversations, core.Conversation{Agent: model.Claude, SessionID: id,
+			ConfigDir: "/h/.claude", Cwd: "/w", Title: "T " + id, FirstPrompt: "build it", LastPrompt: "ship it",
+			LastMessage: "Shipped.", Last: at(1)})
+	}
+	return o
+}
+
+func TestLiveSummaryUsesTheLivePrompt(t *testing.T) {
+	m := newMachine(summaryConfig("always"))
+	ss := of[StartSummary](m.Step(Observed{Obs: needsYou.obs(), At: at(9)}))
+	if len(ss) != 1 || ss[0].SystemPrompt != LiveSummaryPrompt {
+		t.Fatalf("%+v", ss)
+	}
+}
+
+func TestSummaryWhenASessionCloses(t *testing.T) {
+	m := newMachine(summaryConfig("always"))
+	live := scene{activity: model.Working, since: 5}.obs()
+	live.Conversations = closedObs("s1").Conversations
+	m.Step(Observed{Obs: live, At: at(6)})
+	ended := scene{activity: model.Working, since: 8, ended: true}.obs()
+	ended.Conversations = live.Conversations
+	ss := of[StartSummary](m.Step(Observed{Obs: ended, At: at(9)}))
+	if len(ss) != 1 || ss[0].Key != "claude:s1" || ss[0].SystemPrompt != ClosedSummaryPrompt ||
+		!strings.Contains(ss[0].Input, "build it") || ss[0].Profile.Dir != "/h/.claude" {
+		t.Fatalf("%+v", ss)
+	}
+}
+
+func TestClosedConversationsAreSummarisedOnlyOnRequest(t *testing.T) {
+	m := newMachine(summaryConfig("always"))
+	obs := closedObs("c1", "c2", "c3")
+	if ss := of[StartSummary](m.Step(Observed{Obs: obs, At: at(2)})); len(ss) != 0 {
+		t.Fatalf("no bulk backfill of closed conversations: %+v", ss)
+	}
+	ss := of[StartSummary](m.Step(RequestSummary{Key: "claude:c2", At: at(3)}))
+	if len(ss) != 1 || ss[0].Key != "claude:c2" || ss[0].SystemPrompt != ClosedSummaryPrompt {
+		t.Fatalf("%+v", ss)
+	}
+	effs := m.Step(SummaryDone{Key: ss[0].Key, Hash: ss[0].Hash, Text: "Built and shipped the thing", At: at(4)})
+	for _, s := range published(t, effs).Sessions {
+		if s.Key == "claude:c2" && s.Summary != "Built and shipped the thing" {
+			t.Fatalf("summary not shown: %+v", s)
+		}
+	}
+	// Asked again with the same input: already summarised.
+	if ss := of[StartSummary](m.Step(RequestSummary{Key: "claude:c2", At: at(5)})); len(ss) != 0 {
+		t.Fatalf("regenerated: %+v", ss)
+	}
+	// A request is consumed: later observations do not summarise c1 or c3.
+	if ss := of[StartSummary](m.Step(Observed{Obs: obs, At: at(6)})); len(ss) != 0 {
+		t.Fatalf("%+v", ss)
 	}
 }

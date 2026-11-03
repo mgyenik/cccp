@@ -22,3 +22,18 @@ func TestIsPrintMode(t *testing.T) {
 		}
 	}
 }
+
+func TestProfileEnvironSelectsTheDefaultByRemovingTheVariable(t *testing.T) {
+	environ := []string{"HOME=/h", "CLAUDE_CONFIG_DIR=/h/.claude-work", "CLAUDE_CONFIG_DIRX=keep"}
+	def := Profile{Dir: "/h/.claude", Default: true}
+	if got := strings.Join(def.Environ(environ), " "); got != "HOME=/h CLAUDE_CONFIG_DIRX=keep" {
+		t.Fatalf("default: %q", got)
+	}
+	work := Profile{Dir: "/h/.claude-work"}
+	if got := strings.Join(work.Environ(environ), " "); got != "HOME=/h CLAUDE_CONFIG_DIRX=keep CLAUDE_CONFIG_DIR=/h/.claude-work" {
+		t.Fatalf("other: %q", got)
+	}
+	if len(environ) != 3 || environ[1] != "CLAUDE_CONFIG_DIR=/h/.claude-work" {
+		t.Fatal("the input environment was modified")
+	}
+}

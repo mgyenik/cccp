@@ -198,10 +198,13 @@ func (c *Client) CapturePane(pane string, ansi bool, lines int) (string, error) 
 	return c.Run(a...)
 }
 
-// NewWindow opens a window in session running cmd in dir and returns its
-// pane id.
-func (c *Client) NewWindow(session, dir, name string, cmd []string) (string, error) {
+// NewWindow opens a window in session running cmd in dir, with env
+// (KEY=VALUE) set for the command, and returns its pane id.
+func (c *Client) NewWindow(session, dir, name string, env, cmd []string) (string, error) {
 	a := []string{"new-window", "-P", "-F", "#{pane_id}"}
+	for _, kv := range env {
+		a = append(a, "-e", kv)
+	}
 	if session != "" {
 		a = append(a, "-t", session+":")
 	}

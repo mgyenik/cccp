@@ -39,6 +39,13 @@ type fakes struct {
 	hookFiles []string
 	regFiles  []string
 	rediscov  bool
+	ended     bool
+	profiles  []model.Profile
+
+	catalogReads int
+	indexRuns    int
+	indexHold    chan struct{}
+	closedConv   bool // observe a closed conversation "claude:old"
 
 	// effects
 	status    []string
@@ -55,11 +62,29 @@ func (f *fakes) Reload()      { f.mu.Lock(); f.reloads++; f.mu.Unlock() }
 func (f *fakes) RefreshTmux() { f.mu.Lock(); f.tmuxReads++; f.mu.Unlock() }
 func (f *fakes) Discover()    { f.mu.Lock(); f.discovers++; f.mu.Unlock() }
 
-func (f *fakes) HookFileChanged(p string) bool {
+func (f *fakes) HookFileChanged(p string) core.HookChange {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.hookFiles = append(f.hookFiles, p)
-	return f.rediscov
+	return core.HookChange{Rediscover: f.rediscov, Ended: f.ended}
+}
+
+func (f *fakes) RefreshCatalog() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.catalogReads++
+}
+
+// Update is the fake Indexer: it records runs and can be held open.
+func (f *fakes) Update(dirs []string) error {
+	f.mu.Lock()
+	f.indexRuns++
+	hold := f.indexHold
+	f.mu.Unlock()
+	if hold != nil {
+		<-hold
+	}
+	return nil
 }
 
 func (f *fakes) RegistryFileChanged(p string) bool {
@@ -69,6 +94,12 @@ func (f *fakes) RegistryFileChanged(p string) bool {
 	return false
 }
 
+func (f *fakes) Profiles() []model.Profile {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]model.Profile(nil), f.profiles...)
+}
+
 func (f *fakes) Observe(now time.Time) core.Observation {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -76,8 +107,15 @@ func (f *fakes) Observe(now time.Time) core.Observation {
 	st := model.HookState{Version: 1, Agent: model.Claude, SessionID: "s1", PID: 42, PIDStart: 1, Pane: "%1",
 		Activity: f.activity, ActivityAt: f.since, Question: f.question,
 		LastMessage: f.message, StartedAt: time.Unix(0, 0)}
+	var convs []core.Conversation
+	if f.closedConv {
+		convs = []core.Conversation{{Agent: model.Claude, SessionID: "old", Cwd: "/w", Title: "Old one",
+			FirstPrompt: "do the thing", LastMessage: "Did it.", Last: time.Unix(1, 0)}}
+	}
 	return core.Observation{
-		Hooks: []core.HookRecord{{Path: "/state/s1.json", State: st, ProcAlive: true}},
+		Conversations: convs,
+		Profiles:      append([]model.Profile(nil), f.profiles...),
+		Hooks:         []core.HookRecord{{Path: "/state/s1.json", State: st, ProcAlive: true}},
 		Tmux: core.TmuxView{OK: true, Panes: []tmux.Pane{{ID: "%1", Session: "s", WindowID: "@1", WindowIndex: 1, WindowPanes: 1}},
 			Clients: []tmux.ClientInfo{{Name: "c", Pane: "%9", Focused: true}}},
 	}
@@ -104,10 +142,10 @@ func (f *fakes) Notify(argv []string) error {
 	return nil
 }
 
-func (f *fakes) Summarize(ctx context.Context, model, input string) (string, error) {
+func (f *fakes) Summarize(ctx context.Context, modelName string, prof model.Profile, systemPrompt, input string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.summaries = append(f.summaries, input)
+	f.summaries = append(f.summaries, prof.Dir+": "+input)
 	return "Approve make install", nil
 }
 
@@ -179,14 +217,14 @@ func start(t *testing.T, cfg config.Config) *harness {
 	f := &fakes{activity: model.Working, since: time.Unix(1, 0)}
 	opt := Options{
 		SessionsDir: filepath.Join(dir, "sessions"),
-		RegistryDir: filepath.Join(dir, "registry"),
 		Socket:      filepath.Join(dir, "d.sock"),
 	}
-	if err := os.MkdirAll(opt.RegistryDir, 0o700); err != nil {
+	f.profiles = []model.Profile{{Name: "default", Dir: filepath.Join(dir, "claude"), Default: true}}
+	if err := os.MkdirAll(f.profiles[0].RegistryDir(), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	ports := Ports{
-		Observer: f, Tmux: f, Notifier: f, Summarizer: f, Memory: f, Files: f,
+		Observer: f, Tmux: f, Notifier: f, Summarizer: f, Memory: f, Files: f, Indexer: f,
 		LoadConfig: func() (config.Config, error) { return cfg, nil },
 		Now:        time.Now,
 		Log:        log.New(f, "", 0),
@@ -343,7 +381,10 @@ func TestSummariesRunThroughThePort(t *testing.T) {
 		resp, err := h.client.Call(ipc.Request{Op: ipc.OpSnapshot}, time.Second)
 		return err == nil && resp.Snapshot.Sessions[0].Summary == "Approve make install"
 	})
-	if !h.f.get(func(f *fakes) bool { return len(f.summaries) == 1 && strings.Contains(f.summaries[0], "make install") }) {
+	if !h.f.get(func(f *fakes) bool {
+		return len(f.summaries) == 1 && strings.Contains(f.summaries[0], "make install") &&
+			strings.HasPrefix(f.summaries[0], f.profiles[0].Dir+": ")
+	}) {
 		t.Fatalf("summaries %v", h.f.summaries)
 	}
 }
@@ -400,7 +441,7 @@ func TestConfigReload(t *testing.T) {
 
 func TestSecondDaemonRefusesToStart(t *testing.T) {
 	h := start(t, testCfg())
-	d := New(Options{SessionsDir: filepath.Join(h.dir, "s2"), RegistryDir: h.dir, Socket: h.client.Socket},
+	d := New(Options{SessionsDir: filepath.Join(h.dir, "s2"), Socket: h.client.Socket},
 		Ports{Log: log.New(io.Discard, "", 0), Now: time.Now}, machine.New(testCfg(), core.NewMemory(), time.Now()))
 	if err := d.Run(context.Background(), nil); err == nil || !strings.Contains(err.Error(), "another daemon") {
 		t.Fatalf("%v", err)
@@ -445,10 +486,155 @@ func TestRealAdaptersRefuseInTests(t *testing.T) {
 	if err := (ExecNotifier{}).Notify([]string{"notify-send", "x"}); err == nil {
 		t.Fatal("ExecNotifier ran from a test")
 	}
-	if _, err := (ClaudeSummarizer{}).Summarize(context.Background(), "haiku", "x"); err == nil {
+	if _, err := (ClaudeSummarizer{}).Summarize(context.Background(), "haiku", model.Profile{Dir: "/h/.claude", Default: true}, "p", "x"); err == nil {
 		t.Fatal("ClaudeSummarizer ran from a test")
 	}
 	if err := (TmuxOptions{Client: tmux.New("")}).SetStatus("x"); err == nil {
 		t.Fatal("TmuxOptions touched the default tmux server from a test")
 	}
+}
+
+func TestWatchesEveryProfilesRegistryIncludingLaterOnes(t *testing.T) {
+	h := start(t, testCfg())
+	// A second profile appears later (discovered from a new process).
+	work := model.Profile{Name: "work", Dir: filepath.Join(h.dir, "claude-work")}
+	if err := os.MkdirAll(work.RegistryDir(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	h.f.set(func(f *fakes) { f.profiles = append(f.profiles, work) })
+	h.client.Call(ipc.Request{Op: ipc.OpRefresh}, time.Second)
+	// Its registry is now watched: a change there reaches the observer.
+	p := filepath.Join(work.RegistryDir(), "4242.json")
+	os.WriteFile(p, []byte("{}"), 0o600)
+	eventually(t, "registry change in the new profile", func() bool {
+		return h.f.get(func(f *fakes) bool {
+			for _, x := range f.regFiles {
+				if x == p {
+					return true
+				}
+			}
+			return false
+		})
+	})
+	// Files outside any registry, or not named <pid>.json, are ignored.
+	os.WriteFile(filepath.Join(work.RegistryDir(), "notes.txt"), nil, 0o600)
+	time.Sleep(50 * time.Millisecond)
+	if h.f.get(func(f *fakes) bool {
+		for _, x := range f.regFiles {
+			if strings.HasSuffix(x, "notes.txt") {
+				return true
+			}
+		}
+		return false
+	}) {
+		t.Fatal("a non-entry file reached the observer")
+	}
+}
+
+func TestWithoutEnv(t *testing.T) {
+	got := withoutEnv([]string{"A=1", "CLAUDE_CONFIG_DIR=/x", "CLAUDE_CONFIG_DIRX=2"}, "CLAUDE_CONFIG_DIR")
+	if strings.Join(got, ",") != "A=1,CLAUDE_CONFIG_DIRX=2" {
+		t.Fatal(got)
+	}
+}
+
+func TestSummaryCommand(t *testing.T) {
+	environ := []string{"HOME=/h", "CLAUDE_CONFIG_DIR=/h/.claude"}
+	argv, env, err := summaryCommand("haiku", model.Profile{Dir: "/h/.claude-work"}, "the prompt", "the input", environ)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if argv[0] != "claude" || argv[1] != "-p" || argv[len(argv)-1] != "the input" {
+		t.Fatalf("argv %q", argv)
+	}
+	for _, flag := range []string{"--no-session-persistence", "--strict-mcp-config", "--tools", "--setting-sources"} {
+		found := false
+		for _, a := range argv {
+			found = found || a == flag
+		}
+		if !found {
+			t.Errorf("missing %s", flag)
+		}
+	}
+	want := []string{"HOME=/h", "CCCP_INTERNAL=1", "CLAUDE_CONFIG_DIR=/h/.claude-work"}
+	if strings.Join(env, ",") != strings.Join(want, ",") {
+		t.Fatalf("env %q: the session's profile must replace any inherited one", env)
+	}
+	// The default profile runs with the variable removed: set to ~/.claude,
+	// Claude Code would use a blank ~/.claude/.claude.json.
+	_, env, _ = summaryCommand("haiku", model.Profile{Dir: "/h/.claude", Default: true}, "p", "x",
+		[]string{"HOME=/h", "CLAUDE_CONFIG_DIR=/h/.claude-work"})
+	if strings.Join(env, ",") != "HOME=/h,CCCP_INTERNAL=1" {
+		t.Fatalf("default profile env %q", env)
+	}
+	if environ[1] != "CLAUDE_CONFIG_DIR=/h/.claude" {
+		t.Fatal("the daemon's environment was modified")
+	}
+	if _, _, err := summaryCommand("haiku", model.Profile{}, "p", "x", nil); err == nil {
+		t.Fatal("a summary without a profile must be refused")
+	}
+}
+
+// --- catalog indexing ---------------------------------------------------------------
+
+func TestIndexRunsAtStartAndOnRefresh(t *testing.T) {
+	h := start(t, testCfg())
+	eventually(t, "index at start, then the catalog reread", func() bool {
+		return h.f.get(func(f *fakes) bool { return f.indexRuns == 1 && f.catalogReads >= 1 })
+	})
+	h.client.Call(ipc.Request{Op: ipc.OpRefresh}, time.Second)
+	eventually(t, "index on refresh", func() bool {
+		return h.f.get(func(f *fakes) bool { return f.indexRuns == 2 })
+	})
+}
+
+func TestIndexTriggersAreCoalesced(t *testing.T) {
+	h := start(t, testCfg())
+	eventually(t, "first index", func() bool { return h.f.get(func(f *fakes) bool { return f.indexRuns == 1 }) })
+	hold := make(chan struct{})
+	h.f.set(func(f *fakes) { f.indexHold = hold })
+	// A slow run, and five more triggers while it runs.
+	for i := 0; i < 6; i++ {
+		h.client.Call(ipc.Request{Op: ipc.OpRefresh}, time.Second)
+	}
+	h.f.set(func(f *fakes) { f.indexHold = nil })
+	close(hold)
+	eventually(t, "one follow-up run", func() bool { return h.f.get(func(f *fakes) bool { return f.indexRuns == 3 }) })
+	time.Sleep(100 * time.Millisecond)
+	if n := h.f.get(func(f *fakes) bool { return f.indexRuns == 3 }); !n {
+		t.Fatalf("triggers during a run must coalesce into one more run; runs=%d", h.f.indexRuns)
+	}
+}
+
+func TestSessionEndTriggersIndex(t *testing.T) {
+	h := start(t, testCfg())
+	eventually(t, "first index", func() bool { return h.f.get(func(f *fakes) bool { return f.indexRuns == 1 }) })
+	h.f.set(func(f *fakes) { f.ended = true })
+	os.WriteFile(filepath.Join(h.dir, "sessions", "claude-s1.json"), []byte("{}"), 0o600)
+	// The fake reports the end on every event of the write (create, write);
+	// the gatherer reports it once. Either way: at least one more index.
+	eventually(t, "index after SessionEnd", func() bool { return h.f.get(func(f *fakes) bool { return f.indexRuns >= 2 }) })
+}
+
+func TestSummarizeRequestForAClosedConversation(t *testing.T) {
+	cfg := testCfg()
+	cfg.Summaries = "always"
+	h := start(t, cfg)
+	h.f.set(func(f *fakes) { f.closedConv = true })
+	h.client.Call(ipc.Request{Op: ipc.OpRefresh}, time.Second)
+	if _, err := h.client.Call(ipc.Request{Op: ipc.OpSummarize, Key: "claude:old"}, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, "closed summary", func() bool {
+		resp, err := h.client.Call(ipc.Request{Op: ipc.OpSnapshot}, time.Second)
+		if err != nil {
+			return false
+		}
+		for _, s := range resp.Snapshot.Sessions {
+			if s.Key == "claude:old" && s.Summary != "" {
+				return true
+			}
+		}
+		return false
+	})
 }

@@ -28,8 +28,10 @@ type Memory struct {
 	Aliases map[string]string `json:"aliases"`
 	// RegCompletions: turn ends observed as registry busy/waiting → idle
 	// transitions (sessions without hooks).
-	RegCompletions map[string]time.Time     `json:"reg_completions"`
-	Summaries      map[string]SummaryRecord `json:"summaries"`
+	RegCompletions map[string]time.Time `json:"reg_completions"`
+	// Summaries are persisted separately (memfile): they cost a model call
+	// each and grow with the number of conversations.
+	Summaries map[string]SummaryRecord `json:"-"`
 	// Initialized is set once a first observation with sessions has been
 	// computed; until then every session is treated as already seen.
 	Initialized bool `json:"initialized"`

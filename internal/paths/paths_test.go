@@ -13,15 +13,13 @@ func TestResolveDefaults(t *testing.T) {
 		"config":   "/h/.config/cccp/config.toml",
 		"socket":   "/run/user/1000/cccp.sock",
 		"claude":   "/h/.claude",
-		"registry": "/h/.claude/sessions",
-		"projects": "/h/.claude/projects",
 		"agydb":    "/h/.gemini/antigravity-cli/conversation_summaries.db",
 		"bin":      "/h/.local/bin/cccp",
 		"unit":     "/h/.config/systemd/user/cccp.service",
 	}
 	got := map[string]string{
 		"state": l.StateDir, "sessions": l.SessionsDir, "cache": l.CacheDir, "config": l.ConfigFile,
-		"socket": l.Socket, "claude": l.ClaudeDir, "registry": l.ClaudeRegistryDir, "projects": l.ClaudeProjectsDir,
+		"socket": l.Socket, "claude": l.DefaultClaudeDir,
 		"agydb": l.AgySummariesDB, "bin": l.BinPath, "unit": l.SystemdUnit,
 	}
 	for k, v := range want {
@@ -41,11 +39,17 @@ func TestResolveOverrides(t *testing.T) {
 		"XDG_STATE_HOME": "relative/is/ignored",
 	}), "/h", 1)
 	if l.StateDir != "/s" || l.CacheDir != "/c" || l.Socket != "/x.sock" || l.TmuxSocket != "/t" ||
-		l.ClaudeRegistryDir != "/cl/sessions" || l.ConfigFile != "/cfg/cccp/config.toml" {
+		l.DefaultClaudeDir != "/h/.claude" || l.ConfigFile != "/cfg/cccp/config.toml" {
 		t.Fatalf("%+v", l)
 	}
 	if l := Resolve(env(nil), "/h", 7); l.Socket != "/tmp/cccp-7.sock" {
 		t.Fatalf("socket fallback %q", l.Socket)
+	}
+}
+
+func TestClaudeProjectDir(t *testing.T) {
+	if got := ClaudeProjectDir("/h/.claude-work", "/home/user/src/acme"); got != "/h/.claude-work/projects/-home-user-src-acme" {
+		t.Fatal(got)
 	}
 }
 

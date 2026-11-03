@@ -26,17 +26,29 @@ import (
 	"cccp/internal/core"
 	"cccp/internal/ipc"
 	"cccp/internal/machine"
+	"cccp/internal/model"
 	"cccp/internal/store"
 )
 
 // Observer is the read side of the world (implemented by gather.Gatherer).
 type Observer interface {
 	Reload()
-	HookFileChanged(path string) (rediscover bool)
+	HookFileChanged(path string) core.HookChange
 	RegistryFileChanged(path string) (rediscover bool)
 	RefreshTmux()
 	Discover()
 	Observe(now time.Time) core.Observation
+	// Profiles are the known Claude profiles; their registries are watched.
+	Profiles() []model.Profile
+	// RefreshCatalog rereads the conversation catalog (after an index run).
+	RefreshCatalog()
+}
+
+// Indexer brings the conversation catalog up to date with the transcripts
+// of the given Claude profiles (catalog.Index). It may take seconds the
+// first time, so it runs off the event loop.
+type Indexer interface {
+	Update(configDirs []string) error
 }
 
 // TmuxWriter sets cccp's tmux options.
@@ -50,9 +62,10 @@ type Notifier interface {
 	Notify(argv []string) error
 }
 
-// Summarizer produces a one-line summary.
+// Summarizer produces a one-line summary, running under the Claude profile
+// prof (so on that profile's account).
 type Summarizer interface {
-	Summarize(ctx context.Context, model, input string) (string, error)
+	Summarize(ctx context.Context, modelName string, prof model.Profile, systemPrompt, input string) (string, error)
 }
 
 // MemoryStore persists the machine's memory.
@@ -73,6 +86,7 @@ type Ports struct {
 	Summarizer Summarizer
 	Memory     MemoryStore
 	Files      FileRemover
+	Indexer    Indexer
 	// LoadConfig rereads the configuration (on SIGHUP or a reload request).
 	LoadConfig func() (config.Config, error)
 	Now        func() time.Time
@@ -82,7 +96,6 @@ type Ports struct {
 // Options are the daemon's locations.
 type Options struct {
 	SessionsDir string // hook state files (watched)
-	RegistryDir string // Claude registry (watched if it exists)
 	Socket      string
 	// SummaryTimeout bounds one summary.
 	SummaryTimeout time.Duration
@@ -128,15 +141,25 @@ type Daemon struct {
 	ports Ports
 	m     *machine.Machine
 
-	reqs chan request
-	pids chan int
-	sums chan machine.SummaryDone
+	reqs    chan request
+	pids    chan int
+	sums    chan machine.SummaryDone
+	indexed chan error
+
+	// indexing: an index run is in progress; reindex: another is wanted
+	// when it finishes (triggers are coalesced).
+	indexing, reindex bool
 
 	subs    map[*subscriber]bool
 	replies []chan ipc.Response // waiting for the next published snapshot
 	pidw    *pidWatcher
 	timer   *time.Timer
 	ctx     context.Context
+
+	watcher *fsnotify.Watcher
+	// registryDirs are the watched profile registries (true) or those that
+	// could not be watched yet (false: retried on the next observation).
+	registryDirs map[string]bool
 }
 
 type request struct {
@@ -156,10 +179,12 @@ func New(opt Options, ports Ports, m *machine.Machine) *Daemon {
 	}
 	return &Daemon{
 		opt: opt, ports: ports, m: m,
-		reqs: make(chan request, 64),
-		pids: make(chan int, 64),
-		sums: make(chan machine.SummaryDone, 4),
-		subs: map[*subscriber]bool{},
+		reqs:         make(chan request, 64),
+		pids:         make(chan int, 64),
+		sums:         make(chan machine.SummaryDone, 4),
+		indexed:      make(chan error, 1),
+		subs:         map[*subscriber]bool{},
+		registryDirs: map[string]bool{},
 	}
 }
 
@@ -183,9 +208,7 @@ func (d *Daemon) Run(ctx context.Context, reload <-chan struct{}) error {
 	if err := w.Add(d.opt.SessionsDir); err != nil {
 		return err
 	}
-	if err := w.Add(d.opt.RegistryDir); err != nil {
-		d.ports.Log.Printf("not watching the Claude registry: %v", err)
-	}
+	d.watcher = w
 	if d.pidw, err = newPidWatcher(d.pids); err != nil {
 		return err
 	}
@@ -209,6 +232,7 @@ func (d *Daemon) Run(ctx context.Context, reload <-chan struct{}) error {
 	if snap, ok := d.m.Snapshot(); ok {
 		d.ports.Log.Printf("cccp daemon started: %d sessions, socket %s", len(snap.Sessions), d.opt.Socket)
 	}
+	d.index() // bring the conversation catalog up to date
 
 	for {
 		select {
@@ -230,6 +254,7 @@ func (d *Daemon) Run(ctx context.Context, reload <-chan struct{}) error {
 			d.ports.Log.Printf("watcher: %v", err)
 			d.drainAndObserve(w, scopeAll)
 		case <-d.pids:
+			d.index() // a session ended: its transcript is final
 			d.drainAndObserve(w, scopeDiscover)
 		case r := <-d.reqs:
 			var sc Scope
@@ -237,6 +262,17 @@ func (d *Daemon) Run(ctx context.Context, reload <-chan struct{}) error {
 			d.drainAndObserve(w, sc)
 		case done := <-d.sums:
 			d.exec(d.m.Step(done))
+		case err := <-d.indexed:
+			d.indexing = false
+			if err != nil {
+				d.ports.Log.Printf("catalog: %v", err)
+			}
+			d.ports.Observer.RefreshCatalog()
+			d.observe(scopeSources)
+			if d.reindex {
+				d.reindex = false
+				d.index()
+			}
 		case <-d.timer.C:
 			d.exec(d.m.Step(machine.TimerFired{At: d.ports.Now()}))
 		}
@@ -253,6 +289,7 @@ drain:
 			d.fileEvent(ev, &sc)
 		case <-d.pids:
 			sc.add(scopeDiscover)
+			d.index() // a session ended: its transcript is final
 		case r := <-d.reqs:
 			d.request(r, &sc)
 		default:
@@ -273,11 +310,15 @@ func (d *Daemon) fileEvent(ev fsnotify.Event, sc *Scope) {
 			return // lock and temp files
 		}
 		sc.add(scopeSources)
-		if d.ports.Observer.HookFileChanged(ev.Name) {
+		c := d.ports.Observer.HookFileChanged(ev.Name)
+		if c.Rediscover {
 			sc.add(scopeDiscover)
 		}
-	case filepath.Clean(d.opt.RegistryDir):
-		if !claudereg.IsEntryFile(name) {
+		if c.Ended {
+			d.index()
+		}
+	default:
+		if !d.registryDirs[filepath.Dir(ev.Name)] || !claudereg.IsEntryFile(name) {
 			return
 		}
 		sc.add(scopeSources)
@@ -300,7 +341,30 @@ func (d *Daemon) observe(sc Scope) {
 		o.Discover()
 	}
 	now := d.ports.Now()
-	d.exec(d.m.Step(machine.Observed{Obs: o.Observe(now), At: now}))
+	obs := o.Observe(now)
+	d.watchRegistries(obs.Profiles)
+	d.exec(d.m.Step(machine.Observed{Obs: obs, At: now}))
+}
+
+// watchRegistries watches every profile's registry directory. A directory
+// that cannot be watched yet (it may not exist) is retried on the next
+// observation.
+func (d *Daemon) watchRegistries(ps []model.Profile) {
+	for _, p := range ps {
+		dir := p.RegistryDir()
+		if d.registryDirs[dir] {
+			continue
+		}
+		if err := d.watcher.Add(dir); err != nil {
+			if _, tried := d.registryDirs[dir]; !tried {
+				d.ports.Log.Printf("not watching %s (profile %s) yet: %v", dir, p.Name, err)
+			}
+			d.registryDirs[dir] = false
+			continue
+		}
+		d.registryDirs[dir] = true
+		d.ports.Log.Printf("watching the %s profile's registry %s", p.Name, dir)
+	}
 }
 
 // request handles one socket request. Refreshes and tmux events widen sc
@@ -324,6 +388,10 @@ func (d *Daemon) request(r request, sc *Scope) {
 	case ipc.OpRefresh:
 		sc.add(scopeAll)
 		d.replies = append(d.replies, r.reply)
+		d.index() // also picks up conversations created outside tmux
+	case ipc.OpSummarize:
+		d.exec(d.m.Step(machine.RequestSummary{Key: r.req.Key, At: now}))
+		reply(r.reply, ipc.Response{OK: true})
 	case ipc.OpTmux:
 		sc.add(TmuxEventScope(r.req.Event))
 	case ipc.OpSeen:
@@ -338,6 +406,30 @@ func (d *Daemon) request(r request, sc *Scope) {
 	default:
 		reply(r.reply, ipc.Response{Error: "unknown op " + r.req.Op})
 	}
+}
+
+// index starts a catalog update off the loop, or queues one if an update is
+// already running.
+func (d *Daemon) index() {
+	if d.ports.Indexer == nil {
+		return
+	}
+	if d.indexing {
+		d.reindex = true
+		return
+	}
+	d.indexing = true
+	var dirs []string
+	for _, p := range d.ports.Observer.Profiles() {
+		dirs = append(dirs, p.Dir)
+	}
+	go func() {
+		err := d.ports.Indexer.Update(dirs)
+		select {
+		case d.indexed <- err:
+		case <-d.ctx.Done():
+		}
+	}()
 }
 
 func (d *Daemon) reloadConfig() {
@@ -427,7 +519,7 @@ func (d *Daemon) arm(at time.Time) {
 func (d *Daemon) summarize(e machine.StartSummary) {
 	ctx, cancel := context.WithTimeout(d.ctx, d.opt.SummaryTimeout)
 	defer cancel()
-	text, err := d.ports.Summarizer.Summarize(ctx, e.Model, e.Input)
+	text, err := d.ports.Summarizer.Summarize(ctx, e.Model, e.Profile, e.SystemPrompt, e.Input)
 	done := machine.SummaryDone{Key: e.Key, Hash: e.Hash, Text: text, Err: err, At: d.ports.Now()}
 	select {
 	case d.sums <- done:

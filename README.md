@@ -66,14 +66,13 @@ full tracking.
 |---|---|---|
 | tmux | `Shift+PgDn` | jump to the most urgent session that needs you; repeat to cycle |
 | tmux | `Shift+PgUp` | open the cockpit popup |
-| cockpit | `enter` | jump to the session (resumes it in a new window if it ended) |
+| cockpit | `enter` | jump to the session; a closed conversation is resumed in a new window, in its own directory and profile |
 | cockpit | `tab` / `shift+tab` | next / previous session needing you |
-| cockpit | `/` | filter by title, project, location, state, prompt |
-| cockpit | `?` | full-text search over all transcripts; `enter` opens or resumes |
+| cockpit | `/` | search everything, live and closed: names, projects, prompts and summaries match at once (fuzzy), conversation text after a pause in typing; `esc` clears |
 | cockpit | `a` | set an alias for the session |
 | cockpit | `m` | mark seen |
 | cockpit | `p` | preview: live pane → conversation → off |
-| cockpit | `e` | show ended sessions |
+| cockpit | `e` | hide / show closed conversations |
 | cockpit | `r` | rescan everything |
 | shell | `cccp ls [--all] [--json]` | list sessions |
 | shell | `cccp search TERMS…` | search transcripts (`"quoted phrase"` supported) |
@@ -94,13 +93,47 @@ notify_command = ["notify-send", "--app-name=cccp", "--expire-time=10000"]
 summaries = "ac"               # one-line "what it needs from you" via claude -p: off | ac | always
 summary_model = "haiku"
 default_cache_ttl = "1h"       # used when a transcript doesn't reveal the cache bucket
-ended_retention = "168h"       # how long ended sessions are kept
+ended_retention = "168h"       # how long a session that ended without a transcript is listed
 quiet_after = "10s"            # unmanaged session: pending tool + quiet pane → probably waiting for approval
 ```
 
 Summaries run `claude -p` with no tools, no settings and no session
-persistence, and use your Claude subscription. With `"ac"` they only run on
-mains power.
+persistence. With `"ac"` they only run on mains power.
+
+### Profiles (several Claude accounts)
+
+Each Claude config directory (`CLAUDE_CONFIG_DIR`, e.g. an alias
+`claude-work="CLAUDE_CONFIG_DIR=~/.claude-work claude"`) is a **profile**.
+Profiles are found automatically — from running sessions' environment, from
+`~/.claude*` directories, and from hook state — and every session is
+attributed to its own:
+
+* its registry and transcripts are read from that profile;
+* resuming or attaching from the cockpit runs in that profile, so it
+  reopens in the right account (the default profile with
+  `CLAUDE_CONFIG_DIR` removed, never set to `~/.claude`: see below);
+* its **summary runs under that profile**, so it is billed to, and its text
+  only ever sent through, that session's own account;
+* the default profile is always selected by removing `CLAUDE_CONFIG_DIR`.
+  Setting it to `~/.claude` is not the same: Claude Code then keeps its
+  global state in `~/.claude/.claude.json` instead of `~/.claude.json`, and
+  starts as a fresh install (theme, onboarding, plugin prompts);
+* `cccp install` installs the plugin into every profile; `cccp doctor` shows
+  each profile's plugin and account.
+
+When more than one profile is in use, rows and notifications carry a profile
+tag, and `/` filters by it. Name profiles and set per-profile policy:
+
+```toml
+[[profile]]
+name = "personal"
+dir  = "~/.claude"
+
+[[profile]]
+name = "work"
+dir  = "~/.claude-work"
+summaries = "off"      # optional; default: the global setting
+```
 
 ## Files
 

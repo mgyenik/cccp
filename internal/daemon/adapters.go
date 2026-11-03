@@ -6,8 +6,10 @@ import (
 	"errors"
 	"os"
 	"os/exec"
+	"strings"
 	"testing"
 
+	"cccp/internal/model"
 	"cccp/internal/tmux"
 )
 
@@ -55,33 +57,27 @@ func (ExecNotifier) Notify(argv []string) error {
 	return nil
 }
 
-// SummarySystemPrompt instructs the summary model.
-const SummarySystemPrompt = "You write one-line status lines for a dashboard of coding-agent sessions. " +
-	"Given a session's title, the user's last prompt and the assistant's last message, say in one line " +
-	"under 90 characters what the session needs from the user next (a decision, an answer, a review, " +
-	"or nothing). No preamble, no quotes, no trailing period."
-
 // ClaudeSummarizer runs `claude -p` with no tools, no settings (so no
-// plugins or hooks) and no session persistence. CCCP_INTERNAL=1 makes cccp's
-// own hook a no-op should hooks load anyway.
+// plugins or hooks) and no session persistence, under the session's own
+// profile: CLAUDE_CONFIG_DIR selects the credentials, so the summary is
+// billed to that profile's account and the session's text goes only there
+// (verified: with an empty config dir, claude -p refuses as not logged in).
+// CCCP_INTERNAL=1 makes cccp's own hook a no-op should hooks load anyway.
 type ClaudeSummarizer struct {
 	Dir string // working directory for the child
 }
 
 // Summarize implements Summarizer.
-func (c ClaudeSummarizer) Summarize(ctx context.Context, model, input string) (string, error) {
+func (c ClaudeSummarizer) Summarize(ctx context.Context, modelName string, prof model.Profile, systemPrompt, input string) (string, error) {
 	if testing.Testing() {
 		return "", errInTest
 	}
-	cmd := exec.CommandContext(ctx, "claude", "-p",
-		"--model", model,
-		"--no-session-persistence",
-		"--setting-sources", "",
-		"--strict-mcp-config",
-		"--tools", "",
-		"--system-prompt", SummarySystemPrompt,
-		input)
-	cmd.Env = append(os.Environ(), "CCCP_INTERNAL=1")
+	argv, env, err := summaryCommand(modelName, prof, systemPrompt, input, os.Environ())
+	if err != nil {
+		return "", err
+	}
+	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	cmd.Env = env
 	cmd.Stdin = nil // /dev/null: claude -p otherwise waits for stdin
 	if c.Dir != "" {
 		if err := os.MkdirAll(c.Dir, 0o700); err == nil {
@@ -94,4 +90,37 @@ func (c ClaudeSummarizer) Summarize(ctx context.Context, model, input string) (s
 		return "", err
 	}
 	return out.String(), nil
+}
+
+// summaryCommand builds the summarizer's argv and environment. It refuses
+// without a profile: the profile decides the account, and must never be
+// left to whatever the daemon's environment happens to say.
+//
+// The profile is selected with model.Profile.Environ: the default profile by
+// removing CLAUDE_CONFIG_DIR, any other by setting it.
+func summaryCommand(modelName string, prof model.Profile, systemPrompt, input string, environ []string) (argv, env []string, err error) {
+	if prof.Dir == "" {
+		return nil, nil, errors.New("summary: no profile to run under")
+	}
+	argv = []string{"claude", "-p",
+		"--model", modelName,
+		"--no-session-persistence",
+		"--setting-sources", "",
+		"--strict-mcp-config",
+		"--tools", "",
+		"--system-prompt", systemPrompt,
+		input}
+	env = prof.Environ(append(environ[:len(environ):len(environ)], "CCCP_INTERNAL=1"))
+	return argv, env, nil
+}
+
+// withoutEnv drops a variable from an environment list.
+func withoutEnv(env []string, key string) []string {
+	out := env[:0:0]
+	for _, kv := range env {
+		if !strings.HasPrefix(kv, key+"=") {
+			out = append(out, kv)
+		}
+	}
+	return out
 }

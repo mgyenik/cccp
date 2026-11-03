@@ -61,11 +61,11 @@ func ReadAll(dir string) []Entry {
 	return out
 }
 
-// Dir is the registry directory, as a source for the gatherer.
-type Dir struct{ Path string }
+// Reader reads registry directories (the gatherer's Registry source).
+type Reader struct{}
 
-// ReadAll parses every entry in the directory.
-func (d Dir) ReadAll() []Entry { return ReadAll(d.Path) }
+// ReadAll parses every entry in dir.
+func (Reader) ReadAll(dir string) []Entry { return ReadAll(dir) }
 
 // Read parses one entry.
-func (Dir) Read(path string) (Entry, error) { return Read(path) }
+func (Reader) Read(path string) (Entry, error) { return Read(path) }

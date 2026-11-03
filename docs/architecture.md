@@ -200,7 +200,7 @@ Display groups, in order:
 | **IDLE** | idle, cache warm — sorted by soonest cache expiry ("use it or lose it") |
 | **COLD** | idle, cache expired |
 | **UNKNOWN** | unmanaged sessions whose state can't be inferred |
-| **ENDED** | process gone (hidden by default) |
+| **CLOSED** | no process: every conversation on disk, newest first (see [conversations.md](conversations.md)) |
 
 ### 4.5 Merge rule: latest observation wins
 
@@ -274,15 +274,18 @@ when a session newly needs you. One job at a time, cached by input hash,
 
 ### 4.9 Search
 
-`cccp search` and the cockpit's `?` mode search the full text of all
+`cccp search` and the cockpit's `/` (after a pause in typing) search the full text of all
 transcripts (Claude: user prompts, assistant text, `ai-title`; agy: user
 input and planner responses; tool output is excluded, because it dominates
 the bytes and drowns the signal). Text is extracted incrementally (by byte
 offset) into `~/.cache/cccp/text/`, then searched with a direct
 case-insensitive substring/regex scan. At this corpus size (47 transcripts,
 375 MB raw, an order of magnitude less after extraction) a scan is
-milliseconds, so no index engine is warranted. A result jumps to the live
-pane if the session is running, or resumes it in a new tmux window if not.
+milliseconds, so no index engine is warranted. The same incremental pass
+records each conversation's catalog facts (title, cwd, branch, prompts,
+turns), from which the CLOSED rows are built. In the cockpit, text matches
+are listed after the fuzzy matches on the sessions' own facts
+([conversations.md](conversations.md)).
 
 ### 4.10 Cockpit (`cccp ui`)
 
@@ -292,12 +295,13 @@ socket; if the daemon is unreachable it gathers and computes in-process
 
 * Header: counts per group, power state.
 * Grouped list; row = state glyph, agent badge, tmux location, title, project,
-  time in state, cache countdown, context size, detail (tool / question).
+  time in state, cache countdown, context size (closed: turns), detail (tool /
+  question; closed: summary; search: the matching text).
 * Preview: live `capture-pane` of the selected pane (refreshed only while
   the cockpit is open), or the conversation view (last prompt, last message).
-* Keys: `enter` jump · `tab` next needing attention · `/` filter · `?`
-  transcript search · `R` resume ended session · `a` set alias · `m` mark
-  seen · `e` show/hide ended · `p` toggle preview mode · `q` quit.
+* Keys: `enter` jump or resume · `tab` next needing attention · `/` search
+  (one ranked list) · `a` set alias · `m` mark seen · `e` hide/show closed ·
+  `p` toggle preview mode · `r` rescan · `q` quit.
 
 ## 5. Files and paths
 
@@ -305,8 +309,9 @@ socket; if the daemon is unreachable it gathers and computes in-process
 |---|---|---|
 | `~/.local/state/cccp/sessions/*.json` | hook | hook-observed per-session state |
 | `~/.local/state/cccp/daemon.json` | daemon | seen-times, aliases |
+| `~/.local/state/cccp/summaries.json` | daemon | summaries, keyed by session and input hash |
 | `$XDG_RUNTIME_DIR/cccp.sock` | daemon | IPC (JSON lines) |
-| `~/.cache/cccp/text/` | search | extracted transcript text + offsets |
+| `~/.cache/cccp/text/` | catalog | extracted transcript text + offsets, catalog facts per conversation; `.lock` serialises updates |
 | `~/.config/cccp/config.toml` | user | options |
 
 ## 6. Failure modes
@@ -455,11 +460,12 @@ reading, and is reached only through interfaces.
 | `core` | pure | `Plan(Observation) Needs`; `Compute(Observation, Memory, Config, watchStart, now) (Snapshot, Memory)`; `NextAttention`, `PlanJump`, `NextDeadline`, `Expired` |
 | `machine` | pure | the daemon as a state machine: `Step(Input) []Effect`; notification de-duplication, tmux diffing, summary queue and backoff, save debounce, timer, pruning |
 | `present`, `config` | pure | formatting; configuration type, defaults and `Parse` |
+| `profile`, `fuzzy` | pure | Claude profile resolution; fuzzy matching for the cockpit's search |
 | `gather` | shell | builds an `Observation` from interfaces (`HookStore`, `Registry`, `TmuxReader`, `Procs`, `Transcripts`, `Files`, `AgyDB`, `Power`), refreshing only what an event made stale |
-| `daemon` | shell | event loop: OS events → machine inputs; effects → ports (`TmuxWriter`, `Notifier`, `Summarizer`, `MemoryStore`, `FileRemover`) |
+| `daemon` | shell | event loop: OS events → machine inputs; effects → ports (`TmuxWriter`, `Notifier`, `Summarizer`, `MemoryStore`, `FileRemover`, `Indexer`) |
 | `hook` | shell | `Handle(Deps, agent, stdin, now)`; payload parsing is pure |
 | `install` | shell | install/uninstall through a command runner and a tmux runner; `tmux.conf` edits are pure |
-| `store`, `claudereg`, `transcript`, `agydb`, `procs`, `tmux`, `power`, `memfile`, `search`, `ipc` | adapters | one external resource each |
+| `store`, `claudereg`, `transcript`, `agydb`, `procs`, `tmux`, `power`, `memfile`, `catalog`, `ipc` | adapters | one external resource each |
 | `ui` | Elm architecture | Bubble Tea model over `Source`, `Actions`, `Searcher`, `PaneCapturer` interfaces |
 | `paths` | pure | `Resolve(getenv, home, uid) Layout` |
 | `cmd/cccp` | composition root | the only code that reads the environment and constructs real adapters |
@@ -505,3 +511,62 @@ reading, and is reached only through interfaces.
 
 `go test -race ./...` runs tiers 1 to 3 in about a second, with no network,
 no subprocess other than `sleep`, and nothing outside temp directories.
+
+## 11. Profiles (2026-11-02)
+
+A **profile** is a Claude Code config directory (`CLAUDE_CONFIG_DIR`); each
+has its own registry (`<dir>/sessions`), transcripts (`<dir>/projects`),
+plugins and account. The user runs a personal profile (`~/.claude`) and a
+work profile (`~/.claude-work`, via an alias) on different organisations'
+subscriptions.
+
+* **Resolution** (`internal/profile`, pure): the default profile is fixed at
+  `~/.claude`, because a session that reports no `CLAUDE_CONFIG_DIR` is
+  there regardless of cccp's own environment; configured `[[profile]]`
+  entries add names and per-profile `summaries`; discovered directories
+  (running processes' environment, `~/.claude*` directories containing
+  `sessions/` or `projects/`, hook state) complete the list. Unconfigured
+  names are derived (`~/.claude-work` → `work`) and kept unique.
+* **Attribution** (`core`): hook state records the hook's inherited
+  `CLAUDE_CONFIG_DIR`; a registry record carries the profile whose registry
+  holds it; an unmanaged process's environment is read. Transcript lookups
+  and title matching happen within the session's profile only
+  (`ProjectKey{ConfigDir, Cwd}`); a session with the same title in another
+  profile never matches.
+* **Watching** (`daemon`): every profile's registry is watched, including
+  profiles discovered while running.
+* **Summaries** (`machine`, `daemon.ClaudeSummarizer`): `StartSummary`
+  carries the session's profile (agy sessions use the default), the policy
+    is resolved per profile, and the adapter selects it explicitly
+  (`model.Profile.Environ`, below). Verified before implementing: with the summarizer's flags
+  (`--setting-sources ""`), credentials come only from `CLAUDE_CONFIG_DIR`;
+  an empty config directory refuses with "Not logged in", and each real
+  profile answered on its own account.
+* **Jumping** (`core.PlanJump`): resuming or attaching runs in the
+  session's profile, whatever the tmux server's environment: another
+  profile with `-e CLAUDE_CONFIG_DIR=…` on the new window, the default one
+  as `env -u CLAUDE_CONFIG_DIR claude …`.
+* **Selecting the default profile** (`model.Profile.Environ`, used by every
+  path that starts `claude`): the variable is removed, never set to
+  `~/.claude`. Claude Code puts its global state at
+  `join(CLAUDE_CONFIG_DIR || homedir, ".claude.json")` but its settings at
+  `join(CLAUDE_CONFIG_DIR || ~/.claude, "settings.json")` (read from the
+  2.1.317 bundle), so `CLAUDE_CONFIG_DIR=~/.claude` keeps settings and
+  credentials but reads a blank `~/.claude/.claude.json` and runs the
+  first-start flow. Until 2026-11-02 cccp did set it, in resume/attach,
+  summaries, install and doctor; that created a stray
+  `~/.claude/.claude.json`, which nothing reads now.
+* **Install / doctor**: the plugin is installed into, and checked in, every
+  profile; doctor shows each profile's account (`claude auth status`).
+
+Correction recorded here: the seven work-profile sessions earlier shown as
+UNKNOWN, with a note blaming Claude Code's transcript cleanup, were work
+profile sessions whose registry and transcripts cccp was not reading. The
+note now says only "no transcript found".
+
+## 12. Closed conversations (2026-11-02)
+
+Every conversation on disk, in any harness and profile, is a row: those
+without a process are CLOSED, below COLD. `/` searches all rows in one ranked
+list; `enter` on a closed row resumes it in a new tmux window. Design, data
+locations and battery behaviour: [conversations.md](conversations.md).

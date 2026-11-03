@@ -25,6 +25,7 @@ type builder struct {
 	hook *HookRecord
 	reg  *RegistryRecord
 	proc *AgentProc
+	conv *Conversation // its transcript in the catalog, if cataloged
 
 	// unmanaged: found only via tmux and /proc; its state is inferred.
 	unmanaged bool
@@ -56,13 +57,15 @@ type identified struct {
 	builders map[string]*builder
 	needs    Needs
 	panes    map[string]model.TmuxPane
+	// defaultDir is the default profile's directory.
+	defaultDir string
 }
 
 // identify decides which sessions exist and which process and pane belongs
 // to each. Plan and Compute both use it, so they cannot disagree about which
 // transcripts are needed.
 func identify(obs Observation) identified {
-	id := identified{builders: map[string]*builder{}, panes: map[string]model.TmuxPane{}}
+	id := identified{builders: map[string]*builder{}, panes: map[string]model.TmuxPane{}, defaultDir: defaultDir(obs.Profiles)}
 	for _, p := range obs.Tmux.Panes {
 		id.panes[p.ID] = p
 	}
@@ -158,9 +161,9 @@ func identify(obs Observation) identified {
 	}
 	for i := range free {
 		ap := free[i]
-		sid, note, needProject := resolveUnmanaged(ap, id.panes[ap.Pane], obs, taken)
+		sid, note, needProject := resolveUnmanaged(ap, id.panes[ap.Pane], obs, id.defaultDir, taken)
 		if needProject {
-			id.needs.Projects = appendUnique(id.needs.Projects, ap.Cwd)
+			id.needs.Projects = appendUniqueKey(id.needs.Projects, ProjectKey{ConfigDir: orDefault(ap.ConfigDir, id.defaultDir), Cwd: ap.Cwd})
 		}
 		var b *builder
 		if sid != "" && !taken[Key(ap.Agent, sid)] {
@@ -180,9 +183,20 @@ func identify(obs Observation) identified {
 		b.note = note
 	}
 
-	// 6. Transcripts needed for known sessions.
+	// 6. Every cataloged conversation: attached to its session, or a
+	// closed conversation of its own.
+	for i := range obs.Conversations {
+		c := &obs.Conversations[i]
+		if c.SessionID == "" || c.Agent == "" {
+			continue
+		}
+		get(c.Agent, c.SessionID).conv = c
+	}
+
+	// 7. Transcripts needed for known sessions. A closed conversation
+	// (no process, no hook state) needs none: the catalog has its facts.
 	for _, b := range sortedBuilders(id.builders) {
-		if !b.known() {
+		if !b.known() || b.closedOnly() {
 			continue
 		}
 		hint := ""
@@ -191,12 +205,17 @@ func identify(obs Observation) identified {
 		}
 		switch b.agent {
 		case model.Claude:
-			id.needs.Claude = append(id.needs.Claude, ClaudeNeed{SessionID: b.sid, Cwd: b.cwd(), Hint: hint})
+			id.needs.Claude = append(id.needs.Claude, ClaudeNeed{SessionID: b.sid, ConfigDir: orDefault(b.configDir(), id.defaultDir), Cwd: b.cwd(), Hint: hint})
 		case model.Agy:
 			id.needs.Agy = append(id.needs.Agy, AgyNeed{ConversationID: b.sid, Hint: hint})
 		}
 	}
 	return id
+}
+
+// closedOnly: known only from the catalog (no process, hook or registry).
+func (b *builder) closedOnly() bool {
+	return b.conv != nil && b.hook == nil && b.reg == nil && b.proc == nil
 }
 
 // cwd is the session's working directory as reported by its sources.
@@ -206,10 +225,66 @@ func (b *builder) cwd() string {
 		return b.hook.State.Cwd
 	case b.reg != nil && b.reg.Entry.Cwd != "":
 		return b.reg.Entry.Cwd
-	case b.proc != nil:
+	case b.proc != nil && b.proc.Cwd != "":
 		return b.proc.Cwd
+	case b.conv != nil:
+		return b.conv.Cwd
 	}
 	return ""
+}
+
+// configDir is the session's Claude profile directory as its sources report
+// it ("" = the default profile).
+func (b *builder) configDir() string {
+	switch {
+	case b.hook != nil && b.hook.State.ConfigDir != "":
+		return b.hook.State.ConfigDir
+	case b.reg != nil && b.reg.ConfigDir != "":
+		return b.reg.ConfigDir
+	case b.proc != nil && b.proc.ConfigDir != "":
+		return b.proc.ConfigDir
+	case b.conv != nil:
+		return b.conv.ConfigDir
+	}
+	return ""
+}
+
+func defaultDir(ps []model.Profile) string {
+	for _, p := range ps {
+		if p.Default {
+			return p.Dir
+		}
+	}
+	return ""
+}
+
+func orDefault(dir, def string) string {
+	if dir == "" {
+		return def
+	}
+	return dir
+}
+
+// profileOf returns the profile for a config directory ("" = default).
+func profileOf(ps []model.Profile, dir string) (model.Profile, bool) {
+	for _, p := range ps {
+		if (dir == "" && p.Default) || (dir != "" && p.Dir == dir) {
+			return p, true
+		}
+	}
+	return model.Profile{}, false
+}
+
+func appendUniqueKey(xs []ProjectKey, x ProjectKey) []ProjectKey {
+	if x.Cwd == "" {
+		return xs
+	}
+	for _, y := range xs {
+		if y == x {
+			return xs
+		}
+	}
+	return append(xs, x)
 }
 
 func sortedBuilders(m map[string]*builder) []*builder {
@@ -258,7 +333,7 @@ var uuidRe = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4
 // resolveUnmanaged determines the session id of an agent process that no
 // hook or registry entry claims. needProject is set when matching needs the
 // listing of the process's project directory, which is not in obs yet.
-func resolveUnmanaged(ap AgentProc, pane model.TmuxPane, obs Observation, taken map[string]bool) (sid, note string, needProject bool) {
+func resolveUnmanaged(ap AgentProc, pane model.TmuxPane, obs Observation, defaultDir string, taken map[string]bool) (sid, note string, needProject bool) {
 	switch ap.Agent {
 	case model.Claude:
 		if s := flagValue(ap.Cmdline, "--resume", "-r", "--session-id"); uuidRe.MatchString(s) {
@@ -271,7 +346,7 @@ func resolveUnmanaged(ap AgentProc, pane model.TmuxPane, obs Observation, taken 
 		if ap.Cwd == "" {
 			return "", "no working directory", false
 		}
-		list, listed := obs.Projects[ap.Cwd]
+		list, listed := obs.Projects[ProjectKey{ConfigDir: orDefault(ap.ConfigDir, defaultDir), Cwd: ap.Cwd}]
 		if !listed {
 			return "", "", true
 		}

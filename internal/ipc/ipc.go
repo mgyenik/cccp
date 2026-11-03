@@ -21,6 +21,7 @@ const (
 	OpSeen      = "seen"      // mark Key seen now; reply: OK
 	OpAlias     = "alias"     // set Value as alias for Key ("" clears); reply: OK
 	OpReload    = "reload"    // reread the config file; reply: OK
+	OpSummarize = "summarize" // summarise closed conversation Key if it has no summary; reply: OK
 )
 
 // Request is a client message.

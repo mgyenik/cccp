@@ -22,11 +22,11 @@ const (
 	GroupIdle
 	GroupCold
 	GroupUnknown
-	GroupEnded
+	GroupClosed
 )
 
 // Groups lists all groups in display order.
-var Groups = []Group{GroupNeedsYou, GroupYourTurn, GroupWorking, GroupIdle, GroupCold, GroupUnknown, GroupEnded}
+var Groups = []Group{GroupNeedsYou, GroupYourTurn, GroupWorking, GroupIdle, GroupCold, GroupUnknown, GroupClosed}
 
 func (g Group) String() string {
 	switch g {
@@ -42,8 +42,8 @@ func (g Group) String() string {
 		return "COLD"
 	case GroupUnknown:
 		return "UNKNOWN"
-	case GroupEnded:
-		return "ENDED"
+	case GroupClosed:
+		return "CLOSED"
 	}
 	return "?"
 }
@@ -57,6 +57,8 @@ const (
 	TrackHooksRegistry Tracking = "hooks+registry"
 	// TrackUnmanaged: found only via tmux and /proc; state is inferred.
 	TrackUnmanaged Tracking = "unmanaged"
+	// TrackCatalog: known only from its transcript (no process).
+	TrackCatalog Tracking = "catalog"
 )
 
 // Cache describes the prompt cache of a Claude session.
@@ -93,7 +95,14 @@ type Session struct {
 	Alias       string `json:"alias,omitempty"`
 	Summary     string `json:"summary,omitempty"`
 	Cwd         string `json:"cwd,omitempty"`
-	Model       string `json:"model,omitempty"`
+	// Profile is the Claude profile's name and ConfigDir its directory
+	// (Claude sessions only).
+	Profile   string `json:"profile,omitempty"`
+	ConfigDir string `json:"config_dir,omitempty"`
+	// DefaultProfile: ConfigDir is the default profile's, selected by
+	// leaving CLAUDE_CONFIG_DIR unset (see model.Profile.Environ).
+	DefaultProfile bool   `json:"default_profile,omitempty"`
+	Model          string `json:"model,omitempty"`
 
 	Pane     string `json:"pane,omitempty"`
 	WindowID string `json:"window_id,omitempty"`
@@ -104,9 +113,12 @@ type Session struct {
 	Alive    bool   `json:"alive"`
 	Visible  bool   `json:"visible,omitempty"`
 
+	FirstPrompt  string    `json:"first_prompt,omitempty"`
 	LastPrompt   string    `json:"last_prompt,omitempty"`
 	LastPromptAt time.Time `json:"last_prompt_at,omitempty"`
 	LastMessage  string    `json:"last_message,omitempty"`
+	Branch       string    `json:"branch,omitempty"`
+	Turns        int       `json:"turns,omitempty"` // prompts typed (from the catalog)
 
 	// CompletedAt is the end of the last turn; Unseen means it has not been
 	// looked at since.

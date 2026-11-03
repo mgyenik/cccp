@@ -1,6 +1,8 @@
 package core
 
 import (
+	"fmt"
+	"strings"
 	"time"
 
 	"cccp/internal/config"
@@ -86,7 +88,7 @@ func (c *computation) noteRegistryTransitions() {
 func NextDeadline(s Snapshot) time.Time {
 	var t time.Time
 	for _, x := range s.Sessions {
-		if x.Group == GroupWorking || x.Group == GroupEnded || !x.Cache.Known {
+		if x.Group == GroupWorking || x.Group == GroupClosed || !x.Cache.Known {
 			continue
 		}
 		if x.Cache.ExpiresAt.After(s.At) && (t.IsZero() || x.Cache.ExpiresAt.Before(t)) {
@@ -163,28 +165,82 @@ const (
 
 // Jump is the plan for showing a session.
 type Jump struct {
-	Kind   JumpKind
-	Pane   string
-	Dir    string
-	Argv   []string
+	Kind JumpKind
+	Pane string
+	// For a new window: the directory, command and environment, and the
+	// tmux session to open it in ("" = the client's current session).
+	Dir         string
+	Argv        []string
+	Env         []string
+	TmuxSession string
+	// Resume: the command resumes a closed conversation, which only works
+	// in Dir; if Dir no longer exists nothing must be started. (Attaching
+	// works from anywhere; Dir is then a convenience.)
+	Resume bool
 	Reason string
 }
 
-// PlanJump decides how to show s.
-func PlanJump(s Session) Jump {
+// claudeCommand runs claude with args in s's profile. Another profile is
+// selected by setting CLAUDE_CONFIG_DIR; the default one by removing it
+// (setting it to ~/.claude makes Claude Code use a blank global state, see
+// model.Profile.Environ). The removal is part of the command, because a new
+// tmux window starts with the tmux server's environment, which may name
+// another profile.
+func claudeCommand(s Session, args ...string) (argv, env []string) {
+	if s.DefaultProfile || s.ConfigDir == "" {
+		return append([]string{"env", "-u", model.ConfigDirEnv, "claude"}, args...), nil
+	}
+	return append([]string{"claude"}, args...), []string{model.ConfigDirEnv + "=" + s.ConfigDir}
+}
+
+// PlanJump decides how to show s. panes are the tmux panes, used to open a
+// resumed conversation next to the project's other windows.
+//
+// A Claude session always reopens in its own profile (and account),
+// whatever the tmux server's environment (claudeCommand). A resumed conversation must start in its own working
+// directory: Claude Code finds the transcript under the project directory
+// derived from the cwd it starts in.
+func PlanJump(s Session, panes []model.TmuxPane) Jump {
 	switch {
 	case s.Alive && s.Pane != "":
 		return Jump{Kind: JumpPane, Pane: s.Pane}
 	case s.Alive && s.Kind == "background" && s.SessionID != "":
-		return Jump{Kind: JumpNewWindow, Dir: s.Cwd, Argv: []string{"claude", "attach", s.SessionID}}
+		argv, env := claudeCommand(s, "attach", s.SessionID)
+		return Jump{Kind: JumpNewWindow, Dir: s.Cwd, Argv: argv, Env: env, TmuxSession: SessionForDir(panes, s.Cwd)}
 	case s.Alive:
-		return Jump{Kind: JumpImpossible, Reason: s.DisplayTitle() + " has no tmux pane"}
+		// A second process on the same transcript would interleave writes.
+		return Jump{Kind: JumpImpossible, Reason: fmt.Sprintf("%s is already open outside tmux (pid %d); close it there first", s.DisplayTitle(), s.PID)}
 	case s.SessionID == "":
 		return Jump{Kind: JumpImpossible, Reason: s.DisplayTitle() + ": session id unknown, cannot resume"}
+	case s.Cwd == "":
+		return Jump{Kind: JumpImpossible, Reason: s.DisplayTitle() + ": working directory unknown, cannot resume"}
 	case s.Agent == model.Claude:
-		return Jump{Kind: JumpNewWindow, Dir: s.Cwd, Argv: []string{"claude", "--resume", s.SessionID}}
+		argv, env := claudeCommand(s, "--resume", s.SessionID)
+		return Jump{Kind: JumpNewWindow, Dir: s.Cwd, Argv: argv, Env: env, TmuxSession: SessionForDir(panes, s.Cwd), Resume: true}
 	case s.Agent == model.Agy:
-		return Jump{Kind: JumpNewWindow, Dir: s.Cwd, Argv: []string{"agy", "--conversation=" + s.SessionID}}
+		return Jump{Kind: JumpNewWindow, Dir: s.Cwd, Argv: []string{"agy", "--conversation=" + s.SessionID},
+			TmuxSession: SessionForDir(panes, s.Cwd), Resume: true}
 	}
 	return Jump{Kind: JumpImpossible, Reason: "cannot resume " + string(s.Agent) + " sessions"}
+}
+
+// SessionForDir is the tmux session with the most panes in dir (or below
+// it), "" when none has any. Ties go to the session name that sorts first.
+func SessionForDir(panes []model.TmuxPane, dir string) string {
+	if dir == "" {
+		return ""
+	}
+	count := map[string]int{}
+	for _, p := range panes {
+		if p.Path == dir || strings.HasPrefix(p.Path, strings.TrimSuffix(dir, "/")+"/") {
+			count[p.Session]++
+		}
+	}
+	best, n := "", 0
+	for sess, c := range count {
+		if c > n || (c == n && sess < best) {
+			best, n = sess, c
+		}
+	}
+	return best
 }

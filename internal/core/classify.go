@@ -77,7 +77,7 @@ func (c *computation) transcriptFor(b *builder) meta {
 			return meta{claude: t.Meta, hasClaude: true, path: t.Path}
 		}
 		// Matched by title from a project listing.
-		for _, t := range c.obs.Projects[b.cwd()] {
+		for _, t := range c.obs.Projects[ProjectKey{ConfigDir: orDefault(b.configDir(), c.id.defaultDir), Cwd: b.cwd()}] {
 			if t.SessionID == b.sid {
 				return meta{claude: t.Meta, hasClaude: true, path: t.Path}
 			}
@@ -103,6 +103,8 @@ func (c *computation) build(b *builder) (Session, bool) {
 		s.SessionID = b.sid
 	}
 	switch {
+	case b.closedOnly():
+		s.Tracking = TrackCatalog
 	case b.unmanaged:
 		s.Tracking = TrackUnmanaged
 	case h != nil && r != nil:
@@ -156,9 +158,20 @@ func (c *computation) build(b *builder) (Session, bool) {
 		s.Location = "background"
 	}
 	s.Cwd = b.cwd()
+	if b.agent == model.Claude {
+		s.ConfigDir = orDefault(b.configDir(), c.id.defaultDir)
+		s.DefaultProfile = s.ConfigDir == c.id.defaultDir
+
+		if p, ok := profileOf(c.obs.Profiles, s.ConfigDir); ok {
+			s.Profile = p.Name
+		}
+	}
 
 	m := c.transcriptFor(b)
 	s.TranscriptPath = m.path
+	if s.TranscriptPath == "" && b.conv != nil {
+		s.TranscriptPath = b.conv.Path
+	}
 
 	// Activity.
 	switch {
@@ -169,6 +182,9 @@ func (c *computation) build(b *builder) (Session, bool) {
 			if s.ActivitySince.IsZero() {
 				s.ActivitySince = hs.LastEventAt
 			}
+		}
+		if b.conv != nil && b.conv.Last.After(s.ActivitySince) {
+			s.ActivitySince = b.conv.Last
 		}
 	case b.unmanaged:
 		infer(&s, b.agent, m, tp, c.cfg.QuietAfter.Duration, c.now)
@@ -184,6 +200,9 @@ func (c *computation) build(b *builder) (Session, bool) {
 	if r != nil && r.StatusAt().After(s.LastEventAt) {
 		s.LastEventAt = r.StatusAt()
 	}
+	if b.conv != nil && b.conv.Last.After(s.LastEventAt) {
+		s.LastEventAt = b.conv.Last
+	}
 
 	// Times.
 	switch {
@@ -193,6 +212,8 @@ func (c *computation) build(b *builder) (Session, bool) {
 		s.StartedAt = r.StartedAt()
 	case b.proc != nil:
 		s.StartedAt = b.proc.StartedAt
+	case b.conv != nil:
+		s.StartedAt = b.conv.First
 	}
 	if hs != nil {
 		s.EndedAt = hs.EndedAt
@@ -201,10 +222,13 @@ func (c *computation) build(b *builder) (Session, bool) {
 		s.EndedAt = s.LastEventAt
 	}
 
-	c.fillText(&s, hs, r, m, tp)
+	c.fillText(&s, hs, r, m, tp, b.conv)
 
 	// Model and context.
-	if hs != nil {
+	if b.conv != nil {
+		s.Model, s.Branch, s.Turns = b.conv.Model, b.conv.Branch, b.conv.Turns
+	}
+	if hs != nil && hs.Model != "" {
 		s.Model = hs.Model
 	}
 	if m.hasClaude {
@@ -233,7 +257,9 @@ func (c *computation) build(b *builder) (Session, bool) {
 	}
 	s.Alias = c.mem.Aliases[s.Key]
 	s.Group = groupOf(s, c.now)
-	if s.Group == GroupEnded && !s.EndedAt.IsZero() && c.now.Sub(s.EndedAt) > c.cfg.EndedRetention.Duration {
+	// A closed session is listed while its transcript exists; without one
+	// (only hook state left), for the retention period.
+	if s.Group == GroupClosed && b.conv == nil && !s.EndedAt.IsZero() && c.now.Sub(s.EndedAt) > c.cfg.EndedRetention.Duration {
 		return Session{}, false
 	}
 	return s, true
@@ -326,7 +352,7 @@ func infer(s *Session, a model.Agent, m meta, p model.TmuxPane, quiet time.Durat
 			s.Notes = append(s.Notes, "no transcript; pane is producing output")
 		default:
 			s.Activity, s.ActivitySince = model.Unknown, p.WindowActivity
-			s.Notes = append(s.Notes, "no transcript (Claude Code deletes transcripts after cleanupPeriodDays)")
+			s.Notes = append(s.Notes, "no transcript found")
 		}
 	case model.Agy:
 		// agy redraws its pane continuously even when idle, so pane output
@@ -345,8 +371,8 @@ func infer(s *Session, a model.Agent, m meta, p model.TmuxPane, quiet time.Durat
 	}
 }
 
-// fillText chooses the last prompt, last message and title.
-func (c *computation) fillText(s *Session, h *model.HookState, r *model.RegistryEntry, m meta, p model.TmuxPane) {
+// fillText chooses the first and last prompt, last message and title.
+func (c *computation) fillText(s *Session, h *model.HookState, r *model.RegistryEntry, m meta, p model.TmuxPane, conv *Conversation) {
 	// Last prompt / message: whichever source is newest.
 	var msgAt time.Time
 	if h != nil {
@@ -376,6 +402,15 @@ func (c *computation) fillText(s *Session, h *model.HookState, r *model.Registry
 			s.LastMessage = am.LastMessage
 		}
 	}
+	if conv != nil {
+		s.FirstPrompt = conv.FirstPrompt
+		if s.LastPrompt == "" {
+			s.LastPrompt = conv.LastPrompt
+		}
+		if s.LastMessage == "" {
+			s.LastMessage = conv.LastMessage
+		}
+	}
 
 	type cand struct{ v, src string }
 	var cs []cand
@@ -387,6 +422,9 @@ func (c *computation) fillText(s *Session, h *model.HookState, r *model.Registry
 	}
 	if m.hasClaude {
 		cs = append(cs, cand{m.claude.AITitle, "ai-title"})
+	}
+	if conv != nil && s.Agent == model.Claude {
+		cs = append(cs, cand{conv.Title, "ai-title"})
 	}
 	if s.Agent == model.Agy && s.SessionID != "" {
 		if conv, ok := c.obs.AgyConversations[s.SessionID]; ok {
@@ -403,6 +441,9 @@ func (c *computation) fillText(s *Session, h *model.HookState, r *model.Registry
 	}
 	if r != nil {
 		cs = append(cs, cand{r.Name, "name"})
+	}
+	if conv != nil {
+		cs = append(cs, cand{conv.Title, "catalog"}, cand{firstLine(conv.FirstPrompt), "prompt"})
 	}
 	if s.Cwd != "" {
 		cs = append(cs, cand{filepath.Base(s.Cwd), "cwd"})
@@ -468,7 +509,7 @@ func (c *computation) attention(s *Session, b *builder, h *model.HookState, m me
 func groupOf(s Session, now time.Time) Group {
 	switch {
 	case !s.Alive || s.Activity == model.Ended:
-		return GroupEnded
+		return GroupClosed
 	case s.Activity.NeedsYou():
 		return GroupNeedsYou
 	case s.Activity == model.Working:
@@ -507,7 +548,7 @@ func sortSessions(ss []Session) {
 			if !a.Cache.ExpiresAt.Equal(b.Cache.ExpiresAt) {
 				return a.Cache.ExpiresAt.Before(b.Cache.ExpiresAt)
 			}
-		case GroupCold, GroupUnknown, GroupEnded:
+		case GroupCold, GroupUnknown, GroupClosed:
 			ta, tb := maxTime(a.ActivitySince, a.LastEventAt), maxTime(b.ActivitySince, b.LastEventAt)
 			if !ta.Equal(tb) {
 				return ta.After(tb) // most recent first

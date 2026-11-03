@@ -227,5 +227,8 @@ func (System) Cmdline(pid int) []string { return Cmdline(pid) }
 // Cwd returns the working directory of pid.
 func (System) Cwd(pid int) string { return Cwd(pid) }
 
+// Environ returns one environment variable of pid.
+func (System) Environ(pid int, key string) string { return Environ(pid, key) }
+
 // StartWall converts a start time to wall-clock time.
 func (System) StartWall(ticks uint64) time.Time { return StartWall(ticks) }

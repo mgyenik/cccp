@@ -139,8 +139,8 @@ func TestGroupOf(t *testing.T) {
 		{Session{Alive: true, Activity: model.Idle, Agent: model.Claude}, GroupIdle},
 		{Session{Alive: true, Activity: model.Idle, Agent: model.Agy, Cache: cold}, GroupIdle},
 		{Session{Alive: true, Activity: model.Unknown}, GroupUnknown},
-		{Session{Alive: false, Activity: model.Working}, GroupEnded},
-		{Session{Alive: true, Activity: model.Ended}, GroupEnded},
+		{Session{Alive: false, Activity: model.Working}, GroupClosed},
+		{Session{Alive: true, Activity: model.Ended}, GroupClosed},
 	}
 	for i, c := range cases {
 		if g := groupOf(c.s, t0); g != c.want {
@@ -295,7 +295,7 @@ func TestEndedRetention(t *testing.T) {
 		})}}
 	}
 	snap, _ := compute(mk(0), nil, at(60))
-	if s := find(t, snap, "claude:s1"); s.Group != GroupEnded || s.Alive {
+	if s := find(t, snap, "claude:s1"); s.Group != GroupClosed || s.Alive {
 		t.Fatalf("%+v", s)
 	}
 	snap, _ = compute(mk(0), nil, t0.Add(cfg.EndedRetention.Duration+time.Second))
@@ -308,7 +308,7 @@ func TestDeadProcessEndsSession(t *testing.T) {
 	})}}
 	snap, _ := compute(obs, nil, at(5))
 	s := find(t, snap, "claude:s1")
-	if s.Alive || s.Group != GroupEnded || !s.EndedAt.Equal(at(1)) {
+	if s.Alive || s.Group != GroupClosed || !s.EndedAt.Equal(at(1)) {
 		t.Fatalf("%+v", s)
 	}
 }
@@ -343,7 +343,7 @@ func TestRegistrySupersedesHookOnSamePID(t *testing.T) {
 		Registry: []RegistryRecord{regRec("new", 42, "idle", at(9), nil)},
 	}
 	snap, _ := compute(obs, nil, at(10))
-	if s := find(t, snap, "claude:old"); s.Alive || s.Group != GroupEnded {
+	if s := find(t, snap, "claude:old"); s.Alive || s.Group != GroupClosed {
 		t.Fatalf("superseded: %+v", s)
 	}
 	s := find(t, snap, "claude:new")
@@ -459,11 +459,11 @@ func TestUnmanagedClaudeMatchedByTitle(t *testing.T) {
 		}()}},
 		Agents: []AgentProc{{PID: 7, Agent: model.Claude, Pane: "%3", Cwd: "/w", Cmdline: []string{"claude"}}},
 	}
-	if needs := Plan(obs); len(needs.Projects) != 1 || needs.Projects[0] != "/w" {
+	if needs := Plan(obs); len(needs.Projects) != 1 || needs.Projects[0] != (ProjectKey{Cwd: "/w"}) {
 		t.Fatalf("needs: %+v", needs)
 	}
 	m := model.ClaudeMeta{AITitle: "AX96 simulation", LastAssistantAt: at(3), LastStopReason: "end_turn"}
-	obs.Projects = map[string][]ProjectTranscript{"/w": {
+	obs.Projects = map[ProjectKey][]ProjectTranscript{{Cwd: "/w"}: {
 		{SessionID: "older", ModTime: at(1), Meta: m},
 		{SessionID: "newer", ModTime: at(2), Meta: m},
 		{SessionID: "tracked", ModTime: at(9), Meta: m}, // tracked elsewhere: never matched
@@ -483,7 +483,7 @@ func TestUnmanagedClaudeNoTranscript(t *testing.T) {
 	obs := Observation{
 		Tmux:     TmuxView{OK: true, Panes: []model.TmuxPane{p}},
 		Agents:   []AgentProc{{PID: 7, Agent: model.Claude, Pane: "%3", Cwd: "/w", Cmdline: []string{"claude"}}},
-		Projects: map[string][]ProjectTranscript{"/w": nil},
+		Projects: map[ProjectKey][]ProjectTranscript{{Cwd: "/w"}: nil},
 	}
 	snap, _ := compute(obs, nil, at(0))
 	s := find(t, snap, "claude:pane:%3")
@@ -697,12 +697,12 @@ func TestPlanJump(t *testing.T) {
 		want Jump
 	}{
 		{Session{Alive: true, Pane: "%3"}, Jump{Kind: JumpPane, Pane: "%3"}},
-		{Session{Alive: true, Kind: "background", SessionID: "b1", Cwd: "/w"}, Jump{Kind: JumpNewWindow, Dir: "/w", Argv: []string{"claude", "attach", "b1"}}},
-		{Session{Alive: false, Agent: model.Claude, SessionID: "c1", Cwd: "/w"}, Jump{Kind: JumpNewWindow, Dir: "/w", Argv: []string{"claude", "--resume", "c1"}}},
-		{Session{Alive: false, Agent: model.Agy, SessionID: "a1", Cwd: "/w"}, Jump{Kind: JumpNewWindow, Dir: "/w", Argv: []string{"agy", "--conversation=a1"}}},
+		{Session{Alive: true, Kind: "background", SessionID: "b1", Cwd: "/w"}, Jump{Kind: JumpNewWindow, Dir: "/w", Argv: []string{"env", "-u", "CLAUDE_CONFIG_DIR", "claude", "attach", "b1"}}},
+		{Session{Alive: false, Agent: model.Claude, SessionID: "c1", Cwd: "/w"}, Jump{Kind: JumpNewWindow, Dir: "/w", Argv: []string{"env", "-u", "CLAUDE_CONFIG_DIR", "claude", "--resume", "c1"}, Resume: true}},
+		{Session{Alive: false, Agent: model.Agy, SessionID: "a1", Cwd: "/w"}, Jump{Kind: JumpNewWindow, Dir: "/w", Argv: []string{"agy", "--conversation=a1"}, Resume: true}},
 	}
 	for i, c := range cases {
-		if got := PlanJump(c.s); !reflect.DeepEqual(got, c.want) {
+		if got := PlanJump(c.s, nil); !reflect.DeepEqual(got, c.want) {
 			t.Errorf("case %d: %+v want %+v", i, got, c.want)
 		}
 	}
@@ -710,7 +710,7 @@ func TestPlanJump(t *testing.T) {
 		{Alive: true, Title: "x"},                       // live, no pane, not background
 		{Alive: false, Agent: model.Claude, Title: "y"}, // ended, id unknown
 	} {
-		if j := PlanJump(s); j.Kind != JumpImpossible || j.Reason == "" {
+		if j := PlanJump(s, nil); j.Kind != JumpImpossible || j.Reason == "" {
 			t.Errorf("%+v: %+v", s, j)
 		}
 	}
@@ -767,7 +767,7 @@ func TestResumeFlagMustBeASessionID(t *testing.T) {
 	obs := Observation{
 		Tmux:     TmuxView{OK: true, Panes: []model.TmuxPane{p}},
 		Agents:   []AgentProc{{PID: 7, Agent: model.Claude, Pane: "%3", Cwd: "/w", Cmdline: []string{"claude", "--resume", "my-session-name"}}},
-		Projects: map[string][]ProjectTranscript{"/w": {{SessionID: "real-id", Meta: model.ClaudeMeta{AITitle: "Named session"}}}},
+		Projects: map[ProjectKey][]ProjectTranscript{{Cwd: "/w"}: {{SessionID: "real-id", Meta: model.ClaudeMeta{AITitle: "Named session"}}}},
 	}
 	snap, _ := compute(obs, nil, at(1))
 	for _, s := range snap.Sessions {
@@ -776,4 +776,181 @@ func TestResumeFlagMustBeASessionID(t *testing.T) {
 		}
 	}
 	find(t, snap, "claude:real-id") // resolved by title instead
+}
+
+// --- profiles --------------------------------------------------------------------
+
+var profiles = []model.Profile{
+	{Name: "personal", Dir: "/h/.claude", Default: true},
+	{Name: "work", Dir: "/h/.claude-work"},
+}
+
+func TestSessionsAreAttributedToTheirProfile(t *testing.T) {
+	reg := regRec("r1", 42, "idle", at(1), nil)
+	reg.ConfigDir = "/h/.claude-work"
+	obs := Observation{
+		Profiles: profiles,
+		Registry: []RegistryRecord{reg},
+		Hooks: []HookRecord{
+			hookRec("h-default", 43, true, func(s *model.HookState) { s.Activity = model.Idle }),
+			hookRec("h-work", 44, true, func(s *model.HookState) { s.Activity, s.ConfigDir = model.Idle, "/h/.claude-work" }),
+		},
+	}
+	needs := Plan(obs)
+	wantDirs := map[string]string{"h-default": "/h/.claude", "h-work": "/h/.claude-work", "r1": "/h/.claude-work"}
+	for _, n := range needs.Claude {
+		if n.ConfigDir != wantDirs[n.SessionID] {
+			t.Errorf("need %s: config dir %q want %q", n.SessionID, n.ConfigDir, wantDirs[n.SessionID])
+		}
+	}
+	snap, _ := compute(obs, nil, at(2))
+	for sid, want := range map[string]string{"h-default": "personal", "h-work": "work", "r1": "work"} {
+		s := find(t, snap, "claude:"+sid)
+		if s.Profile != want || s.ConfigDir != wantDirs[sid] || s.DefaultProfile != (sid == "h-default") {
+			t.Errorf("%s: profile %q dir %q default %v", sid, s.Profile, s.ConfigDir, s.DefaultProfile)
+		}
+	}
+}
+
+func TestUnmanagedSessionMatchedWithinItsProfile(t *testing.T) {
+	p := pane("%3", "@3", 3)
+	p.Title = "✳ Work thing"
+	m := model.ClaudeMeta{AITitle: "Work thing", LastAssistantAt: at(1), LastStopReason: "end_turn"}
+	obs := Observation{
+		Profiles: profiles,
+		Tmux:     TmuxView{OK: true, Panes: []model.TmuxPane{p}},
+		Agents:   []AgentProc{{PID: 7, Agent: model.Claude, Pane: "%3", Cwd: "/w", ConfigDir: "/h/.claude-work", Cmdline: []string{"claude"}}},
+	}
+	needs := Plan(obs)
+	if len(needs.Projects) != 1 || needs.Projects[0] != (ProjectKey{ConfigDir: "/h/.claude-work", Cwd: "/w"}) {
+		t.Fatalf("needs %+v", needs.Projects)
+	}
+	// The same title in the other profile's project must not match.
+	obs.Projects = map[ProjectKey][]ProjectTranscript{
+		{ConfigDir: "/h/.claude", Cwd: "/w"}:    {{SessionID: "personal-one", ModTime: at(9), Meta: m}},
+		{ConfigDir: "/h/.claude-work", Cwd: "/w"}: {{SessionID: "work-one", ModTime: at(1), Meta: m}},
+	}
+	snap, _ := compute(obs, nil, at(5))
+	s := find(t, snap, "claude:work-one")
+	if s.Profile != "work" || s.Title != "Work thing" {
+		t.Fatalf("%+v", s)
+	}
+	absent(t, snap, "claude:personal-one")
+}
+
+func TestPlanJumpSetsTheProfile(t *testing.T) {
+	ended := Session{Agent: model.Claude, SessionID: "c1", Cwd: "/w", ConfigDir: "/h/.claude-work"}
+	if j := PlanJump(ended, nil); !reflect.DeepEqual(j.Env, []string{"CLAUDE_CONFIG_DIR=/h/.claude-work"}) {
+		t.Fatalf("resume env %v", j.Env)
+	}
+	if j := PlanJump(ended, nil); !reflect.DeepEqual(j.Argv, []string{"claude", "--resume", "c1"}) {
+		t.Fatalf("resume argv %v", j.Argv)
+	}
+	// The default profile is selected by removing the variable, in the
+	// command itself: CLAUDE_CONFIG_DIR=~/.claude would start Claude Code
+	// from a blank ~/.claude/.claude.json (the first-start flow).
+	bg := Session{Alive: true, Kind: "background", Agent: model.Claude, SessionID: "b1", ConfigDir: "/h/.claude", DefaultProfile: true}
+	if j := PlanJump(bg, nil); j.Env != nil || !reflect.DeepEqual(j.Argv, []string{"env", "-u", "CLAUDE_CONFIG_DIR", "claude", "attach", "b1"}) {
+		t.Fatalf("attach under the default profile: argv %v env %v", j.Argv, j.Env)
+	}
+	if j := PlanJump(Session{Agent: model.Agy, SessionID: "a1", Cwd: "/w"}, nil); j.Env != nil {
+		t.Fatalf("agy env %v", j.Env)
+	}
+}
+
+// --- closed conversations (the catalog) ------------------------------------------
+
+func conv(agent model.Agent, sid string, lastSec int) Conversation {
+	return Conversation{Agent: agent, SessionID: sid, ConfigDir: "/h/.claude", Path: "/t/" + sid + ".jsonl",
+		Cwd: "/w/proj", Title: "Title " + sid, FirstPrompt: "first prompt of " + sid, LastPrompt: "last prompt",
+		LastMessage: "last message", Branch: "main", Model: "claude-x", Turns: 7, First: at(0), Last: at(lastSec)}
+}
+
+func TestCatalogOnlyConversationIsClosed(t *testing.T) {
+	obs := Observation{Profiles: profiles, Conversations: []Conversation{conv(model.Claude, "c1", 50)}}
+	if needs := Plan(obs); len(needs.Claude) != 0 {
+		t.Fatalf("a closed conversation must not ask for its transcript: %+v", needs.Claude)
+	}
+	// Long after the retention period: still listed while the transcript exists.
+	now := t0.Add(cfg.EndedRetention.Duration * 3)
+	snap, _ := compute(obs, nil, now)
+	s := find(t, snap, "claude:c1")
+	if s.Group != GroupClosed || s.Alive || s.Tracking != TrackCatalog || s.Activity != model.Ended {
+		t.Fatalf("%+v", s)
+	}
+	if s.Title != "Title c1" || s.FirstPrompt != "first prompt of c1" || s.LastMessage != "last message" ||
+		s.Turns != 7 || s.Branch != "main" || s.Profile != "personal" || s.TranscriptPath != "/t/c1.jsonl" ||
+		!s.ActivitySince.Equal(at(50)) || !s.StartedAt.Equal(at(0)) {
+		t.Fatalf("%+v", s)
+	}
+}
+
+func TestClosedConversationsNewestFirst(t *testing.T) {
+	obs := Observation{Conversations: []Conversation{conv(model.Claude, "old", 10), conv(model.Claude, "new", 90), conv(model.Agy, "mid", 50)}}
+	snap, _ := compute(obs, nil, at(100))
+	if got := keys(snap); !reflect.DeepEqual(got, []string{"claude:new", "agy:mid", "claude:old"}) {
+		t.Fatalf("%v", got)
+	}
+}
+
+func TestLiveSessionAndItsConversationAreOneRow(t *testing.T) {
+	obs := Observation{
+		Profiles:      profiles,
+		Registry:      []RegistryRecord{regRec("c1", 42, "busy", at(5), nil)},
+		Conversations: []Conversation{conv(model.Claude, "c1", 4)},
+	}
+	snap, _ := compute(obs, nil, at(6))
+	if len(snap.Sessions) != 1 {
+		t.Fatalf("one conversation, one row: %v", keys(snap))
+	}
+	s := snap.Sessions[0]
+	if s.Group != GroupWorking || s.Turns != 7 || s.FirstPrompt != "first prompt of c1" {
+		t.Fatalf("%+v", s)
+	}
+}
+
+func TestEndedHookSessionWithTranscriptOutlivesRetention(t *testing.T) {
+	obs := Observation{
+		Hooks: []HookRecord{hookRec("c1", 42, false, func(s *model.HookState) {
+			s.Activity, s.EndedAt, s.LastEventAt = model.Ended, at(0), at(0)
+		})},
+		Conversations: []Conversation{conv(model.Claude, "c1", 0)},
+	}
+	snap, _ := compute(obs, nil, t0.Add(cfg.EndedRetention.Duration*2))
+	if s := find(t, snap, "claude:c1"); s.Group != GroupClosed {
+		t.Fatalf("%+v", s)
+	}
+}
+
+func TestSessionForDir(t *testing.T) {
+	panes := []model.TmuxPane{
+		{Session: "alpha", Path: "/w/acme"}, {Session: "alpha", Path: "/w/acme/tools"},
+		{Session: "beta", Path: "/w/acme"},
+		{Session: "gamma", Path: "/w/songs"}, {Session: "omega", Path: "/w/songs"},
+		{Session: "x", Path: "/w/acme-other"}, // a sibling, not below
+	}
+	for dir, want := range map[string]string{
+		"/w/acme": "alpha", "/w/songs": "gamma", "/w/none": "", "": "",
+	} {
+		if got := SessionForDir(panes, dir); got != want {
+			t.Errorf("%q → %q want %q", dir, got, want)
+		}
+	}
+}
+
+func TestPlanJumpForClosedConversations(t *testing.T) {
+	panes := []model.TmuxPane{{Session: "alpha", Path: "/w/proj"}}
+	j := PlanJump(Session{Agent: model.Claude, SessionID: "c1", Cwd: "/w/proj", ConfigDir: "/h/.claude-work"}, panes)
+	want := Jump{Kind: JumpNewWindow, Dir: "/w/proj", Argv: []string{"claude", "--resume", "c1"},
+		Env: []string{"CLAUDE_CONFIG_DIR=/h/.claude-work"}, TmuxSession: "alpha", Resume: true}
+	if !reflect.DeepEqual(j, want) {
+		t.Fatalf("%+v", j)
+	}
+	if j := PlanJump(Session{Agent: model.Claude, SessionID: "c1"}, panes); j.Kind != JumpImpossible || !strings.Contains(j.Reason, "working directory") {
+		t.Fatalf("missing cwd: %+v", j)
+	}
+	j = PlanJump(Session{Alive: true, Agent: model.Claude, SessionID: "c1", PID: 77, Title: "T"}, panes)
+	if j.Kind != JumpImpossible || !strings.Contains(j.Reason, "outside tmux (pid 77)") {
+		t.Fatalf("open outside tmux: %+v", j)
+	}
 }

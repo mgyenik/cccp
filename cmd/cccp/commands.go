@@ -19,7 +19,10 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"cccp"
+	"cccp/internal/catalog"
 	"cccp/internal/core"
 	"cccp/internal/daemon"
 	"cccp/internal/hook"
@@ -29,7 +32,6 @@ import (
 	"cccp/internal/model"
 	"cccp/internal/paths"
 	"cccp/internal/present"
-	"cccp/internal/search"
 	"cccp/internal/tmux"
 	"cccp/internal/ui"
 )
@@ -117,8 +119,9 @@ func printList(w io.Writer, snap core.Snapshot, all bool) {
 		fmt.Fprintf(w, "! %s\n", p)
 	}
 	last := core.Group(-1)
+	multi := present.MultiProfile(snap)
 	for _, s := range snap.Sessions {
-		if s.Group == core.GroupEnded && !all {
+		if s.Group == core.GroupClosed && !all {
 			continue
 		}
 		if s.Group != last {
@@ -134,7 +137,11 @@ func printList(w io.Writer, snap core.Snapshot, all bool) {
 			loc = "-"
 		}
 		meta := strings.Join(nonEmpty(present.Since(now, s.ActivitySince), present.CacheText(s, now), present.Tokens(s.ContextTokens)), "  ")
-		fmt.Fprintf(w, " %s%s %s %-12s %-40s %s\n", present.Glyph(s), inf, present.AgentBadge(s.Agent), clipStr(loc, 12), clipStr(s.DisplayTitle(), 40), meta)
+		badge := present.AgentBadge(s.Agent)
+		if multi {
+			badge += fmt.Sprintf(" %-8s", present.ProfileTag(s, 8))
+		}
+		fmt.Fprintf(w, " %s%s %s %-12s %-40s %s\n", present.Glyph(s), inf, badge, clipStr(loc, 12), clipStr(s.DisplayTitle(), 40), meta)
 		if d := present.Detail(s); d != "" {
 			fmt.Fprintf(w, "        %s\n", clipStr(d, 110))
 		}
@@ -209,7 +216,11 @@ func runJump(a *app, args []string) error {
 
 // jump executes core.PlanJump for a session on a tmux client.
 func (a *app) jump(client string, s core.Session) error {
-	p := core.PlanJump(s)
+	panes, err := a.tmux.ListPanes()
+	if err != nil {
+		return err
+	}
+	p := core.PlanJump(s, panes)
 	switch p.Kind {
 	case core.JumpPane:
 		if err := a.tmux.SwitchClient(client, p.Pane); err != nil {
@@ -218,9 +229,16 @@ func (a *app) jump(client string, s core.Session) error {
 	case core.JumpNewWindow:
 		dir := p.Dir
 		if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
+			if p.Resume {
+				return fmt.Errorf("cannot resume %s: its directory %s no longer exists", s.DisplayTitle(), p.Dir)
+			}
 			dir = ""
 		}
-		pane, err := a.tmux.NewWindow(a.clientValue(client, "#{session_name}"), dir, "", p.Argv)
+		sess := p.TmuxSession
+		if sess == "" {
+			sess = a.clientValue(client, "#{session_name}")
+		}
+		pane, err := a.tmux.NewWindow(sess, dir, "", p.Env, p.Argv)
 		if err != nil {
 			return err
 		}
@@ -261,11 +279,11 @@ func runSearch(a *app, args []string) error {
 	asJSON := fs.Bool("json", false, "print hits as JSON")
 	limit := fs.Int("n", 30, "maximum sessions to list")
 	_ = fs.Parse(args)
-	q := search.ParseQuery(strings.Join(fs.Args(), " "))
+	q := catalog.ParseQuery(strings.Join(fs.Args(), " "))
 	if len(q.Terms) == 0 {
 		return errors.New("usage: cccp search [--json] [-n N] TERMS…")
 	}
-	ix := a.searchIndex()
+	ix := a.catalog(a.profiles(a.config()))
 	if _, err := ix.Update(); err != nil {
 		return err
 	}
@@ -305,12 +323,13 @@ func runDaemon(a *app, args []string) error {
 		logger.Printf("memory: %v (starting fresh)", err)
 	}
 	m := machine.New(cfg, mem, time.Now())
+	g := a.gatherer(cfg)
 	d := daemon.New(daemon.Options{
 		SessionsDir: a.l.SessionsDir,
-		RegistryDir: a.l.ClaudeRegistryDir,
 		Socket:      a.l.Socket,
 	}, daemon.Ports{
-		Observer:   a.gatherer(),
+		Observer:   g,
+		Indexer:    indexer{base: a.catalog(nil)},
 		Tmux:       daemon.TmuxOptions{Client: a.tmux},
 		Notifier:   daemon.ExecNotifier{},
 		Summarizer: daemon.ClaudeSummarizer{Dir: a.l.CacheDir},
@@ -362,7 +381,7 @@ func runUI(a *app, args []string) error {
 	return ui.Run(ui.Options{
 		Source: src,
 		Panes:  a.tmux,
-		Search: a.searchIndex(),
+		Search: a.catalog(nil), // only read: the daemon (or localSource) updates it
 		Actions: ui.Actions{
 			Jump: func(s core.Session) error { return a.jump(*client, s) },
 			Alias: func(key, value string) error {
@@ -378,6 +397,12 @@ func runUI(a *app, args []string) error {
 				}
 				_, err := a.daemon.Call(ipc.Request{Op: ipc.OpSeen, Key: key}, 2*time.Second)
 				return err
+			},
+			Summarize: func(key string) error {
+				if !hasDaemon {
+					return nil // summaries are the daemon's: without it there are none
+				}
+				return a.daemon.Send(ipc.Request{Op: ipc.OpSummarize, Key: key}, time.Second)
 			},
 		},
 	})
@@ -447,8 +472,8 @@ type localSource struct {
 
 func (l *localSource) Start(send func(core.Snapshot)) {
 	l.stop, l.kick = make(chan struct{}), make(chan struct{}, 1)
-	g := l.a.gatherer()
 	cfg, mem := l.a.config(), l.a.memory()
+	g := l.a.gatherer(cfg)
 	start := time.Now()
 	go func() {
 		t := time.NewTicker(2 * time.Second)
@@ -457,8 +482,9 @@ func (l *localSource) Start(send func(core.Snapshot)) {
 		for {
 			g.Reload()
 			g.RefreshTmux()
-			if discover {
+			if discover { // at start and on r: as the daemon does
 				g.Discover()
+				l.a.updateCatalog(g)
 			}
 			now := time.Now()
 			snap, next := core.Compute(g.Observe(now), mem, cfg, start, now)
@@ -488,24 +514,40 @@ func (l *localSource) Close()       { l.once.Do(func() { close(l.stop) }) }
 
 // ---- install / uninstall ---------------------------------------------------------------
 
-// execRunner runs external commands for the installer.
+// execRunner runs external commands for the installer and doctor.
 type execRunner struct{}
 
-func (execRunner) Run(name string, args ...string) (string, error) {
+// Run implements install.Runner: env nil inherits cccp's environment,
+// otherwise it is the command's complete environment.
+func (execRunner) Run(env []string, name string, args ...string) (string, error) {
 	cmd := exec.Command(name, args...)
+	cmd.Env = env // nil: inherit
 	var out bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &out
 	err := cmd.Run()
 	return strings.TrimSpace(out.String()), err
 }
 
+// errNoTerminal: the installer would ask, but nothing can answer.
+var errNoTerminal = errors.New("no terminal to ask on (e.g. run through `!` or a pipe): run it in a terminal, or pass --yes to do every step")
+
+// isTerminal reports whether f is a terminal (TCGETS succeeds). A character
+// device is not enough: /dev/null is one.
+func isTerminal(f *os.File) bool {
+	_, err := unix.IoctlGetTermios(int(f.Fd()), unix.TCGETS)
+	return err == nil
+}
+
 func (a *app) installer(yes bool) (*install.Installer, error) {
+	if !yes && !isTerminal(os.Stdin) {
+		return nil, errNoTerminal
+	}
 	self, err := os.Executable()
 	if err != nil {
 		return nil, err
 	}
 	return &install.Installer{
-		L: a.l, Assets: cccp.Assets, Cmd: execRunner{}, Tmux: a.tmux, Self: self,
+		L: a.l, Profiles: a.profiles(a.config()), Assets: cccp.Assets, Cmd: execRunner{}, Environ: os.Environ(), Tmux: a.tmux, Self: self,
 		Out: os.Stdout, In: bufio.NewReader(os.Stdin), Yes: yes,
 	}, nil
 }

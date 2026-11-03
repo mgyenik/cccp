@@ -1,4 +1,7 @@
-// Package search provides full-text search over agent transcripts.
+// Package catalog indexes every agent conversation on disk: per transcript,
+// the facts shown in the session list (title, working directory, branch,
+// model, first and last prompt, last message, turn count, activity times),
+// and the conversation text for full-text search.
 //
 // Only the conversation text is indexed: user prompts, assistant text and
 // session titles. Tool calls and tool output are excluded; they make up most
@@ -7,7 +10,7 @@
 // At the corpus sizes involved (hundreds of MB of raw transcripts, an order
 // of magnitude less extracted) a scan takes milliseconds, so no index
 // structure is maintained.
-package search
+package catalog
 
 import (
 	"bufio"
@@ -23,21 +26,48 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"golang.org/x/sys/unix"
+
 	"cccp/internal/model"
 	"cccp/internal/store"
 )
 
-// Doc is one transcript's extracted text.
+// Version of the cached Doc format; a Doc with another version is rebuilt.
+const Version = 2
+
+// Doc is one conversation: its catalog facts and the state of its
+// incremental text extraction.
 type Doc struct {
+	Version   int         `json:"version"`
 	Agent     model.Agent `json:"agent"`
 	SessionID string      `json:"session_id"`
-	Source    string      `json:"source"`
-	Offset    int64       `json:"offset"`
-	ModTime   time.Time   `json:"mod_time"`
-	Title     string      `json:"title"`
-	Cwd       string      `json:"cwd"`
-	Last      time.Time   `json:"last"`
+	// ConfigDir is the Claude profile the transcript belongs to.
+	ConfigDir string    `json:"config_dir,omitempty"`
+	Source    string    `json:"source"`
+	Offset    int64     `json:"offset"`
+	ModTime   time.Time `json:"mod_time"`
+
+	Title       string    `json:"title"` // Claude's ai-title; agy's first prompt
+	Cwd         string    `json:"cwd"`
+	Branch      string    `json:"branch,omitempty"`
+	Model       string    `json:"model,omitempty"`
+	Entrypoint  string    `json:"entrypoint,omitempty"` // "cli"; "sdk-cli" for print mode
+	FirstPrompt string    `json:"first_prompt,omitempty"`
+	LastPrompt  string    `json:"last_prompt,omitempty"`
+	LastMessage string    `json:"last_message,omitempty"` // the end of the last assistant text
+	Turns       int       `json:"turns"`                  // prompts the user typed
+	First       time.Time `json:"first"`
+	Last        time.Time `json:"last"`
 }
+
+// PrintMode reports whether the conversation was a `claude -p` run.
+func (d Doc) PrintMode() bool { return strings.HasPrefix(d.Entrypoint, "sdk") }
+
+// Text limits for the stored facts, in bytes.
+const (
+	maxPrompt  = 1000
+	maxMessage = 2000
+)
 
 // Key is the session key used by the engine.
 func (d Doc) Key() string { return string(d.Agent) + ":" + d.SessionID }
@@ -54,26 +84,39 @@ type Hit struct {
 // Index is the extracted-text cache and the transcript directories it is
 // built from.
 type Index struct {
-	TextDir           string
-	ClaudeProjectsDir string
-	AgyBrainDir       string
+	TextDir string
+	// ClaudeConfigDirs are the Claude profiles whose transcripts are indexed.
+	ClaudeConfigDirs []string
+	AgyBrainDir      string
 }
 
 func docName(a model.Agent, id string) string {
 	return store.FileName(a, id) // "<agent>-<id>.json"; the text file shares the stem
 }
 
-// Update brings the extracted text up to date with every transcript and
-// returns the number of transcripts that had new content.
+// Update brings the catalog up to date with every transcript and returns
+// the number of transcripts that had new content. It holds an exclusive
+// lock on the cache: the daemon and an in-process cockpit may both update.
 func (ix Index) Update() (int, error) {
 	if err := os.MkdirAll(ix.TextDir, 0o700); err != nil {
 		return 0, err
 	}
+	lf, err := os.OpenFile(filepath.Join(ix.TextDir, ".lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return 0, err
+	}
+	defer lf.Close()
+	if err := unix.Flock(int(lf.Fd()), unix.LOCK_EX); err != nil {
+		return 0, err
+	}
+	defer unix.Flock(int(lf.Fd()), unix.LOCK_UN)
 	sources := map[string]Doc{}
-	claude, _ := filepath.Glob(filepath.Join(ix.ClaudeProjectsDir, "*", "*.jsonl"))
-	for _, p := range claude {
-		id := strings.TrimSuffix(filepath.Base(p), ".jsonl")
-		sources[docName(model.Claude, id)] = Doc{Agent: model.Claude, SessionID: id, Source: p}
+	for _, cfg := range ix.ClaudeConfigDirs {
+		claude, _ := filepath.Glob(filepath.Join(cfg, "projects", "*", "*.jsonl"))
+		for _, p := range claude {
+			id := strings.TrimSuffix(filepath.Base(p), ".jsonl")
+			sources[docName(model.Claude, id)] = Doc{Agent: model.Claude, SessionID: id, Source: p, ConfigDir: cfg}
+		}
 	}
 	agy, _ := filepath.Glob(filepath.Join(ix.AgyBrainDir, "*", ".system_generated", "logs", "transcript_full.jsonl"))
 	for _, p := range agy {
@@ -94,7 +137,7 @@ func (ix Index) Update() (int, error) {
 	ents, _ := os.ReadDir(ix.TextDir)
 	for _, e := range ents {
 		n := e.Name()
-		if strings.HasSuffix(n, ".json") {
+		if strings.HasSuffix(n, ".json") && !strings.HasPrefix(n, ".") {
 			if _, ok := sources[n]; !ok {
 				os.Remove(filepath.Join(ix.TextDir, n))
 				os.Remove(filepath.Join(ix.TextDir, strings.TrimSuffix(n, ".json")+".txt"))
@@ -115,8 +158,9 @@ func (ix Index) updateOne(name string, src Doc) (bool, error) {
 	if b, err := os.ReadFile(metaPath); err == nil {
 		_ = json.Unmarshal(b, &d)
 	}
-	if d.Source != src.Source || fi.Size() < d.Offset {
-		d = src // new or rewritten: rebuild
+	if d.Version != Version || d.Source != src.Source || fi.Size() < d.Offset {
+		d = src // new, rewritten or an older format: rebuild
+		d.Version = Version
 		os.Remove(txtPath)
 	}
 	if fi.Size() == d.Offset {
@@ -183,8 +227,47 @@ type claudeLine struct {
 	IsSidechain bool            `json:"isSidechain"`
 	IsMeta      bool            `json:"isMeta"`
 	Cwd         string          `json:"cwd"`
+	GitBranch   string          `json:"gitBranch"`
+	Entrypoint  string          `json:"entrypoint"`
 	AITitle     string          `json:"aiTitle"`
 	Message     json.RawMessage `json:"message"`
+}
+
+// prompt records a prompt the user typed.
+func (d *Doc) prompt(text string) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return
+	}
+	if d.FirstPrompt == "" {
+		d.FirstPrompt = clip(text, maxPrompt)
+	}
+	d.LastPrompt = clip(text, maxPrompt)
+	d.Turns++
+}
+
+// clip keeps at most n bytes on a rune boundary.
+func clip(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	s = s[:n]
+	for !utf8.ValidString(s) {
+		s = s[:len(s)-1]
+	}
+	return s + "…"
+}
+
+// tailText keeps at most the last n bytes on a rune boundary.
+func tailText(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	cut := len(s) - n
+	for cut < len(s) && !utf8.RuneStart(s[cut]) {
+		cut++
+	}
+	return "…" + s[cut:]
 }
 
 var (
@@ -204,7 +287,16 @@ func extractClaude(d *Doc, line []byte, w *bufio.Writer) {
 	if l.Cwd != "" {
 		d.Cwd = l.Cwd
 	}
+	if l.GitBranch != "" {
+		d.Branch = l.GitBranch
+	}
+	if l.Entrypoint != "" && d.Entrypoint == "" {
+		d.Entrypoint = l.Entrypoint
+	}
 	if !l.Timestamp.IsZero() {
+		if d.First.IsZero() {
+			d.First = l.Timestamp
+		}
 		d.Last = l.Timestamp
 	}
 	switch l.Type {
@@ -227,6 +319,7 @@ func extractClaude(d *Doc, line []byte, w *bufio.Writer) {
 		if json.Unmarshal(m.Content, &s) == nil {
 			if !strings.HasPrefix(s, "<") && !strings.HasPrefix(s, "[Request interrupted") {
 				writeRecord(w, l.Timestamp, "user", s)
+				d.prompt(s)
 			}
 			return
 		}
@@ -235,13 +328,19 @@ func extractClaude(d *Doc, line []byte, w *bufio.Writer) {
 			Text string `json:"text"`
 		}
 		_ = json.Unmarshal(m.Content, &blocks)
+		var typed []string
 		for _, b := range blocks {
 			if b.Type == "text" && !strings.HasPrefix(b.Text, "<") && !strings.HasPrefix(b.Text, "[Request interrupted") {
 				writeRecord(w, l.Timestamp, "user", b.Text)
+				typed = append(typed, b.Text)
 			}
+		}
+		if len(typed) > 0 {
+			d.prompt(strings.Join(typed, "\n"))
 		}
 	case "assistant":
 		var m struct {
+			Model   string `json:"model"`
 			Content []struct {
 				Type string `json:"type"`
 				Text string `json:"text"`
@@ -250,9 +349,15 @@ func extractClaude(d *Doc, line []byte, w *bufio.Writer) {
 		if json.Unmarshal(l.Message, &m) != nil {
 			return
 		}
+		if m.Model != "" && m.Model != "<synthetic>" {
+			d.Model = m.Model
+		}
 		for _, b := range m.Content {
 			if b.Type == "text" {
 				writeRecord(w, l.Timestamp, "assistant", b.Text)
+				if strings.TrimSpace(b.Text) != "" {
+					d.LastMessage = tailText(strings.TrimSpace(b.Text), maxMessage)
+				}
 			}
 		}
 	}
@@ -268,6 +373,9 @@ func extractAgy(d *Doc, line []byte, w *bufio.Writer) {
 		return
 	}
 	if !s.CreatedAt.IsZero() {
+		if d.First.IsZero() {
+			d.First = s.CreatedAt
+		}
 		d.Last = s.CreatedAt
 	}
 	var text string
@@ -285,8 +393,12 @@ func extractAgy(d *Doc, line []byte, w *bufio.Writer) {
 			d.Title = firstWords(text, 60)
 		}
 		writeRecord(w, s.CreatedAt, "user", text)
+		d.prompt(text)
 	case "PLANNER_RESPONSE":
 		writeRecord(w, s.CreatedAt, "assistant", text)
+		if strings.TrimSpace(text) != "" {
+			d.LastMessage = tailText(strings.TrimSpace(text), maxMessage)
+		}
 	}
 }
 
@@ -300,6 +412,38 @@ func firstWords(s string, n int) string {
 		s = s[:len(s)-1]
 	}
 	return s + "…"
+}
+
+// Docs returns every cataloged conversation (print-mode runs excluded),
+// newest first. Call Update first to bring the catalog up to date.
+func (ix Index) Docs() ([]Doc, error) {
+	ents, err := os.ReadDir(ix.TextDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var out []Doc
+	for _, e := range ents {
+		n := e.Name()
+		if !strings.HasSuffix(n, ".json") || strings.HasPrefix(n, ".") {
+			continue
+		}
+		var d Doc
+		b, err := os.ReadFile(filepath.Join(ix.TextDir, n))
+		if err != nil || json.Unmarshal(b, &d) != nil || d.Version != Version || d.PrintMode() {
+			continue
+		}
+		out = append(out, d)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].Last.Equal(out[j].Last) {
+			return out[i].Last.After(out[j].Last)
+		}
+		return out[i].Key() < out[j].Key()
+	})
+	return out, nil
 }
 
 // Query matches messages containing every term (case-insensitive).

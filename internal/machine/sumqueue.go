@@ -2,13 +2,17 @@ package machine
 
 import (
 	"time"
+
+	"cccp/internal/model"
 )
 
 // summaryJob asks for a one-line summary of one session's input.
 type summaryJob struct {
-	key   string
-	hash  string
-	input string
+	key     string
+	hash    string
+	input   string
+	profile model.Profile // the Claude profile to run under
+	prompt  string        // the system prompt
 }
 
 // Summary scheduling policy.

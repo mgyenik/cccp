@@ -8,16 +8,17 @@ import (
 	"time"
 
 	"cccp/internal/agydb"
+	"cccp/internal/catalog"
 	"cccp/internal/claudereg"
 	"cccp/internal/config"
 	"cccp/internal/core"
 	"cccp/internal/gather"
 	"cccp/internal/ipc"
 	"cccp/internal/memfile"
+	"cccp/internal/model"
 	"cccp/internal/paths"
 	"cccp/internal/power"
 	"cccp/internal/procs"
-	"cccp/internal/search"
 	"cccp/internal/store"
 	"cccp/internal/tmux"
 	"cccp/internal/transcript"
@@ -78,7 +79,9 @@ func (a *app) config() config.Config {
 	return c
 }
 
-func (a *app) memoryFile() memfile.File { return memfile.File{Path: a.l.MemoryFile} }
+func (a *app) memoryFile() memfile.File {
+	return memfile.File{Path: a.l.MemoryFile, SummariesPath: a.l.SummariesFile}
+}
 
 func (a *app) memory() core.Memory {
 	m, err := a.memoryFile().Load()
@@ -88,39 +91,78 @@ func (a *app) memory() core.Memory {
 	return m
 }
 
-func (a *app) searchIndex() search.Index {
-	return search.Index{TextDir: a.l.TextDir, ClaudeProjectsDir: a.l.ClaudeProjectsDir, AgyBrainDir: a.l.AgyBrainDir}
+// catalog is the conversation catalog and text index over the given
+// profiles' transcripts (and agy's).
+func (a *app) catalog(profiles []model.Profile) catalog.Index {
+	ix := catalog.Index{TextDir: a.l.TextDir, AgyBrainDir: a.l.AgyBrainDir}
+	for _, p := range profiles {
+		ix.ClaudeConfigDirs = append(ix.ClaudeConfigDirs, p.Dir)
+	}
+	return ix
+}
+
+// indexer adapts the catalog to the daemon's Indexer port: the profiles
+// are the daemon's current ones at each run.
+type indexer struct{ base catalog.Index }
+
+func (ix indexer) Update(configDirs []string) error {
+	c := ix.base
+	c.ClaudeConfigDirs = configDirs
+	_, err := c.Update()
+	return err
+}
+
+// updateCatalog brings the catalog up to date for an in-process snapshot
+// (no daemon to do it) and rereads it into g. A failure is a warning: the
+// live sessions do not depend on it.
+func (a *app) updateCatalog(g *gather.Gatherer) {
+	if _, err := a.catalog(g.Profiles()).Update(); err != nil {
+		a.warn("conversation catalog: %v", err)
+	}
+	g.RefreshCatalog()
 }
 
 // gatherer wires the real sources.
-func (a *app) gatherer() *gather.Gatherer {
+func (a *app) gatherer(cfg config.Config) *gather.Gatherer {
 	host, _ := os.Hostname()
 	return gather.New(gather.Deps{
-		Hooks:       a.store,
-		Registry:    claudereg.Dir{Path: a.l.ClaudeRegistryDir},
-		Tmux:        a.tmux,
-		Procs:       procs.System{},
-		Transcripts: transcript.NewReader(),
-		Files: gather.DiskFiles{
-			ClaudeProjectsDir: a.l.ClaudeProjectsDir,
-			AgyBrainDir:       a.l.AgyBrainDir,
-			ProjectDir:        a.l.ClaudeProjectDir,
-		},
-		AgyDB:    agydb.NewCache(a.l.AgySummariesDB),
-		Power:    power.System{},
-		Hostname: host,
+		Hooks:            a.store,
+		Registry:         claudereg.Reader{},
+		Tmux:             a.tmux,
+		Procs:            procs.System{},
+		Transcripts:      transcript.NewReader(),
+		Files:            gather.DiskFiles{Home: a.l.Home, AgyBrainDir: a.l.AgyBrainDir},
+		Catalog:          a.catalog(nil), // reading the catalog needs no transcript directories
+		AgyDB:            agydb.NewCache(a.l.AgySummariesDB),
+		Power:            power.System{},
+		Hostname:         host,
+		Home:             a.l.Home,
+		DefaultClaudeDir: a.l.DefaultClaudeDir,
+		Configured:       cfg.Profiles,
 	})
+}
+
+// profiles resolves every Claude profile: configured, and discovered from
+// ~/.claude* directories, hook state and running sessions.
+func (a *app) profiles(cfg config.Config) []model.Profile {
+	g := a.gatherer(cfg)
+	g.Reload()
+	g.RefreshTmux()
+	g.Discover()
+	return g.Profiles()
 }
 
 // localSnapshot computes a snapshot in-process (no daemon). Memory is read,
 // never written: seen marks are the daemon's to keep.
 func (a *app) localSnapshot() core.Snapshot {
-	g := a.gatherer()
+	cfg := a.config()
+	g := a.gatherer(cfg)
 	g.Reload()
 	g.RefreshTmux()
 	g.Discover()
+	a.updateCatalog(g)
 	now := time.Now()
-	snap, _ := core.Compute(g.Observe(now), a.memory(), a.config(), now, now)
+	snap, _ := core.Compute(g.Observe(now), a.memory(), cfg, now, now)
 	return snap
 }
 

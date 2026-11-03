@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -40,14 +41,35 @@ func runDoctor(a *app, args []string) error {
 	} else {
 		check("daemon", false, "not reachable on "+l.Socket+": systemctl --user status cccp")
 	}
-	if out, err := (execRunner{}).Run("systemctl", "--user", "is-active", "cccp.service"); err == nil {
+	if out, err := (execRunner{}).Run(nil, "systemctl", "--user", "is-active", "cccp.service"); err == nil {
 		check("systemd unit", true, out)
 	} else {
 		check("systemd unit", false, out)
 	}
 
-	plugins, _ := (execRunner{}).Run("claude", "plugin", "list")
-	check("claude plugin", strings.Contains(plugins, "cccp@cccp"), "cccp@cccp in `claude plugin list`")
+	// Each Claude profile: the plugin, and the account its sessions (and
+	// their summaries) use.
+	for _, p := range a.profiles(a.config()) {
+		env := p.Environ(os.Environ()) // the default profile: variable removed
+		plugins, _ := (execRunner{}).Run(env, "claude", "plugin", "list")
+		installed := strings.Contains(plugins, "cccp@cccp")
+		detail := p.Dir
+		if !installed {
+			detail += ": not installed (cccp install --only claude)"
+		}
+		check("plugin: "+p.Name, installed, detail)
+		out, _ := (execRunner{}).Run(env, "claude", "auth", "status", "--json")
+		var st struct {
+			LoggedIn         bool   `json:"loggedIn"`
+			Email            string `json:"email"`
+			OrgName          string `json:"orgName"`
+			SubscriptionType string `json:"subscriptionType"`
+		}
+		if json.Unmarshal([]byte(out), &st) == nil {
+			who := strings.TrimSpace(strings.Join(nonEmpty(st.Email, st.OrgName, st.SubscriptionType), " · "))
+			check("account: "+p.Name, st.LoggedIn, map[bool]string{true: who, false: "not logged in"}[st.LoggedIn])
+		}
+	}
 	if _, err := os.Stat(filepath.Join(l.AgyPluginDir, "hooks.json")); err == nil {
 		check("agy plugin", true, l.AgyPluginDir)
 	} else {

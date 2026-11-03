@@ -8,9 +8,9 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 
+	"cccp/internal/catalog"
 	"cccp/internal/core"
 	"cccp/internal/model"
-	"cccp/internal/search"
 )
 
 // --- fakes -----------------------------------------------------------------------
@@ -23,24 +23,30 @@ func (f *fakeSource) Daemon() bool              { return true }
 func (f *fakeSource) Close()                    {}
 
 type recorder struct {
-	jumped  []string
-	aliases map[string]string
-	seen    []string
-	fail    error
+	jumped     []string
+	aliases    map[string]string
+	seen       []string
+	summarized []string
+	fail       error
 }
 
 func (r *recorder) actions() Actions {
 	return Actions{
-		Jump:  func(s core.Session) error { r.jumped = append(r.jumped, s.Key); return r.fail },
-		Alias: func(k, v string) error { r.aliases[k] = v; return nil },
-		Seen:  func(k string) error { r.seen = append(r.seen, k); return nil },
+		Jump:      func(s core.Session) error { r.jumped = append(r.jumped, s.Key); return r.fail },
+		Alias:     func(k, v string) error { r.aliases[k] = v; return nil },
+		Seen:      func(k string) error { r.seen = append(r.seen, k); return nil },
+		Summarize: func(k string) error { r.summarized = append(r.summarized, k); return nil },
 	}
 }
 
-type fakeSearch struct{ hits []search.Hit }
+// fakeSearch answers every query with hits, recording the queries.
+type fakeSearch struct {
+	hits    []catalog.Hit
+	queries *[]string
+}
 
-func (f fakeSearch) Update() (int, error) { return 0, nil }
-func (f fakeSearch) Run(q search.Query, limit int) ([]search.Hit, error) {
+func (f fakeSearch) Run(q catalog.Query, limit int) ([]catalog.Hit, error) {
+	*f.queries = append(*f.queries, strings.Join(q.Terms, " "))
 	return f.hits, nil
 }
 
@@ -50,16 +56,27 @@ func snapshot() core.Snapshot {
 		{Key: "claude:b", Title: "Gain staging", Group: core.GroupYourTurn, Activity: model.Idle, Alive: true, Pane: "%2", Cwd: "/w/synth"},
 		{Key: "claude:c", Title: "Refactor parser", Group: core.GroupWorking, Activity: model.Working, Alive: true, Pane: "%3", Cwd: "/w/lang"},
 		{Key: "agy:d", Title: "Logger console", Group: core.GroupIdle, Activity: model.Idle, Alive: true, Pane: "%4", Cwd: "/w/logger"},
-		{Key: "claude:e", Title: "Old thing", Group: core.GroupEnded, Activity: model.Ended, Cwd: "/w/old"},
+		{Key: "claude:e", Title: "Old thing", Group: core.GroupClosed, Activity: model.Ended, Cwd: "/w/old", Turns: 12,
+			Model: "claude-opus-5"},
+		{Key: "claude:old1", Title: "Decoder work", Group: core.GroupClosed, Activity: model.Ended, Cwd: "/w/dsp",
+			Summary: "Built a soft-decision decoder.", FirstPrompt: "write a decoder for the radio"},
 	}}
 }
+
+var queries []string
 
 func newModel(t *testing.T) (*Model, *recorder, *fakeSource) {
 	t.Helper()
 	r := &recorder{aliases: map[string]string{}}
 	src := &fakeSource{}
-	m := New(Options{Source: src, Actions: r.actions(), Search: fakeSearch{hits: []search.Hit{
-		{Doc: search.Doc{Agent: model.Claude, SessionID: "old1", Title: "Viterbi", Cwd: "/w"}, Role: "user", Snippet: "explain viterbi"},
+	queries = nil
+	m := New(Options{Source: src, Actions: r.actions(), Search: fakeSearch{queries: &queries, hits: []catalog.Hit{
+		{Doc: catalog.Doc{Agent: model.Claude, SessionID: "old1", Title: "Decoder work"}, Role: "user", Snippet: "explain viterbi",
+			At: time.Now().Add(-time.Hour)},
+		{Doc: catalog.Doc{Agent: model.Claude, SessionID: "e", Title: "Old thing"}, Role: "assistant",
+			Snippet: "…a long preamble that a narrow column would show instead of the match, viterbi again",
+			At:      time.Now()},
+		{Doc: catalog.Doc{Agent: model.Claude, SessionID: "gone"}, Role: "user", Snippet: "viterbi, not in the list"},
 	}}})
 	m.Update(tea.WindowSizeMsg{Width: 160, Height: 40})
 	m.Update(snapMsg(snapshot()))
@@ -121,14 +138,30 @@ func selected(t *testing.T, m *Model) string {
 
 // --- tests -------------------------------------------------------------------------
 
-func TestEndedHiddenUntilToggled(t *testing.T) {
+func TestClosedShownUntilHidden(t *testing.T) {
 	m, _, _ := newModel(t)
-	if n := len(m.visible()); n != 4 {
+	if n := len(m.visible()); n != 6 {
 		t.Fatalf("visible %d", n)
 	}
+	if !strings.Contains(m.render(), "CLOSED") || !strings.Contains(m.render(), "12 turns") {
+		t.Fatal("closed group, or its turn count, not rendered")
+	}
+	for range 4 {
+		key(m, "j")
+	}
+	out := m.render()
+	if !strings.Contains(out, "12 turns · enter resumes it") || !strings.Contains(out, "claude-opus-5") ||
+		strings.Contains(out, "context") {
+		t.Fatal("closed preview: turns and resume hint, the model, no empty context size")
+	}
 	key(m, "e")
-	if n := len(m.visible()); n != 5 {
-		t.Fatalf("with ended: %d", n)
+	if n := len(m.visible()); n != 4 {
+		t.Fatalf("closed hidden: %d", n)
+	}
+	key(m, "/")
+	typeText(m, "old thing")
+	if v := m.visible(); len(v) != 1 || v[0].Key != "claude:e" {
+		t.Fatalf("search must find closed conversations even when hidden: %v", v)
 	}
 }
 
@@ -179,15 +212,121 @@ func TestFilter(t *testing.T) {
 	if v := m.visible(); len(v) != 1 || v[0].Key != "claude:b" {
 		t.Fatalf("filter: %v", v)
 	}
+	if strings.Contains(m.render(), "YOUR TURN") {
+		t.Fatal("search results are one flat list, without group headers")
+	}
 	key(m, "esc")
-	if len(m.visible()) != 4 || m.filter.Value() != "" {
+	if len(m.visible()) != 6 || m.filter.Value() != "" {
 		t.Fatal("esc should clear the filter")
 	}
-	// Filtering finds ended sessions too.
+	// The search finds closed conversations, by summary and first prompt.
+	key(m, "/")
+	typeText(m, "radio")
+	if v := m.visible(); len(v) != 1 || v[0].Key != "claude:old1" {
+		t.Fatalf("closed not found by its first prompt: %v", v)
+	}
+}
+
+func TestSearchRanksBestMatchFirst(t *testing.T) {
+	m, _, _ := newModel(t)
+	key(m, "/")
+	typeText(m, "de")
+	v := m.visible()
+	if len(v) < 2 || v[0].Key != "claude:old1" {
+		t.Fatalf("prefix match on the title should rank first: %v", keys(v))
+	}
+	// A scattered subsequence across long prose does not match.
+	key(m, "esc")
+	key(m, "/")
+	typeText(m, "wdftr")
+	if v := m.visible(); len(v) != 0 {
+		t.Fatalf("scattered match in prose: %v", keys(v))
+	}
+}
+
+func keys(ss []core.Session) []string {
+	var out []string
+	for _, s := range ss {
+		out = append(out, s.Key)
+	}
+	return out
+}
+
+// pause delivers the end of a typing pause, runs the text search it starts
+// and feeds the result back.
+func pause(m *Model) {
+	_, cmd := m.Update(contentTick{query: strings.TrimSpace(m.filter.Value())})
+	run(m, cmd)
+}
+
+func TestContentMatchesFollowMetadataMatches(t *testing.T) {
+	m, _, _ := newModel(t)
+	key(m, "/")
+	typeText(m, "viterbi")
+	if len(m.visible()) != 0 || len(queries) != 0 {
+		t.Fatal("no metadata match, and no text search before the pause")
+	}
+	pause(m)
+	if len(queries) != 1 || queries[0] != "viterbi" {
+		t.Fatalf("queries %v", queries)
+	}
+	// Both sessions found in their text, newest hit first; the hit for a
+	// conversation not in the list is dropped.
+	if v := keys(m.visible()); len(v) != 2 || v[0] != "claude:e" || v[1] != "claude:old1" {
+		t.Fatalf("content matches %v", v)
+	}
+	if !strings.Contains(m.render(), "“…match, viterbi again”") {
+		t.Fatal("the snippet, from just before the match, is the row's detail")
+	}
+	// A pause for a query that is no longer typed searches nothing.
+	typeText(m, "x")
+	_, cmd := m.Update(contentTick{query: "viterbi"})
+	run(m, cmd)
+	if len(queries) != 1 {
+		t.Fatalf("stale pause searched: %v", queries)
+	}
+	if v := m.visible(); len(v) != 0 {
+		t.Fatalf("the old query's content matches still apply: %v", keys(v))
+	}
+	// The current query's result, then a late one for the old query: the
+	// late one must not replace it.
+	m.Update(searchMsg{query: "viterbix", hits: []catalog.Hit{{Doc: catalog.Doc{Agent: model.Claude, SessionID: "c"}}}})
+	m.Update(searchMsg{query: "viterbi", hits: []catalog.Hit{{Doc: catalog.Doc{Agent: model.Claude, SessionID: "a"}}}})
+	if v := keys(m.visible()); len(v) != 1 || v[0] != "claude:c" {
+		t.Fatalf("a stale result replaced the current one: %v", v)
+	}
+}
+
+func TestContentMatchesDoNotRepeatMetadataMatches(t *testing.T) {
+	m, _, _ := newModel(t)
 	key(m, "/")
 	typeText(m, "old")
-	if v := m.visible(); len(v) != 1 || v[0].Key != "claude:e" {
-		t.Fatalf("ended not found by filter: %v", v)
+	pause(m)
+	v := keys(m.visible())
+	if len(v) != 2 || v[0] != "claude:e" || v[1] != "claude:old1" {
+		t.Fatalf("want the title match, then the other text match once: %v", v)
+	}
+}
+
+func TestSelectingAClosedConversationAsksForASummaryOnce(t *testing.T) {
+	m, r, _ := newModel(t)
+	move := func(k rune) {
+		_, cmd := m.Update(tea.KeyPressMsg{Code: k, Text: string(k)})
+		run(m, cmd)
+	}
+	for range 4 {
+		move('j')
+	}
+	if selected(t, m) != "claude:e" || len(r.summarized) != 1 {
+		t.Fatalf("selected %s, summarized %v", selected(t, m), r.summarized)
+	}
+	move('j') // old1 has a summary: nothing to ask
+	move('k') // back to e: already asked
+	move('j')
+	move('k')
+
+	if len(r.summarized) != 1 || r.summarized[0] != "claude:e" {
+		t.Fatalf("summarized %v", r.summarized)
 	}
 }
 
@@ -205,14 +344,13 @@ func TestAliasAndSeen(t *testing.T) {
 	}
 }
 
-func TestSearchOpensHit(t *testing.T) {
+func TestEnterOpensASearchResult(t *testing.T) {
 	m, r, _ := newModel(t)
-	key(m, "?")
+	key(m, "/")
 	typeText(m, "viterbi")
-	key(m, "enter")
-	if m.mode != modeSearchResults || len(m.hits) != 1 {
-		t.Fatalf("mode %v hits %d", m.mode, len(m.hits))
-	}
+	pause(m)
+	_, cmd := m.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+	run(m, cmd)
 	key(m, "enter")
 	if len(r.jumped) != 1 || r.jumped[0] != "claude:old1" {
 		t.Fatalf("jumped %v", r.jumped)
@@ -299,5 +437,23 @@ func TestLivePanePreview(t *testing.T) {
 	key(m, "p")
 	if len(panes.captured) != 0 {
 		t.Fatalf("conversation preview captured %v", panes.captured)
+	}
+}
+
+func TestProfileTagsAndFilter(t *testing.T) {
+	m, _, _ := newModel(t)
+	if strings.Contains(m.render(), "acmecorp") {
+		t.Fatal("no tags with a single profile")
+	}
+	snap := snapshot()
+	snap.Sessions[0].Profile, snap.Sessions[1].Profile, snap.Sessions[2].Profile = "acmecorp", "homelab", "homelab"
+	m.Update(snapMsg(snap))
+	if out := m.render(); !strings.Contains(out, "acmecorp") || !strings.Contains(out, "homelab") {
+		t.Fatal("profile tags not shown with several profiles")
+	}
+	key(m, "/")
+	typeText(m, "acmecorp")
+	if v := m.visible(); len(v) != 1 || v[0].Key != "claude:a" {
+		t.Fatalf("filter by profile: %v", v)
 	}
 }

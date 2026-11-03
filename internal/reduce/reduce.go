@@ -46,6 +46,7 @@ func mergeMeta(s *model.HookState, ev model.Event) {
 	if ev.PID != 0 {
 		s.PID, s.PIDStart = ev.PID, ev.PIDStart
 		s.PrintMode = ev.PrintMode
+		s.ConfigDir = ev.ConfigDir
 	}
 	if ev.Pane != "" {
 		s.Pane = ev.Pane

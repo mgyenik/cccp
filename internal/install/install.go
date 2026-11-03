@@ -17,14 +17,17 @@ import (
 	"sort"
 	"strings"
 
+	"cccp/internal/model"
 	"cccp/internal/paths"
 	"cccp/internal/store"
 	"cccp/internal/tmux"
 )
 
-// Runner runs an external command and returns its combined output.
+// Runner runs an external command and returns its combined output. env nil
+// inherits cccp's environment; otherwise env is the command's complete
+// environment (so a variable can be removed, not only set).
 type Runner interface {
-	Run(name string, args ...string) (string, error)
+	Run(env []string, name string, args ...string) (string, error)
 }
 
 // Tmux runs tmux commands (tmux.Client).
@@ -34,14 +37,20 @@ type Tmux interface {
 
 // Installer holds the installation's dependencies.
 type Installer struct {
-	L      paths.Layout
-	Assets fs.FS // the embedded integrations (cccp.Assets)
-	Cmd    Runner
-	Tmux   Tmux
-	Self   string // path of the running binary
-	Out    io.Writer
-	In     *bufio.Reader
-	Yes    bool // do every step without asking
+	L paths.Layout
+	// Profiles are the Claude profiles; the plugin is installed into each.
+	Profiles []model.Profile
+	Assets   fs.FS // the embedded integrations (cccp.Assets)
+	Cmd      Runner
+	// Environ is the environment claude commands start from (os.Environ()),
+	// with each profile then selected by model.Profile.Environ.
+	Environ []string
+
+	Tmux Tmux
+	Self string // path of the running binary
+	Out  io.Writer
+	In   *bufio.Reader
+	Yes  bool // do every step without asking
 }
 
 // Step names, in order.
@@ -74,17 +83,20 @@ func (i *Installer) confirm() bool {
 // Install runs the install steps (all of them when only is empty).
 func (i *Installer) Install(only map[string]bool) error {
 	l := i.L
-	steps := []step{
-		{StepBin, "copy this binary to " + l.BinPath, i.installBin},
-		{StepClaude, "install the Claude Code plugin (observe-only hooks) from a local marketplace at " + l.MarketplaceDir +
-			"\n    runs: claude plugin marketplace add …; claude plugin install cccp@cccp" +
-			"\n    takes effect in sessions started (or /reload-plugins'd) afterwards", i.installClaude},
-		{StepAgy, "install the agy plugin (observe-only hooks: SessionStart, PreInvocation, PostToolUse, Stop) to " + l.AgyPluginDir, i.installAgy},
-		{StepSystemd, "install and start the systemd user unit " + l.SystemdUnit, i.installSystemd},
-		{StepTmux, "add `" + SourceLine(l.TmuxSnippet) + "` to " + l.TmuxConf +
+	steps := []step{{StepBin, "copy this binary to " + l.BinPath, i.installBin}}
+	for _, p := range i.Profiles {
+		p := p
+		steps = append(steps, step{StepClaude, "install the Claude Code plugin (observe-only hooks) into the " + p.Name + " profile (" + p.Dir + ")" +
+			"\n    from the local marketplace at " + l.MarketplaceDir +
+			"\n    takes effect in sessions started (or /reload-plugins'd) afterwards", func() error { return i.installClaude(p) }})
+	}
+	steps = append(steps,
+		step{StepAgy, "install the agy plugin (observe-only hooks: SessionStart, PreInvocation, PostToolUse, Stop) to " + l.AgyPluginDir, i.installAgy},
+		step{StepSystemd, "install and start the systemd user unit " + l.SystemdUnit, i.installSystemd},
+		step{StepTmux, "add `" + SourceLine(l.TmuxSnippet) + "` to " + l.TmuxConf +
 			"\n    sets focus-events on, hooks [97], Shift+PgDn / Shift+PgUp, status-right and window-status formats" +
 			"\n    (current values are saved to " + l.TmuxRestore + " for uninstall)", i.installTmux},
-	}
+	)
 	for _, s := range steps {
 		if len(only) > 0 && !only[s.name] {
 			continue
@@ -109,9 +121,13 @@ func (i *Installer) Uninstall() error {
 	steps := []step{
 		{StepTmux, "remove the cccp line from " + l.TmuxConf + ", unset cccp's hooks and options and restore saved settings", i.uninstallTmux},
 		{StepSystemd, "stop, disable and remove the systemd user unit", i.uninstallSystemd},
-		{StepClaude, "uninstall the Claude Code plugin and remove the cccp marketplace", i.uninstallClaude},
-		{StepAgy, "remove " + l.AgyPluginDir, func() error { return os.RemoveAll(l.AgyPluginDir) }},
 	}
+	for _, p := range i.Profiles {
+		p := p
+		steps = append(steps, step{StepClaude, "uninstall the Claude Code plugin from the " + p.Name + " profile (" + p.Dir + ")", func() error { return i.uninstallClaude(p) }})
+	}
+	steps = append(steps, step{StepAgy, "remove " + l.AgyPluginDir, func() error { return os.RemoveAll(l.AgyPluginDir) }})
+	steps = append(steps, step{"marketplace", "remove the local marketplace " + l.MarketplaceDir, func() error { return os.RemoveAll(l.MarketplaceDir) }})
 	var failed []string
 	for _, s := range steps {
 		i.printf("\n[%s] %s\n", s.name, s.what)
@@ -192,24 +208,28 @@ func (i *Installer) installBin() error {
 	return os.Chmod(i.L.BinPath, 0o755)
 }
 
-func (i *Installer) installClaude() error {
+// claudeEnv is the complete environment for a claude command in profile p.
+func (i *Installer) claudeEnv(p model.Profile) []string { return p.Environ(i.Environ) }
+
+func (i *Installer) installClaude(p model.Profile) error {
 	mp := i.L.MarketplaceDir
+	env := i.claudeEnv(p)
 	if err := i.writeAsset(".claude-plugin/marketplace.json", filepath.Join(mp, ".claude-plugin", "marketplace.json"), 0o644); err != nil {
 		return err
 	}
 	if err := i.writeTree("integrations/claude-plugin", filepath.Join(mp, "integrations", "claude-plugin")); err != nil {
 		return err
 	}
-	list, err := i.Cmd.Run("claude", "plugin", "marketplace", "list")
+	list, err := i.Cmd.Run(env, "claude", "plugin", "marketplace", "list")
 	if err != nil {
 		return fmt.Errorf("claude plugin marketplace list: %v: %s", err, list)
 	}
 	if !strings.Contains(list, mp) {
-		if out, err := i.Cmd.Run("claude", "plugin", "marketplace", "add", mp); err != nil {
+		if out, err := i.Cmd.Run(env, "claude", "plugin", "marketplace", "add", mp); err != nil {
 			return fmt.Errorf("marketplace add: %v: %s", err, out)
 		}
 	}
-	plugins, err := i.Cmd.Run("claude", "plugin", "list")
+	plugins, err := i.Cmd.Run(env, "claude", "plugin", "list")
 	if err != nil {
 		return fmt.Errorf("claude plugin list: %v: %s", err, plugins)
 	}
@@ -217,7 +237,7 @@ func (i *Installer) installClaude() error {
 		i.printf("  plugin already installed; files updated in place\n")
 		return nil
 	}
-	if out, err := i.Cmd.Run("claude", "plugin", "install", "cccp@cccp"); err != nil {
+	if out, err := i.Cmd.Run(env, "claude", "plugin", "install", "cccp@cccp"); err != nil {
 		return fmt.Errorf("plugin install: %v: %s", err, out)
 	}
 	return nil
@@ -238,7 +258,7 @@ func (i *Installer) installSystemd() error {
 	}
 	// restart, not start: picks up a replaced binary on reinstall.
 	for _, args := range [][]string{{"daemon-reload"}, {"enable", "cccp.service"}, {"restart", "cccp.service"}} {
-		if out, err := i.Cmd.Run("systemctl", append([]string{"--user"}, args...)...); err != nil {
+		if out, err := i.Cmd.Run(nil, "systemctl", append([]string{"--user"}, args...)...); err != nil {
 			return fmt.Errorf("systemctl --user %s: %v: %s", strings.Join(args, " "), err, out)
 		}
 	}
@@ -437,34 +457,35 @@ func sortedKeys(m map[string]string) []string {
 }
 
 func (i *Installer) uninstallSystemd() error {
-	_, _ = i.Cmd.Run("systemctl", "--user", "disable", "--now", "cccp.service")
+	_, _ = i.Cmd.Run(nil, "systemctl", "--user", "disable", "--now", "cccp.service")
 	if err := os.Remove(i.L.SystemdUnit); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	_, _ = i.Cmd.Run("systemctl", "--user", "daemon-reload")
+	_, _ = i.Cmd.Run(nil, "systemctl", "--user", "daemon-reload")
 	return nil
 }
 
-func (i *Installer) uninstallClaude() error {
-	plugins, err := i.Cmd.Run("claude", "plugin", "list")
+func (i *Installer) uninstallClaude(p model.Profile) error {
+	env := i.claudeEnv(p)
+	plugins, err := i.Cmd.Run(env, "claude", "plugin", "list")
 	if err != nil {
 		return fmt.Errorf("claude plugin list: %v: %s", err, plugins)
 	}
 	if strings.Contains(plugins, "cccp@cccp") {
-		if out, err := i.Cmd.Run("claude", "plugin", "uninstall", "cccp@cccp"); err != nil {
+		if out, err := i.Cmd.Run(env, "claude", "plugin", "uninstall", "cccp@cccp"); err != nil {
 			return fmt.Errorf("plugin uninstall: %v: %s", err, out)
 		}
 	}
-	list, err := i.Cmd.Run("claude", "plugin", "marketplace", "list")
+	list, err := i.Cmd.Run(env, "claude", "plugin", "marketplace", "list")
 	if err != nil {
 		return fmt.Errorf("claude plugin marketplace list: %v: %s", err, list)
 	}
 	if strings.Contains(list, i.L.MarketplaceDir) {
-		if out, err := i.Cmd.Run("claude", "plugin", "marketplace", "remove", "cccp"); err != nil {
+		if out, err := i.Cmd.Run(env, "claude", "plugin", "marketplace", "remove", "cccp"); err != nil {
 			return fmt.Errorf("marketplace remove: %v: %s", err, out)
 		}
 	}
-	return os.RemoveAll(i.L.MarketplaceDir)
+	return nil
 }
 
 // ---- tmux.conf edits (pure) -----------------------------------------------------

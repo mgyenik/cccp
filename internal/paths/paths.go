@@ -14,21 +14,24 @@ type Layout struct {
 	Home string
 
 	// cccp's own state, cache and config.
-	StateDir     string // ~/.local/state/cccp
-	SessionsDir  string // hook-written session state files
-	MemoryFile   string // daemon memory (seen marks, aliases, summaries)
-	HookErrorLog string
-	CacheDir     string // ~/.cache/cccp
-	TextDir      string // extracted transcript text for search
-	ConfigFile   string
-	Socket       string
+	StateDir      string // ~/.local/state/cccp
+	SessionsDir   string // hook-written session state files
+	MemoryFile    string // daemon memory (seen marks, aliases)
+	SummariesFile string // generated summaries
+	HookErrorLog  string
+	CacheDir      string // ~/.cache/cccp
+	TextDir       string // extracted transcript text for search
+	ConfigFile    string
+	Socket        string
 	// TmuxSocket selects a tmux server; empty means tmux's default.
 	TmuxSocket string
 
-	// Claude Code.
-	ClaudeDir         string
-	ClaudeRegistryDir string
-	ClaudeProjectsDir string
+	// DefaultClaudeDir is Claude Code's configuration directory when
+	// CLAUDE_CONFIG_DIR is unset: the default profile. It is fixed (not
+	// taken from cccp's own environment), because a session that reports
+	// no CLAUDE_CONFIG_DIR is in exactly this directory. Other profiles are
+	// configured or discovered (package profile).
+	DefaultClaudeDir string
 
 	// Antigravity CLI.
 	AgyDir         string
@@ -51,13 +54,13 @@ type Layout struct {
 // resolves the same layout.
 var EnvVars = []string{
 	"CCCP_STATE_DIR", "CCCP_CACHE_DIR", "CCCP_SOCKET", "CCCP_TMUX_SOCKET",
-	"XDG_STATE_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_RUNTIME_DIR", "CLAUDE_CONFIG_DIR",
+	"XDG_STATE_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_RUNTIME_DIR",
 }
 
 // Resolve computes the layout from environment variables (getenv) and the
 // home directory. Overrides: CCCP_STATE_DIR, CCCP_CACHE_DIR, CCCP_SOCKET,
 // CCCP_TMUX_SOCKET, XDG_STATE_HOME, XDG_CACHE_HOME, XDG_CONFIG_HOME,
-// XDG_RUNTIME_DIR, CLAUDE_CONFIG_DIR.
+// XDG_RUNTIME_DIR.
 func Resolve(getenv func(string) string, home string, uid int) Layout {
 	xdg := func(env, fallback string) string {
 		if v := getenv(env); v != "" && filepath.IsAbs(v) {
@@ -75,6 +78,7 @@ func Resolve(getenv func(string) string, home string, uid int) Layout {
 	l.StateDir = or(getenv("CCCP_STATE_DIR"), filepath.Join(xdg("XDG_STATE_HOME", ".local/state"), "cccp"))
 	l.SessionsDir = filepath.Join(l.StateDir, "sessions")
 	l.MemoryFile = filepath.Join(l.StateDir, "daemon.json")
+	l.SummariesFile = filepath.Join(l.StateDir, "summaries.json")
 	l.HookErrorLog = filepath.Join(l.StateDir, "hook-errors.log")
 	l.CacheDir = or(getenv("CCCP_CACHE_DIR"), filepath.Join(xdg("XDG_CACHE_HOME", ".cache"), "cccp"))
 	l.TextDir = filepath.Join(l.CacheDir, "text")
@@ -89,9 +93,7 @@ func Resolve(getenv func(string) string, home string, uid int) Layout {
 	}
 	l.TmuxSocket = getenv("CCCP_TMUX_SOCKET")
 
-	l.ClaudeDir = or(getenv("CLAUDE_CONFIG_DIR"), filepath.Join(home, ".claude"))
-	l.ClaudeRegistryDir = filepath.Join(l.ClaudeDir, "sessions")
-	l.ClaudeProjectsDir = filepath.Join(l.ClaudeDir, "projects")
+	l.DefaultClaudeDir = filepath.Join(home, ".claude")
 
 	l.AgyDir = filepath.Join(home, ".gemini", "antigravity-cli")
 	l.AgySummariesDB = filepath.Join(l.AgyDir, "conversation_summaries.db")
@@ -115,9 +117,9 @@ var slugRe = regexp.MustCompile(`[^A-Za-z0-9]`)
 // non-alphanumeric byte becomes '-'.
 func ProjectSlug(cwd string) string { return slugRe.ReplaceAllString(cwd, "-") }
 
-// ClaudeProjectDir is the transcript directory for cwd.
-func (l Layout) ClaudeProjectDir(cwd string) string {
-	return filepath.Join(l.ClaudeProjectsDir, ProjectSlug(cwd))
+// ClaudeProjectDir is the transcript directory for cwd in a Claude profile.
+func ClaudeProjectDir(configDir, cwd string) string {
+	return filepath.Join(configDir, "projects", ProjectSlug(cwd))
 }
 
 // AgyTranscript is an agy conversation's full transcript.

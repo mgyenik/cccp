@@ -78,6 +78,11 @@ func Handle(d Deps, agent model.Agent, r io.Reader, now time.Time) error {
 	}
 	ev.Time = now
 	ev.Pane = d.Getenv("TMUX_PANE")
+	if agent == model.Claude {
+		// The hook inherits the agent's environment: this names the
+		// session's profile ("" = the default, ~/.claude).
+		ev.ConfigDir = d.Getenv("CLAUDE_CONFIG_DIR")
+	}
 	if a, ok := d.FindAgent(agent); ok {
 		ev.PID, ev.PIDStart = a.PID, a.Start
 		ev.PrintMode = model.IsPrintMode(a.Cmdline)

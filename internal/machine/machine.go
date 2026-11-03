@@ -19,6 +19,7 @@ import (
 
 	"cccp/internal/config"
 	"cccp/internal/core"
+	"cccp/internal/model"
 	"cccp/internal/present"
 )
 
@@ -74,17 +75,24 @@ type ConfigChanged struct {
 // next snapshot.
 type TmuxFailed struct{}
 
+// RequestSummary: the user selected a closed conversation without a summary.
+type RequestSummary struct {
+	Key string
+	At  time.Time
+}
+
 // Stop: the daemon is shutting down.
 type Stop struct{ At time.Time }
 
-func (Observed) isInput()      {}
-func (TimerFired) isInput()    {}
-func (SummaryDone) isInput()   {}
-func (MarkSeen) isInput()      {}
-func (SetAlias) isInput()      {}
-func (ConfigChanged) isInput() {}
-func (TmuxFailed) isInput()    {}
-func (Stop) isInput()          {}
+func (Observed) isInput()       {}
+func (TimerFired) isInput()     {}
+func (SummaryDone) isInput()    {}
+func (MarkSeen) isInput()       {}
+func (SetAlias) isInput()       {}
+func (ConfigChanged) isInput()  {}
+func (TmuxFailed) isInput()     {}
+func (RequestSummary) isInput() {}
+func (Stop) isInput()           {}
 
 // ---- effects ----------------------------------------------------------------
 
@@ -107,8 +115,13 @@ type Notify struct {
 }
 
 // StartSummary: generate a summary; report back with SummaryDone.
+// Profile is the Claude profile to run it under: the session's own, so
+// the summary is billed to, and the session's text only ever sent through,
+// that session's account.
 type StartSummary struct {
 	Key, Hash, Input, Model string
+	Profile                 model.Profile
+	SystemPrompt            string
 }
 
 // SaveMemory: persist memory.
@@ -157,6 +170,8 @@ type Machine struct {
 	notified map[string]string
 
 	sum *sumQueue
+	// requested: closed conversations the user asked to summarise.
+	requested map[string]bool
 
 	dirty     bool
 	saveDue   time.Time
@@ -173,6 +188,7 @@ func New(cfg config.Config, mem core.Memory, start time.Time) *Machine {
 		watchStart: start,
 		windows:    map[string]string{},
 		sum:        newSumQueue(),
+		requested:  map[string]bool{},
 	}
 }
 
@@ -218,6 +234,9 @@ func (m *Machine) Step(in Input) []Effect {
 	case TmuxFailed:
 		m.tmuxOK = false
 		return nil
+	case RequestSummary:
+		m.requested[in.Key] = true
+		return m.recompute(in.At)
 	case Stop:
 		return m.stop()
 	}
@@ -242,6 +261,12 @@ func (m *Machine) recompute(now time.Time) []Effect {
 	snap.FromDaemon = true
 	m.setMem(mem, now)
 	hadPrev := m.have
+	wasAlive := map[string]bool{}
+	for _, s := range m.snap.Sessions {
+		if s.Alive {
+			wasAlive[s.Key] = true
+		}
+	}
 	m.snap, m.have = snap, true
 
 	var effs []Effect
@@ -251,7 +276,7 @@ func (m *Machine) recompute(now time.Time) []Effect {
 	} else {
 		m.prime(snap)
 	}
-	effs = append(effs, m.summaries(snap, now)...)
+	effs = append(effs, m.summaries(snap, wasAlive, now)...)
 	effs = append(effs, Publish{Snapshot: snap})
 	effs = append(effs, m.prune(snap, now)...)
 	if m.dirty && !now.Before(m.saveDue) {
@@ -336,7 +361,7 @@ func (m *Machine) notify(snap core.Snapshot) []Effect {
 		if !m.cfg.Notify || len(m.cfg.NotifyCommand) == 0 || s.Visible {
 			continue
 		}
-		title, body := notificationText(s)
+		title, body := notificationText(s, len(m.obs.Profiles) > 1)
 		argv := append(append([]string{}, m.cfg.NotifyCommand...), title, body)
 		effs = append(effs,
 			Log{Msg: fmt.Sprintf("notify %s (%s, %s): %s", s.Key, s.Group, orDash(s.Location), title)},
@@ -350,8 +375,8 @@ func (m *Machine) notify(snap core.Snapshot) []Effect {
 	return effs
 }
 
-func notificationText(s core.Session) (title, body string) {
-	title = "cccp: " + s.Group.String() + " — " + s.DisplayTitle()
+func notificationText(s core.Session, showProfile bool) (title, body string) {
+	title = "cccp: " + s.Group.String() + " — " + present.TitleWithProfile(s, showProfile)
 	body = present.Detail(s)
 	if s.Inferred {
 		body = "(inferred) " + body
@@ -371,7 +396,36 @@ func orDash(s string) string {
 
 // ---- summaries --------------------------------------------------------------------
 
-// summaryInput builds the summarizer prompt and its hash for a session.
+// Summary system prompts: for a session that needs you, and for a closed
+// conversation.
+const (
+	LiveSummaryPrompt = "You write one-line status lines for a dashboard of coding-agent sessions. " +
+		"Given a session's title, the user's last prompt and the assistant's last message, say in one line " +
+		"under 90 characters what the session needs from the user next (a decision, an answer, a review, " +
+		"or nothing). No preamble, no quotes, no trailing period."
+	ClosedSummaryPrompt = "You write one-line descriptions for a list of past coding-agent conversations. " +
+		"Given a conversation's title, the user's first and last prompts and the assistant's last message, " +
+		"say in one line under 90 characters what the conversation was about and where it left off. " +
+		"No preamble, no quotes, no trailing period."
+)
+
+func hashOf(s string) string {
+	h := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(h[:8])
+}
+
+// closedSummaryInput builds the summarizer input for a closed conversation.
+func closedSummaryInput(s core.Session) (input, hash string) {
+	var b strings.Builder
+	b.WriteString("Conversation title: " + s.DisplayTitle() + "\n")
+	b.WriteString("User's first prompt:\n" + tail(s.FirstPrompt, 1200) + "\n")
+	b.WriteString("User's last prompt:\n" + tail(s.LastPrompt, 1200) + "\n")
+	b.WriteString("Assistant's last message (end):\n" + tail(s.LastMessage, 2000) + "\n")
+	input = b.String()
+	return input, hashOf("closed\n" + input)
+}
+
+// summaryInput builds the summarizer input and its hash for a session.
 func summaryInput(s core.Session) (input, hash string) {
 	var b strings.Builder
 	b.WriteString("Session title: " + s.DisplayTitle() + "\n")
@@ -384,8 +438,7 @@ func summaryInput(s core.Session) (input, hash string) {
 	b.WriteString("User's last prompt:\n" + tail(s.LastPrompt, 1500) + "\n")
 	b.WriteString("Assistant's last message (end):\n" + tail(s.LastMessage, 2500) + "\n")
 	input = b.String()
-	h := sha256.Sum256([]byte(input))
-	return input, hex.EncodeToString(h[:8])
+	return input, hashOf(input)
 }
 
 func tail(s string, n int) string {
@@ -399,9 +452,23 @@ func tail(s string, n int) string {
 	return "…" + s[cut:]
 }
 
-// summariesAllowed applies the configured policy to the power state.
-func (m *Machine) summariesAllowed(onBattery bool) bool {
-	switch m.cfg.Summaries {
+// summaryProfile is the profile a session's summary runs under: its own,
+// or (for agy sessions, which have none) the default profile.
+func (m *Machine) summaryProfile(s core.Session) (model.Profile, bool) {
+	for _, p := range m.obs.Profiles {
+		if (s.ConfigDir != "" && p.Dir == s.ConfigDir) || (s.ConfigDir == "" && p.Default) {
+			return p, true
+		}
+	}
+	return model.Profile{}, false
+}
+
+// summariesAllowed applies a policy ("" = the global one) to the power state.
+func (m *Machine) summariesAllowed(policy string, onBattery bool) bool {
+	if policy == "" {
+		policy = m.cfg.Summaries
+	}
+	switch policy {
 	case "always":
 		return true
 	case "ac":
@@ -410,19 +477,36 @@ func (m *Machine) summariesAllowed(onBattery bool) bool {
 	return false
 }
 
-func (m *Machine) summaries(snap core.Snapshot, now time.Time) []Effect {
-	if !m.summariesAllowed(snap.OnBattery) {
-		return nil
-	}
+// summaries offers summary jobs: for sessions that need you, and for closed
+// conversations that just closed (wasAlive) or that the user asked about.
+func (m *Machine) summaries(snap core.Snapshot, wasAlive map[string]bool, now time.Time) []Effect {
 	for _, s := range snap.Sessions {
-		if !s.NeedsAttention() || !s.Alive || (s.LastMessage == "" && s.Question == "") {
+		var in, hash, prompt string
+		switch {
+		case s.Alive && s.NeedsAttention() && (s.LastMessage != "" || s.Question != ""):
+			in, hash = summaryInput(s)
+			prompt = LiveSummaryPrompt
+		case s.Group == core.GroupClosed && (wasAlive[s.Key] || m.requested[s.Key]):
+			delete(m.requested, s.Key)
+			if s.FirstPrompt == "" && s.LastMessage == "" {
+				continue // nothing to summarise
+			}
+			in, hash = closedSummaryInput(s)
+			prompt = ClosedSummaryPrompt
+		default:
 			continue
 		}
-		in, hash := summaryInput(s)
+		prof, ok := m.summaryProfile(s)
+		if !ok || !m.summariesAllowed(prof.Summaries, snap.OnBattery) {
+			continue // no known profile to run under, or not allowed
+		}
 		if rec, ok := m.mem.Summaries[s.Key]; ok && rec.InputHash == hash {
 			continue
 		}
-		m.sum.offer(summaryJob{key: s.Key, hash: hash, input: in}, now)
+		m.sum.offer(summaryJob{key: s.Key, hash: hash, input: in, profile: prof, prompt: prompt}, now)
+	}
+	for k := range m.requested {
+		delete(m.requested, k) // requests for keys not in the snapshot
 	}
 	m.sum.forget(core.Keys(snap))
 	return m.startSummary(now)
@@ -433,7 +517,8 @@ func (m *Machine) startSummary(now time.Time) []Effect {
 	if !ok {
 		return nil
 	}
-	return []Effect{StartSummary{Key: job.key, Hash: job.hash, Input: job.input, Model: m.cfg.SummaryModel}}
+	return []Effect{StartSummary{Key: job.key, Hash: job.hash, Input: job.input, Model: m.cfg.SummaryModel,
+		Profile: job.profile, SystemPrompt: job.prompt}}
 }
 
 func (m *Machine) summaryDone(in SummaryDone) []Effect {
