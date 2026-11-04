@@ -9,6 +9,7 @@
 package gather
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -45,6 +46,7 @@ type TmuxReader interface {
 	ListPanes() ([]tmux.Pane, error)
 	ListClients() ([]tmux.ClientInfo, error)
 	SocketPath() (string, error)
+	ServerIdentity() (pid int, start int64, err error)
 }
 
 // Procs reads process information.
@@ -275,7 +277,7 @@ func (g *Gatherer) RegistryFileChanged(path string) bool {
 func (g *Gatherer) RefreshTmux() {
 	panes, err := g.d.Tmux.ListPanes()
 	if err != nil {
-		g.tmux = core.TmuxView{Err: err.Error()}
+		g.tmux = core.TmuxView{Err: err.Error(), NoServer: errors.Is(err, tmux.ErrNoServer)}
 		return
 	}
 	clients, err := g.d.Tmux.ListClients()
@@ -283,7 +285,13 @@ func (g *Gatherer) RefreshTmux() {
 		clients = nil
 	}
 	sock, _ := g.d.Tmux.SocketPath() // "" if unknown: pane ids are then trusted
-	g.tmux = core.TmuxView{OK: true, Panes: panes, Clients: clients, Socket: sock}
+	view := core.TmuxView{OK: true, Panes: panes, Clients: clients, Socket: sock}
+	if len(panes) > 0 {
+		view.ServerPID, view.ServerStart = panes[0].ServerPID, panes[0].ServerStart
+	} else if pid, start, err := g.d.Tmux.ServerIdentity(); err == nil {
+		view.ServerPID, view.ServerStart = pid, start
+	}
+	g.tmux = view
 }
 
 type procKey struct {
@@ -305,6 +313,9 @@ func (g *Gatherer) registryTmux(e claudereg.Entry, seen map[procKey]string) stri
 	seen[k] = sock
 	return sock
 }
+
+// Tmux is the tmux view as of the last RefreshTmux.
+func (g *Gatherer) Tmux() core.TmuxView { return g.tmux }
 
 // Discover scans /proc for agent processes under the known panes. A Claude
 // process's CLAUDE_CONFIG_DIR names its profile; a new profile's registry is

@@ -1,6 +1,10 @@
 # Workstreams
 
-Status: design, 2026-11-04 (decisions settled the same day). Not built.
+Status: built 2026-11-04. Code: `internal/workstream` (the record, the
+forgetting rule, the restore plan), `internal/dirpick` and `internal/dirs`
+(the directory picker), `cmd/cccp/workstreams.go` (`cccp start`, `cccp
+resume-pane`, the cockpit's actions), `internal/ui/create.go` (the `w`
+flow).
 
 ## Goal
 
@@ -42,6 +46,14 @@ Tested on tmux 3.4 (isolated servers, an attached terminal driven by
 * A command chained after `attach` runs as the attaching client:
   `tmux attach -t beta \; run-shell -b '… #{client_name} …'` saw the new
   client's name and session.
+* With `exit-empty off` the server outlives its last session and still
+  answers `display-message -p '#{pid} #{start_time}'`; `list-panes -a`
+  then fails with "no current target", which means "no panes". With the
+  default (`on`) the server exits.
+* `select-layout` applies a layout recorded from another window: it ignores
+  the pane ids in the string, assigns panes in order, and resizes.
+* A per-pane user option (`set -p @cccp_resume …`) is readable in
+  `list-panes` formats; `#{automatic-rename}` is readable per window.
 
 ## Creating: `w` in the cockpit
 
@@ -69,9 +81,11 @@ Two steps, `Esc` going back one:
    * **Keys:** `↑↓` select; `Tab` copies the selection into the input with a
      trailing `/`, to append to it; `Enter` opens the selection.
    * **New directories:** when the input is a path that does not exist, the
-     first row is `+ create ~/git/newproj`; `Enter` on it creates it
-     (`mkdir -p`, 0755) and opens it. Creating is always that explicit row,
-     never a side effect of a typo matching nothing.
+     list ends with `+ create ~/git/newproj`; `Enter` on it creates it
+     (`mkdir -p`, 0755) and opens it. It comes *after* the matches, so
+     `Enter` on a near miss (`~/git/inf`) opens the match (`~/git/infra`)
+     instead of creating a directory; with no match it is the only row.
+     Creating is always that explicit row.
    * The default selection, with nothing typed, is `$HOME`.
 
 Then `tmux new-session -d -s NAME -c DIR`, the client switches to it, and
@@ -82,8 +96,13 @@ the cockpit closes.
 Closing a workstream is ordinary tmux: close its last window (or
 `kill-session`). The snippet sets `detach-on-destroy previous`, so the
 terminal goes back to the workstream you used before; closing the last one
-leaves tmux. (The installer saves and restores the previous value, like the
-other options.)
+leaves tmux. It also sets `exit-empty off`: otherwise tmux exits when its
+last session closes, which would look exactly like a shutdown (the server
+gone) and bring the workstream you just closed back at the next `cccp
+start`. With the server kept, closing the last workstream is "the same
+server, the session gone" like any other. (The installer saves both
+previous values and uninstall restores them; an upgrade saves an option the
+first time it sets it.)
 
 **Forgetting is decided by reconciliation, not by the hook.** Each recorded
 workstream names the server it was last seen on (pid, start time, socket).
@@ -145,11 +164,17 @@ The one command after a reboot (and harmless at any time):
    * `new-session -d -s NAME`, the windows in their order and names, each
      window's panes split, then `select-layout` with the recorded layout;
    * a shell pane: a shell in its directory;
-   * a conversation pane, **lazily**: a placeholder, `cccp resume-pane KEY`,
-     that prints `⏎ resume «title»` and on Enter `exec`s the resume command
-     `core.PlanJump` already builds (`claude --resume ID` with the profile
-     selected, in the directory; `agy --conversation=ID`). It costs nothing
-     until you go there, and becomes the conversation in the same pane.
+   * a conversation pane, **lazily**: a placeholder, `cccp resume-pane`,
+     that prints `⏎ resume «title»` and the exact command. On Enter it runs
+     the resume command `core.PlanJump` already builds (`claude --resume ID`
+     with the profile selected, in the directory; `agy --conversation=ID`)
+     as its child; when that ends the pane becomes a shell in its directory,
+     as a pane where you had typed `claude` would. `Ctrl-D` or `Ctrl-C`
+     gives the shell straight away. `cccp start` marks the pane with the
+     conversation (the `@cccp_resume` option) as it creates it, so the
+     record keeps the conversation while the placeholder waits (a reboot
+     before you resume it loses nothing); the mark is cleared when the pane
+     becomes a shell, and a live session in the pane outranks it.
 2. **Attach and open the cockpit**:
    * outside tmux: `exec tmux attach -t LAST \; run-shell -b "cccp popup
      --client '#{client_name}'"`, LAST being the most recently used
@@ -160,10 +185,20 @@ The one command after a reboot (and harmless at any time):
 
 The daemon never starts tmux or restores anything by itself.
 
+`cccp start` restores into whatever tmux server is running, or a new one,
+started with your `~/.tmux.conf` (which sources cccp's snippet).
+
+Known limit: a server that dies sends no further event, so the daemon's
+snapshot (and the cockpit) shows its workstreams as running until the next
+tmux event. `cccp start` applies the rule against the actual server, so
+what it restores is right regardless.
+
 Caveats: resumed conversations start with a cold prompt cache; a turn that
 was running at shutdown resumes as interrupted.
 
 ## Tests
+
+As built, all passing; each rule's guard was mutated and the mutant caught:
 
 * Pure: record derivation from a snapshot; the forgetting rule as a state
   machine (same server and gone twice 10 s apart → forget; server gone →

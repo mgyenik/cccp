@@ -47,6 +47,10 @@ func main() {
 		err = runDoctor(a, args)
 	case "tmux-focus-since":
 		err = runTmuxFocusSince(a, args)
+	case "start":
+		err = runStart(a, args)
+	case "resume-pane":
+		err = runResumePane(a, args)
 
 	case "help", "-h", "--help":
 		usage()
@@ -84,6 +88,8 @@ usage:
   cccp doctor            check the installation
   cccp hook claude|agy   hook entry point (called by the agents)
     cccp notify tmux EVENT tmux hook entry point (called by tmux)
-  cccp tmux-focus-since  record when focus reporting started (called by cccp.tmux)
+    cccp tmux-focus-since  record when focus reporting started (called by cccp.tmux)
+  cccp start             restore the workstreams (after a reboot), attach, open the cockpit
+  cccp resume-pane       a restored conversation's placeholder (run by cccp start)
 `)
 }

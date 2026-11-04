@@ -13,12 +13,15 @@ import (
 
 	"cccp/internal/core"
 	"cccp/internal/store"
+	"cccp/internal/workstream"
 )
 
-// File is the memory at Path, with summaries at SummariesPath.
+// File is the memory at Path, with summaries at SummariesPath and the
+// workstream record at WorkstreamsPath.
 type File struct {
-	Path          string
-	SummariesPath string
+	Path            string
+	SummariesPath   string
+	WorkstreamsPath string
 }
 
 // legacy is the part of an older daemon.json that held summaries.
@@ -59,7 +62,32 @@ func (f File) Load() (core.Memory, error) {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		errs = append(errs, err)
 	}
+	if rec, err := f.LoadWorkstreams(); err != nil {
+		errs = append(errs, err)
+	} else {
+		m.Workstreams = rec
+	}
 	return m, errors.Join(errs...)
+}
+
+// LoadWorkstreams reads only the workstream record (for `cccp start`, which
+// needs nothing else); a missing file is an empty record.
+func (f File) LoadWorkstreams() (workstream.Record, error) {
+	var rec workstream.Record
+	if f.WorkstreamsPath == "" {
+		return rec, nil
+	}
+	b, err := os.ReadFile(f.WorkstreamsPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return rec, nil
+	}
+	if err != nil {
+		return rec, err
+	}
+	if err := json.Unmarshal(b, &rec); err != nil {
+		return workstream.Record{}, fmt.Errorf("%s: %w", f.WorkstreamsPath, err)
+	}
+	return rec, nil
 }
 
 // Save writes both files atomically.
@@ -78,5 +106,15 @@ func (f File) Save(m core.Memory) error {
 	if err != nil {
 		return err
 	}
-	return store.WriteAtomic(f.SummariesPath, b)
+	if err := store.WriteAtomic(f.SummariesPath, b); err != nil {
+		return err
+	}
+	if f.WorkstreamsPath == "" {
+		return nil
+	}
+	b, err = json.MarshalIndent(m.Workstreams, "", " ")
+	if err != nil {
+		return err
+	}
+	return store.WriteAtomic(f.WorkstreamsPath, b)
 }

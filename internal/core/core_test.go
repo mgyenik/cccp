@@ -8,6 +8,7 @@ import (
 
 	"cccp/internal/config"
 	"cccp/internal/model"
+	"cccp/internal/workstream"
 )
 
 // --- fixtures ----------------------------------------------------------------
@@ -1022,5 +1023,90 @@ func TestAHookWithoutAPidIsNotAliveInAnotherServersPane(t *testing.T) {
 		if s.Key == "claude:h" && s.Alive {
 			t.Fatal("liveness taken from an agent in a same-numbered pane of another server")
 		}
+	}
+}
+
+// --- workstreams --------------------------------------------------------------------
+
+func TestWorkstreamsAreRecordedWithWhatRunsInEachPane(t *testing.T) {
+	wsPane := func(id string, idx int, path string) model.TmuxPane {
+		p := pane(id, "@1", 1)
+		p.SessionID, p.PaneIndex, p.Path, p.WindowPanes = "$1", idx, path, 3
+		p.ServerPID, p.ServerStart, p.WindowLayout, p.WindowAutoName = 10, 100, "b25d,80x24,0,0,0", true
+		return p
+	}
+	placeholder := wsPane("%2", 1, "/w/old")
+	placeholder.Resume = workstream.EncodeTag(workstream.Conversation{Agent: model.Claude, SessionID: "old1", Title: "Earlier work"})
+	obs := Observation{
+		Tmux: TmuxView{OK: true, Socket: "/tmp/tmux-1000/default", ServerPID: 10, ServerStart: 100,
+			Panes: []model.TmuxPane{wsPane("%1", 0, "/w/live"), placeholder, wsPane("%3", 2, "/w/shell")}},
+		Profiles: []model.Profile{{Name: "work", Dir: "/h/.claude-work"}, {Name: "default", Dir: "/h/.claude", Default: true}},
+		Hooks: []HookRecord{hookRec("live1", 42, true, func(s *model.HookState) {
+			s.Activity, s.Pane, s.ConfigDir, s.Cwd = model.Idle, "%1", "/h/.claude-work", "/w/live"
+		})},
+	}
+	snap, mem := compute(obs, nil, at(1))
+	w, ok := snap.Workstreams.Find("s")
+	if !ok || len(w.Windows) != 1 || len(w.Windows[0].Panes) != 3 {
+		t.Fatalf("%+v", snap.Workstreams)
+	}
+	p := w.Windows[0].Panes
+	if p[0].Kind != workstream.KindConversation || p[0].Conv.SessionID != "live1" || p[0].Conv.ConfigDir != "/h/.claude-work" || p[0].Conv.DefaultProfile {
+		t.Fatalf("live conversation %+v", p[0])
+	}
+	if p[1].Kind != workstream.KindConversation || p[1].Conv.SessionID != "old1" || p[1].Conv.Title != "Earlier work" {
+		t.Fatalf("a placeholder keeps its conversation: %+v", p[1])
+	}
+	if p[2].Kind != workstream.KindShell || p[2].Cwd != "/w/shell" {
+		t.Fatalf("shell %+v", p[2])
+	}
+	if !mem.Workstreams.Equal(snap.Workstreams) {
+		t.Fatal("memory and snapshot disagree")
+	}
+	// The session closes; the server runs on (no panes left): pending, and
+	// the snapshot's deadline is when it is forgotten.
+	gone := Observation{Tmux: TmuxView{OK: true, Socket: "/tmp/tmux-1000/default", ServerPID: 10, ServerStart: 100}}
+	snap, mem = compute(gone, &mem, at(2))
+	if len(snap.Workstreams.Pending) != 1 || !NextDeadline(snap).Equal(at(2).Add(workstream.Grace)) {
+		t.Fatalf("pending %+v deadline %v", snap.Workstreams.Pending, NextDeadline(snap))
+	}
+	snap, _ = compute(gone, &mem, at(2).Add(workstream.Grace))
+	if len(snap.Workstreams.Workstreams) != 0 {
+		t.Fatalf("not forgotten: %+v", snap.Workstreams)
+	}
+}
+
+func TestWorkstreamsGoDormantWithoutAServer(t *testing.T) {
+	obs := Observation{Tmux: TmuxView{OK: true, ServerPID: 10, ServerStart: 100, Panes: []model.TmuxPane{
+		{ID: "%1", Session: "s", SessionID: "$1", WindowID: "@1", Path: "/w"}}}}
+	_, mem := compute(obs, nil, at(1))
+	snap, mem := compute(Observation{Tmux: TmuxView{NoServer: true, Err: "no server"}}, &mem, at(2))
+	if d := snap.Workstreams.Dormant(); len(d) != 1 || d[0].Name != "s" {
+		t.Fatalf("%+v", snap.Workstreams)
+	}
+	// A tmux failure (not "no server") concludes nothing.
+	snap, _ = compute(Observation{Tmux: TmuxView{Err: "timeout"}}, &mem, at(3))
+	if !snap.Workstreams.Equal(mem.Workstreams) {
+		t.Fatal("changed on a tmux failure")
+	}
+}
+
+// A placeholder that has been resumed keeps its mark while the conversation
+// runs; the live session is what is recorded.
+func TestALiveConversationOutranksAPlaceholderMark(t *testing.T) {
+	p := pane("%2", "@1", 1)
+	p.SessionID, p.ServerPID, p.ServerStart = "$1", 10, 100
+	p.Resume = workstream.EncodeTag(workstream.Conversation{Agent: model.Claude, SessionID: "old1", Title: "Old title"})
+	obs := Observation{
+		Tmux:     TmuxView{OK: true, ServerPID: 10, ServerStart: 100, Panes: []model.TmuxPane{p}},
+		Profiles: []model.Profile{{Name: "default", Dir: "/h/.claude", Default: true}},
+		Hooks: []HookRecord{hookRec("live2", 42, true, func(s *model.HookState) {
+			s.Activity, s.Pane = model.Idle, "%2"
+		})},
+	}
+	snap, _ := compute(obs, nil, at(1))
+	w, _ := snap.Workstreams.Find("s")
+	if c := w.Windows[0].Panes[0].Conv; c.SessionID != "live2" || !c.DefaultProfile {
+		t.Fatalf("%+v", c)
 	}
 }

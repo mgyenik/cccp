@@ -72,6 +72,7 @@ full tracking.
 | cockpit | `enter` | jump to the session; a closed conversation is resumed in a new window, in its own directory and profile |
 | cockpit | `tab` / `shift+tab` | next / previous session needing you |
 | cockpit | `/` | search everything, live and closed: names, projects, prompts and summaries match at once (fuzzy), conversation text after a pause in typing; `esc` clears |
+| cockpit | `w` | new workstream (a tmux session): type a name, then pick or type its directory (a new path is created); an existing name opens it |
 | cockpit | `a` | set an alias for the session |
 | cockpit | `m` | mark seen |
 | cockpit | `p` | preview: live pane → conversation → off |
@@ -79,11 +80,28 @@ full tracking.
 | cockpit | `r` | rescan everything |
 | shell | `cccp ls [--all] [--json]` | list sessions |
 | shell | `cccp search TERMS…` | search transcripts (`"quoted phrase"` supported) |
+| shell | `cccp start` | after a reboot: restore the workstreams, attach, open the cockpit |
 | shell | `cccp status` | one-line counts |
 | shell | `cccp jump --next` / `--back` / `cccp jump KEY` | jump from scripts |
 
 The status line shows the counts (`⚠1 ⏎2 ●3 ○6 ❄14`), and each window name is
 prefixed with the state of the most urgent session in it.
+
+### Workstreams
+
+A workstream is a tmux session; group your work however you like, one per
+project or task. Create them from the cockpit (`w`) or with plain `tmux new`,
+and use tmux as usual inside them. Closing a workstream's last window
+closes it (the terminal goes back to the workstream you used before; the
+last one leaves tmux), and cccp forgets it.
+
+cccp records every workstream's windows, pane layout, directories and
+conversations as they change. After a reboot, open a terminal and run
+`cccp start`: the workstreams come back, each conversation as a placeholder
+that resumes it (in its own profile) when you press Enter in it, and the
+terminal attaches to the one you used last with the cockpit open. Nothing
+starts by itself; a bare terminal stays bare. Design:
+[docs/workstreams.md](docs/workstreams.md).
 
 ### Notifications
 

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"cccp/internal/model"
+	"cccp/internal/workstream"
 )
 
 // Client talks to one tmux server.
@@ -87,18 +88,99 @@ var paneFormat = strings.Join([]string{
 	"#{window_name}", "#{pane_index}", "#{pane_title}", "#{pane_current_command}",
 	"#{pane_current_path}", "#{window_active}", "#{session_attached}",
 	"#{window_activity}", "#{window_panes}",
+	"#{session_id}", "#{session_activity}", "#{window_layout}", "#{automatic-rename}", "#{pane_active}",
+	"#{@cccp_resume}", "#{pid}", "#{start_time}",
 }, sep)
+
+// paneFields is the number of fields in paneFormat.
+const paneFields = 22
 
 // ListPanes returns every pane on the server.
 func (c *Client) ListPanes() ([]Pane, error) {
 	out, err := c.Run("list-panes", "-a", "-F", paneFormat)
 	if err != nil {
+		if strings.Contains(err.Error(), "no current target") {
+			// A running server with no session (exit-empty off): no panes.
+			return nil, nil
+		}
 		return nil, err
 	}
+	return ParsePanes(out), nil
+}
+
+// Bases returns base-index and pane-base-index (which decide a new window's
+// and pane's index), starting the server if none runs: the values come from
+// the user's tmux.conf, loaded when the server starts. One invocation, so
+// the server is up while asked even with exit-empty on.
+func (c *Client) Bases() (workstream.Bases, error) {
+	out, err := c.Run("start-server", ";", "show-options", "-gv", "base-index", ";", "show-options", "-gwv", "pane-base-index")
+	if err != nil {
+		return workstream.Bases{}, err
+	}
+	return ParseBases(out)
+}
+
+// ParseBases parses Bases' output: the two values, one per line.
+func ParseBases(out string) (workstream.Bases, error) {
+	f := strings.Fields(out)
+	if len(f) != 2 {
+		return workstream.Bases{}, fmt.Errorf("tmux base indexes: unexpected %q", out)
+	}
+	w, err1 := strconv.Atoi(f[0])
+	p, err2 := strconv.Atoi(f[1])
+	if err1 != nil || err2 != nil {
+		return workstream.Bases{}, fmt.Errorf("tmux base indexes: unexpected %q", out)
+	}
+	return workstream.Bases{Window: w, Pane: p}, nil
+}
+
+// Restore runs a restore plan (workstream.Plan), marking each placeholder
+// pane it creates with workstream.ResumeOption. A cosmetic command that
+// fails (a layout tmux rejects) is passed over; any other failure stops the
+// restore, as the rest of the plan targets what failed to appear.
+func (c *Client) Restore(cmds []workstream.Command) error {
+	for _, cmd := range cmds {
+		out, err := c.Run(cmd.Args...)
+		if err != nil {
+			if cmd.Cosmetic {
+				continue
+			}
+			return err
+		}
+		if cmd.MarkResume == "" {
+			continue
+		}
+		pane := strings.TrimSpace(out)
+		if !strings.HasPrefix(pane, "%") {
+			return fmt.Errorf("tmux %s: expected a pane id, got %q", cmd.Args[0], out)
+		}
+		if _, err := c.Run("set-option", "-p", "-t", pane, workstream.ResumeOption, cmd.MarkResume); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ServerIdentity is the server's pid and start time, which with the socket
+// identify it. list-panes carries them with every pane; this is for a server
+// with no panes.
+func (c *Client) ServerIdentity() (pid int, start int64, err error) {
+	out, err := c.Run("display-message", "-p", "#{pid}"+sep+"#{start_time}")
+	if err != nil {
+		return 0, 0, err
+	}
+	a, b, _ := strings.Cut(strings.TrimSpace(out), sep)
+	pid, _ = strconv.Atoi(a)
+	start, _ = strconv.ParseInt(b, 10, 64)
+	return pid, start, nil
+}
+
+// ParsePanes parses list-panes output in paneFormat.
+func ParsePanes(out string) []Pane {
 	var panes []Pane
 	for _, line := range strings.Split(strings.TrimRight(out, "\n"), "\n") {
 		f := strings.Split(line, sep)
-		if len(f) != 14 {
+		if len(f) != paneFields {
 			continue
 		}
 		p := Pane{
@@ -114,9 +196,14 @@ func (c *Client) ListPanes() ([]Pane, error) {
 			p.WindowActivity = time.Unix(ts, 0)
 		}
 		p.WindowPanes, _ = strconv.Atoi(f[13])
+		p.SessionID, p.SessionActivity = f[14], unixTime(f[15])
+		p.WindowActive, p.WindowLayout, p.WindowAutoName = f[10] == "1", f[16], f[17] == "1"
+		p.PaneActive, p.Resume = f[18] == "1", f[19]
+		p.ServerPID, _ = strconv.Atoi(f[20])
+		p.ServerStart, _ = strconv.ParseInt(f[21], 10, 64)
 		panes = append(panes, p)
 	}
-	return panes, nil
+	return panes
 }
 
 // FocusSinceOption records when the server started asking terminals for

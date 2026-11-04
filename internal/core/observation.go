@@ -71,6 +71,12 @@ type TmuxView struct {
 	// Socket identifies the server ("" if unknown); a pane id from a hook
 	// or the registry names a pane here only if it was recorded on it.
 	Socket string
+	// ServerPID and ServerStart, with Socket, identify the running server
+	// (zero if unknown).
+	ServerPID   int
+	ServerStart int64
+	// NoServer: no tmux server is running (as opposed to tmux failing).
+	NoServer bool
 }
 
 // AgentProc is an agent process found under a tmux pane.

@@ -4,9 +4,11 @@ import (
 	"bufio"
 	"encoding/json"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 
@@ -399,4 +401,52 @@ func TestUninstallForgetsFocusSince(t *testing.T) {
 		}
 	}
 	t.Fatalf("@cccp_focus_since left set: %v", tm.calls)
+}
+
+// The snippet sets exactly the hooks Hooks names (doctor counts them, and
+// uninstall unsets them by this list).
+func TestSnippetHooksMatchTheList(t *testing.T) {
+	b, err := fs.ReadFile(cccp.Assets, "integrations/tmux/cccp.tmux")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, line := range strings.Split(string(b), "\n") {
+		if f := strings.Fields(line); len(f) >= 3 && f[0] == "set-hook" && strings.HasSuffix(f[2], "[97]") {
+			got = append(got, strings.TrimSuffix(f[2], "[97]"))
+		}
+	}
+	want := append([]string(nil), Hooks...)
+	sort.Strings(got)
+	sort.Strings(want)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("snippet hooks %v\nHooks        %v", got, want)
+	}
+}
+
+// An upgrade that sets an option for the first time saves its value before
+// changing it, though the other options were saved by an earlier install.
+func TestUpgradeSavesNewlySetOptions(t *testing.T) {
+	in, _, tm, l := setup(t)
+	old := Saved{Options: map[string]string{"status-right": "it's #H"}, Keys: map[string]string{}}
+	b, _ := json.Marshal(old)
+	if err := os.MkdirAll(filepath.Dir(l.TmuxRestore), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(l.TmuxRestore, b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tm.options["exit-empty"], tm.options["detach-on-destroy"], tm.options["status-right"] = "on", "on", "cccp's own"
+	if err := in.Install(map[string]bool{"tmux": true}); err != nil {
+		t.Fatal(err)
+	}
+	var saved Saved
+	b, _ = os.ReadFile(l.TmuxRestore)
+	json.Unmarshal(b, &saved)
+	if saved.Options["exit-empty"] != "on" || saved.Options["detach-on-destroy"] != "on" {
+		t.Fatalf("new options not saved: %v", saved.Options)
+	}
+	if saved.Options["status-right"] != "it's #H" {
+		t.Fatalf("an option saved earlier was overwritten with the current value: %v", saved.Options)
+	}
 }

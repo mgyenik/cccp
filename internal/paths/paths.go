@@ -14,15 +14,17 @@ type Layout struct {
 	Home string
 
 	// cccp's own state, cache and config.
-	StateDir      string // ~/.local/state/cccp
-	SessionsDir   string // hook-written session state files
-	MemoryFile    string // daemon memory (seen marks, aliases)
-	SummariesFile string // generated summaries
-	HookErrorLog  string
-	CacheDir      string // ~/.cache/cccp
-	TextDir       string // extracted transcript text for search
-	ConfigFile    string
-	Socket        string
+	StateDir        string // ~/.local/state/cccp
+	SessionsDir     string // hook-written session state files
+	MemoryFile      string // daemon memory (seen marks, aliases)
+	SummariesFile   string // generated summaries
+	WorkstreamsFile string // the workstream record (docs/workstreams.md)
+
+	HookErrorLog string
+	CacheDir     string // ~/.cache/cccp
+	TextDir      string // extracted transcript text for search
+	ConfigFile   string
+	Socket       string
 	// TmuxSocket selects a tmux server; empty means tmux's default.
 	TmuxSocket string
 
@@ -79,6 +81,8 @@ func Resolve(getenv func(string) string, home string, uid int) Layout {
 	l.SessionsDir = filepath.Join(l.StateDir, "sessions")
 	l.MemoryFile = filepath.Join(l.StateDir, "daemon.json")
 	l.SummariesFile = filepath.Join(l.StateDir, "summaries.json")
+	l.WorkstreamsFile = filepath.Join(l.StateDir, "workstreams.json")
+
 	l.HookErrorLog = filepath.Join(l.StateDir, "hook-errors.log")
 	l.CacheDir = or(getenv("CCCP_CACHE_DIR"), filepath.Join(xdg("XDG_CACHE_HOME", ".cache"), "cccp"))
 	l.TextDir = filepath.Join(l.CacheDir, "text")

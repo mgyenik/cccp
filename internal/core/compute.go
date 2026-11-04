@@ -7,6 +7,7 @@ import (
 
 	"cccp/internal/config"
 	"cccp/internal/model"
+	"cccp/internal/workstream"
 )
 
 // Plan returns the transcripts Compute will need for obs. The shell calls it
@@ -45,7 +46,41 @@ func Compute(obs Observation, mem Memory, cfg config.Config, watchStart, now tim
 	if !c.mem.Initialized && len(c.id.builders) > 0 {
 		c.mem.Initialized = true
 	}
+	c.mem.Workstreams = workstream.Observe(c.mem.Workstreams, LiveWorkstreams(obs.Tmux, snap.Sessions), now)
+	snap.Workstreams = c.mem.Workstreams.Clone()
 	return snap, c.mem
+}
+
+// LiveWorkstreams is the running tmux server as the workstream record needs
+// it: each pane with the conversation it runs, if any (a live agent session
+// with a known id, which can be resumed, or a restore placeholder waiting
+// to resume one). sessions may be nil (only placeholders are then known).
+func LiveWorkstreams(t TmuxView, sessions []Session) workstream.Live {
+
+	l := workstream.Live{
+		OK:      t.OK || t.NoServer,
+		Running: t.OK,
+		Server:  workstream.Server{PID: t.ServerPID, Start: t.ServerStart, Socket: t.Socket},
+	}
+	inPane := map[string]*workstream.Conversation{}
+	for _, s := range sessions {
+		// Only a live session has a pane (classify), and only a known id
+		// can be resumed.
+		if s.Pane != "" && s.SessionID != "" {
+			inPane[s.Pane] = &workstream.Conversation{Agent: s.Agent, SessionID: s.SessionID,
+				ConfigDir: s.ConfigDir, DefaultProfile: s.DefaultProfile, Title: s.DisplayTitle()}
+		}
+	}
+	for _, p := range t.Panes {
+		lp := workstream.LivePane{Pane: p, Conv: inPane[p.ID]}
+		if lp.Conv == nil {
+			if c, ok := workstream.ParseTag(p.Resume); ok {
+				lp.Conv = c
+			}
+		}
+		l.Panes = append(l.Panes, lp)
+	}
+	return l
 }
 
 // visibleWindows lists windows shown on a tmux client whose terminal has
@@ -85,9 +120,10 @@ func (c *computation) noteRegistryTransitions() {
 }
 
 // NextDeadline is the earliest future time at which the snapshot would
-// change with no new observation (a prompt cache expiring), or zero.
+// change with no new observation (a prompt cache expiring, a closed
+// workstream due to be forgotten), or zero.
 func NextDeadline(s Snapshot) time.Time {
-	var t time.Time
+	t := s.Workstreams.Deadline() // a closed workstream to forget
 	for _, x := range s.Sessions {
 		if x.Group == GroupWorking || x.Group == GroupClosed || !x.Cache.Known {
 			continue

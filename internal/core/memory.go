@@ -3,6 +3,8 @@ package core
 import (
 	"maps"
 	"time"
+
+	"cccp/internal/workstream"
 )
 
 // SummaryRecord is a generated one-line summary and the input it was made from.
@@ -38,6 +40,9 @@ type Memory struct {
 	// RegLast is each registry session's previous status, for transition
 	// detection. Not persisted: after a restart there is no previous status.
 	RegLast map[string]RegStatus `json:"-"`
+	// Workstreams is the record of tmux sessions, for restoring them
+	// (persisted separately, memfile).
+	Workstreams workstream.Record `json:"-"`
 }
 
 // NewMemory returns empty memory.
@@ -60,6 +65,7 @@ func (m Memory) Clone() Memory {
 	maps.Copy(c.Summaries, m.Summaries)
 	maps.Copy(c.RegLast, m.RegLast)
 	c.Initialized = m.Initialized
+	c.Workstreams = m.Workstreams.Clone()
 	return c
 }
 
@@ -71,7 +77,8 @@ func (m Memory) Persisted(o Memory) bool {
 		maps.EqualFunc(m.RegCompletions, o.RegCompletions, time.Time.Equal) &&
 		maps.EqualFunc(m.Summaries, o.Summaries, func(a, b SummaryRecord) bool {
 			return a.InputHash == b.InputHash && a.Text == b.Text && a.At.Equal(b.At)
-		})
+		}) &&
+		m.Workstreams.Equal(o.Workstreams)
 }
 
 // Prune returns a copy without records for sessions not in keep. Aliases

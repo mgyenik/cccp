@@ -36,6 +36,19 @@ set-hook -g after-split-window[97]     'run-shell -b "$HOME/.local/bin/cccp noti
 set-hook -g pane-exited[97]            'run-shell -b "$HOME/.local/bin/cccp notify tmux pane-exited"'
 set-hook -g session-created[97]        'run-shell -b "$HOME/.local/bin/cccp notify tmux session-created"'
 set-hook -g session-closed[97]         'run-shell -b "$HOME/.local/bin/cccp notify tmux session-closed"'
+set-hook -g session-renamed[97]        'run-shell -b "$HOME/.local/bin/cccp notify tmux session-renamed"'
+set-hook -g window-renamed[97]         'run-shell -b "$HOME/.local/bin/cccp notify tmux window-renamed"'
+set-hook -g window-layout-changed[97]  'run-shell -b "$HOME/.local/bin/cccp notify tmux window-layout-changed"'
+
+# --- workstreams (docs/workstreams.md) -----------------------------------------
+# Closing a session's last window goes back to the session used before it,
+# instead of dropping out of tmux; closing the last one leaves tmux.
+set -g detach-on-destroy previous
+# The server stays up with no session left, so cccp can tell "you closed
+# your last workstream" (the same server, the session gone: forgotten) from
+# a shutdown (the server gone: kept, restored by `cccp start`).
+set -g exit-empty off
+
 
 # --- keys (root table: no prefix) --------------------------------------------
 # Shift+PgDn: jump to the most urgent session that needs you; press again to

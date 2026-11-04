@@ -267,7 +267,8 @@ func (i *Installer) installSystemd() error {
 
 // RestoredOptions are the tmux options cccp.tmux changes; their values from
 // before the install are saved so uninstall can put them back.
-var RestoredOptions = []string{"focus-events", "status-right", "status-right-length", "window-status-format", "window-status-current-format"}
+var RestoredOptions = []string{"focus-events", "status-right", "status-right-length", "window-status-format", "window-status-current-format",
+	"detach-on-destroy", "exit-empty"}
 
 // Key is a tmux key binding: a key table and a key.
 type Key struct{ Table, Key string }
@@ -290,7 +291,8 @@ func parseSavedKey(s string) Key {
 var Hooks = []string{
 	"client-session-changed", "session-window-changed", "window-pane-changed", "client-focus-in",
 	"client-focus-out", "client-attached", "client-detached", "after-new-window", "after-split-window",
-	"pane-exited", "session-created", "session-closed",
+	"pane-exited", "session-created", "session-closed", "session-renamed", "window-renamed",
+	"window-layout-changed",
 }
 
 // Saved is the tmux state cccp.tmux overrides. It is stored as data and
@@ -430,13 +432,19 @@ func (i *Installer) saveTmuxState() error {
 			saved.Keys = map[string]string{}
 		}
 	case errors.Is(err, os.ErrNotExist):
-		for _, o := range RestoredOptions {
-			if v, err := i.Tmux.Run("show-options", "-gv", o); err == nil {
-				saved.Options[o] = strings.TrimSuffix(v, "\n")
-			}
-		}
 	default:
 		return err
+	}
+	// Options are saved one by one, like keys: an option a newer version
+	// sets for the first time is saved before its first change, even when
+	// the others were saved by an earlier install.
+	for _, o := range RestoredOptions {
+		if _, ok := saved.Options[o]; ok {
+			continue
+		}
+		if v, err := i.Tmux.Run("show-options", "-gv", o); err == nil {
+			saved.Options[o] = strings.TrimSuffix(v, "\n")
+		}
 	}
 	want := map[string]bool{}
 	for _, k := range RestoredKeys {

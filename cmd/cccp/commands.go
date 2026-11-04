@@ -25,6 +25,7 @@ import (
 	"cccp/internal/catalog"
 	"cccp/internal/core"
 	"cccp/internal/daemon"
+	"cccp/internal/dirs"
 	"cccp/internal/hook"
 	"cccp/internal/install"
 	"cccp/internal/ipc"
@@ -435,10 +436,18 @@ func runUI(a *app, args []string) error {
 		return fmt.Errorf("%s need the daemon (systemctl --user start cccp)", what)
 	}
 	return ui.Run(ui.Options{
-		Source: src,
-		Panes:  a.tmux,
-		Search: a.catalog(nil), // only read: the daemon (or localSource) updates it
+		Source:     src,
+		Panes:      a.tmux,
+		Search:     a.catalog(nil), // only read: the daemon (or localSource) updates it
+		Dirs:       dirs.FS{},
+		Home:       a.l.Home,
+		Workstream: a.clientValue(*client, "#{session_name}"),
+
 		Actions: ui.Actions{
+			OpenWorkstream: func(name string) error { return a.openWorkstream(*client, name) },
+			NewWorkstream: func(name, dir string, create bool) error {
+				return a.newWorkstream(*client, name, dir, create)
+			},
 			Jump: func(s core.Session) error { return a.jump(*client, s) },
 			Alias: func(key, value string) error {
 				if !hasDaemon {

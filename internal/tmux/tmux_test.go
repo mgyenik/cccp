@@ -56,3 +56,31 @@ func TestParseClients(t *testing.T) {
 		}
 	}
 }
+
+func TestParsePanes(t *testing.T) {
+	line := strings.Join([]string{"%3", "123", "infra", "@2", "1", "claude", "0", "title", "claude", "/w/infra",
+		"1", "1", "1793690000", "2", "$4", "1793690100", "b25d,80x24,0,0,0", "1", "1",
+		`{"agent":"claude","session_id":"x"}`, "999", "1793000000"}, sep)
+	ps := ParsePanes(line + "\n" + "short" + sep + "line\n")
+	if len(ps) != 1 {
+		t.Fatalf("%d panes", len(ps))
+	}
+	p := ps[0]
+	if p.ID != "%3" || p.Session != "infra" || p.SessionID != "$4" || p.SessionActivity.Unix() != 1793690100 ||
+		!p.WindowActive || p.WindowLayout != "b25d,80x24,0,0,0" || !p.WindowAutoName || !p.PaneActive ||
+		p.Resume != `{"agent":"claude","session_id":"x"}` || p.ServerPID != 999 || p.ServerStart != 1793000000 ||
+		!p.Visible || p.WindowPanes != 2 {
+		t.Fatalf("%+v", p)
+	}
+}
+
+func TestParseBases(t *testing.T) {
+	if b, err := ParseBases("1\n0\n"); err != nil || b.Window != 1 || b.Pane != 0 {
+		t.Fatal(b, err)
+	}
+	for _, bad := range []string{"", "1\n", "a\nb\n", "1\n2\n3\n"} {
+		if _, err := ParseBases(bad); err == nil {
+			t.Errorf("%q parsed", bad)
+		}
+	}
+}

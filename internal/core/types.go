@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"cccp/internal/model"
+	"cccp/internal/workstream"
 )
 
 // Group is a display group, in priority order.
@@ -158,6 +159,8 @@ type Snapshot struct {
 	FromDaemon bool      `json:"from_daemon"`
 	TmuxOK     bool      `json:"tmux_ok"`
 	Problems   []string  `json:"problems,omitempty"`
+	// Workstreams: the tmux sessions, running and dormant (docs/workstreams.md).
+	Workstreams workstream.Record `json:"workstreams"`
 }
 
 // Counts returns the number of sessions per group.

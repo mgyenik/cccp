@@ -37,6 +37,11 @@ type Actions struct {
 	Seen  func(key string) error
 	// Summarize asks for a summary of a closed conversation (may be nil).
 	Summarize func(key string) error
+	// OpenWorkstream switches to a workstream, restoring it first if it is
+	// dormant; NewWorkstream creates one in dir (making dir if create) and
+	// switches to it. Either may be nil (no workstream support).
+	OpenWorkstream func(name string) error
+	NewWorkstream  func(name, dir string, create bool) error
 }
 
 // Searcher searches the conversation text (catalog.Index). The cockpit only
@@ -56,6 +61,11 @@ type Options struct {
 	Actions Actions
 	Panes   PaneCapturer // nil: no live preview
 	Search  Searcher     // nil: search disabled
+	Dirs    Dirs         // the directory picker's filesystem (nil: known directories only)
+	Home    string
+	// Workstream is the tmux session the cockpit's client is on ("" if
+	// unknown), shown in the header.
+	Workstream string
 }
 
 type mode int
@@ -64,6 +74,7 @@ const (
 	modeList mode = iota
 	modeFilter
 	modeAlias
+	modeCreate // the new-workstream flow (creator)
 )
 
 type snapMsg core.Snapshot
@@ -116,9 +127,12 @@ type Model struct {
 	previewKey  string
 	previewText string
 
-	status    string
-	statusAt  time.Time
-	quitting  bool
+	creator *creator // the new-workstream flow, in modeCreate
+
+	status   string
+	statusAt time.Time
+	quitting bool
+
 	selectKey string // keep the selection on the same session across updates
 }
 
@@ -303,6 +317,12 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.quitting = true
 		return m, tea.Quit
 
+	case walkedMsg:
+		if m.creator != nil {
+			m.creator.walked(msg.dirs)
+		}
+		return m, nil
+
 	case tea.KeyPressMsg:
 		return m.key(msg)
 	}
@@ -314,6 +334,12 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.filter, cmd = m.filter.Update(msg)
 	case modeAlias:
 		m.alias, cmd = m.alias.Update(msg)
+	case modeCreate:
+		if m.creator.step == stepName {
+			m.creator.name, cmd = m.creator.name.Update(msg)
+		} else {
+			m.creator.dir, cmd = m.creator.dir.Update(msg)
+		}
 	}
 	return m, cmd
 }
@@ -358,6 +384,16 @@ func (m *Model) key(k tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 	}
 	switch m.mode {
+	case modeCreate:
+		cmd, done, res := m.creator.update(k)
+		if !done {
+			return m, cmd
+		}
+		m.mode, m.creator = modeList, nil
+		if res == nil {
+			return m, cmd
+		}
+		return m, tea.Batch(cmd, m.workstreamAction(*res))
 	case modeFilter:
 		switch key {
 		case "esc":
@@ -472,8 +508,30 @@ func (m *Model) key(k tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.alias.CursorEnd()
 			return m, m.alias.Focus()
 		}
+	case "w":
+		if m.opt.Actions.NewWorkstream == nil {
+			m.setStatus("workstreams are not available here")
+			break
+		}
+		m.creator = newCreator(m.snap, m.opt.Home, m.opt.Dirs)
+		m.mode = modeCreate
+		return m, m.creator.focus()
 	}
 	return m, m.loadPreview()
+}
+
+// workstreamAction carries out the creator's decision; like a jump, the
+// cockpit closes when it succeeds.
+func (m *Model) workstreamAction(res Created) tea.Cmd {
+	if res.Open != "" {
+		open := m.opt.Actions.OpenWorkstream
+		if open == nil {
+			return nil
+		}
+		return func() tea.Msg { return doneMsg{err: open(res.Open)} }
+	}
+	newWS := m.opt.Actions.NewWorkstream
+	return func() tea.Msg { return doneMsg{err: newWS(res.Name, res.Dir, res.Create)} }
 }
 
 func (m *Model) nextAttention(dir int) {
@@ -635,7 +693,11 @@ func (m *Model) renderHeader() string {
 	if m.snap.OnBattery {
 		src += " · battery"
 	}
-	left := sTitle.Render("cccp") + "  " + strings.Join(parts, "  ")
+	left := sTitle.Render("cccp")
+	if m.opt.Workstream != "" {
+		left += " " + lipgloss.NewStyle().Foreground(cCyan).Render("["+m.opt.Workstream+"]")
+	}
+	left += "  " + strings.Join(parts, "  ")
 	right := sDim.Render(src)
 	gap := m.width - lipgloss.Width(left) - lipgloss.Width(right)
 	if gap < 1 {
@@ -651,6 +713,8 @@ func (m *Model) renderHeader() string {
 func (m *Model) renderFooter() string {
 	var line string
 	switch m.mode {
+	case modeCreate:
+		line = m.creator.input() + "  " + sKeyHint.Render(m.creator.hint())
 	case modeFilter:
 		line = m.filter.View() + "  " + sKeyHint.Render("enter open · ↑↓ move · esc clear")
 	case modeAlias:
@@ -660,7 +724,7 @@ func (m *Model) renderFooter() string {
 		if m.hideClosed {
 			closed = "e show closed"
 		}
-		hint := "enter open/resume · tab next needing you · / search · a alias · m seen · p preview · " + closed + " · r rescan · q quit"
+		hint := "enter open/resume · tab next needing you · / search · w workstream · a alias · m seen · p preview · " + closed + " · r rescan · q quit"
 		if f := m.filter.Value(); f != "" {
 			hint = "search: " + f + " · " + hint
 		}
@@ -673,6 +737,10 @@ func (m *Model) renderFooter() string {
 }
 
 func (m *Model) renderBody(h int) string {
+	if m.mode == modeCreate {
+		return m.creator.view(m.width, h)
+	}
+
 	sel, hasSel := m.selected()
 	pm := previewOff
 	if hasSel {

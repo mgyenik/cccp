@@ -68,6 +68,15 @@ type fakeTmux struct {
 	err    error
 	calls  int
 	socket string
+	// identity is the server's pid and start time, for a server with no panes.
+	identPID   int
+	identStart int64
+	identCalls int
+}
+
+func (f *fakeTmux) ServerIdentity() (int, int64, error) {
+	f.identCalls++
+	return f.identPID, f.identStart, nil
 }
 
 func (f *fakeTmux) ListPanes() ([]tmux.Pane, error) { f.calls++; return f.panes, f.err }
@@ -498,5 +507,27 @@ func TestTheTmuxServersAreRecorded(t *testing.T) {
 		if r.Entry.SessionID == "r2" && r.TmuxSocket != "/tmp/tmux-1000/default" {
 			t.Fatalf("stale server for a new process: %q", r.TmuxSocket)
 		}
+	}
+}
+
+func TestServerIdentity(t *testing.T) {
+	w := newWorld()
+	w.tmux.panes = []tmux.Pane{{ID: "%1", Session: "s", ServerPID: 7, ServerStart: 70}}
+	w.tmux.identPID, w.tmux.identStart = 9, 90
+	w.g.RefreshTmux()
+	obs := w.g.Observe(now)
+	if obs.Tmux.ServerPID != 7 || obs.Tmux.ServerStart != 70 || w.tmux.identCalls != 0 {
+		t.Fatalf("from the panes, with no extra command: %+v, %d calls", obs.Tmux, w.tmux.identCalls)
+	}
+	w.tmux.panes = nil // a server with no session (exit-empty off)
+	w.g.RefreshTmux()
+	obs = w.g.Observe(now)
+	if !obs.Tmux.OK || obs.Tmux.ServerPID != 9 || obs.Tmux.ServerStart != 90 {
+		t.Fatalf("empty server: %+v", obs.Tmux)
+	}
+	w.tmux.err = tmux.ErrNoServer
+	w.g.RefreshTmux()
+	if obs := w.g.Observe(now); obs.Tmux.OK || !obs.Tmux.NoServer {
+		t.Fatalf("no server: %+v", obs.Tmux)
 	}
 }

@@ -539,14 +539,24 @@ reading, and is reached only through interfaces.
    (50 concurrent writers under the lock), `transcript` (windowed backward
    scan, partial lines), `search` (extraction, incremental updates), `procs`
    (its own process), `memfile`, and the pidfd watcher (a real child
-   process killed while watched).
+   process killed while watched), and `tmux`: a workstream restore plan run
+   against a real tmux server on a socket in a temp directory, configured
+   with `-f` (never `~/.tmux.conf`), checking windows, layouts, directories
+   and resume marks.
 4. **Manual end-to-end** (not in `go test`, because they cost money or touch
    the user's environment): a `claude -p --plugin-dir` run with a scratch
    copy of the plugin, the cockpit rendered in an isolated tmux server
    (`tmux -L`), and the installed daemon checked with `cccp doctor`.
 
-`go test -race ./...` runs tiers 1 to 3 in about a second, with no network,
-no subprocess other than `sleep`, and nothing outside temp directories.
+`go test -race ./...` runs tiers 1 to 3 in a few seconds, with no network,
+no subprocess other than `sleep`, `sh` and a sandboxed `tmux` (skipped where
+tmux is not installed), and nothing outside temp directories.
+
+The workstream flows above the adapter (`cccp start`, the placeholder, the
+cockpit's `w`, closing and forgetting with a real daemon) were checked end to
+end in tier 4: an isolated tmux server and daemon (their own state, cache,
+socket and config, notifications and summaries off), with a stand-in
+`claude` on PATH; docs/workstreams.md lists what was shown.
 
 ## 11. Profiles (2026-11-02)
 
@@ -614,3 +624,14 @@ right window, which on GNOME Wayland only the terminal itself can do. The
 design uses Ghostty ≥ 1.4.0 (`GHOSTTY_SURFACE_ID` and its `present-surface`
 D-Bus action) and D-Bus notifications from the daemon. It waits for that
 release: [notification-click.md](notification-click.md).
+
+## 14. Workstreams (2026-11-04)
+
+A workstream is a tmux session. `w` in the cockpit creates one (a name, then
+a directory picked fuzzily or typed, made if new); closing its last window
+closes it, and cccp forgets it once the same server has run without it for
+10 s (a shutdown, which kills the server, forgets nothing). The daemon
+records every workstream's windows, layouts, directories and conversations;
+`cccp start` restores them after a reboot, conversations as placeholders
+that resume in their own profile on Enter. Design, tmux facts and tests:
+[workstreams.md](workstreams.md).

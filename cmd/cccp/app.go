@@ -80,7 +80,7 @@ func (a *app) config() config.Config {
 }
 
 func (a *app) memoryFile() memfile.File {
-	return memfile.File{Path: a.l.MemoryFile, SummariesPath: a.l.SummariesFile}
+	return memfile.File{Path: a.l.MemoryFile, SummariesPath: a.l.SummariesFile, WorkstreamsPath: a.l.WorkstreamsFile}
 }
 
 func (a *app) memory() core.Memory {

@@ -15,15 +15,17 @@ import (
 // pure lists the functional-core packages and the cccp packages each may
 // import.
 var pure = map[string][]string{
-	"model":   {},
-	"reduce":  {"model"},
-	"config":  {},
-	"core":    {"model", "config"},
-	"present": {"core", "model"},
-	"machine": {"core", "model", "config", "present"},
-	"profile": {"config", "model"},
-	"fuzzy":   {},
-	"nav":     {},
+	"model":      {},
+	"reduce":     {"model"},
+	"config":     {},
+	"core":       {"model", "config", "workstream"},
+	"present":    {"core", "model"},
+	"machine":    {"core", "model", "config", "present"},
+	"profile":    {"config", "model"},
+	"fuzzy":      {},
+	"nav":        {},
+	"workstream": {"model"},
+	"dirpick":    {"fuzzy"},
 }
 
 // io are standard-library packages that perform I/O or reach the process

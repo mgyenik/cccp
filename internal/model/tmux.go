@@ -41,6 +41,18 @@ type TmuxPane struct {
 	// WindowActivity is the last time the pane's window produced output.
 	WindowActivity time.Time
 	WindowPanes    int
+
+	// For workstreams (recording and restoring sessions):
+	SessionID       string    // $N
+	SessionActivity time.Time // last use of the session
+	WindowActive    bool      // the current window of its session
+	WindowLayout    string    // #{window_layout}
+	WindowAutoName  bool      // automatic-rename is on for the window
+	PaneActive      bool      // the active pane of its window
+	Resume          string    // the @cccp_resume pane option (a restore placeholder)
+	// The server: its pid and start time (with the socket, its identity).
+	ServerPID   int
+	ServerStart int64
 }
 
 // Location is "session:window" (with ".pane" when the window is split).
