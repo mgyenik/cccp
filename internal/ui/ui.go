@@ -823,12 +823,13 @@ func (m *Model) renderList(w, h int) string {
 	var lines []line
 	last := core.Group(-1)
 	searching := strings.TrimSpace(m.filter.Value()) != ""
+	wsW := workstreamWidth(vis)
 	for i, s := range vis {
 		if s.Group != last && !searching { // search results are one ranked list
 			lines = append(lines, line{groupStyle(s.Group).Render(s.Group.String()), -1})
 			last = s.Group
 		}
-		lines = append(lines, line{m.renderRow(s, w, i == m.cursor), i})
+		lines = append(lines, line{m.renderRow(s, w, wsW, i == m.cursor), i})
 	}
 	if len(vis) == 0 {
 		msg := "no sessions"
@@ -881,16 +882,38 @@ func pad(s string, n int) string {
 	return s + strings.Repeat(" ", n-w)
 }
 
-func (m *Model) renderRow(s core.Session, w int, cursor bool) string {
+// maxWorkstreamWidth bounds the workstream column.
+const maxWorkstreamWidth = 16
+
+// workstreamOf is a row's workstream column: its tmux session ("-" for a
+// closed conversation, "background" for a background session).
+func workstreamOf(s core.Session) string {
+	switch {
+	case s.TmuxSess != "":
+		return s.TmuxSess
+	case s.Location != "":
+		return s.Location
+	}
+	return "-"
+}
+
+// workstreamWidth sizes the workstream column to the longest name shown.
+func workstreamWidth(ss []core.Session) int {
+	w := 1
+	for _, s := range ss {
+		w = max(w, ansi.StringWidth(workstreamOf(s)))
+	}
+	return min(w, maxWorkstreamWidth)
+}
+
+// renderRow is one session: state, harness, workstream, title, detail, and
+// times. The profile and the exact tmux location are in the preview.
+func (m *Model) renderRow(s core.Session, w, wsW int, cursor bool) string {
 	g := present.Glyph(s)
 	if s.Inferred {
 		g += "~"
 	} else {
 		g += " "
-	}
-	loc := s.Location
-	if loc == "" {
-		loc = "-"
 	}
 	turns := ""
 	if s.Group == core.GroupClosed {
@@ -906,11 +929,8 @@ func (m *Model) renderRow(s core.Session, w int, cursor bool) string {
 	if w < 90 {
 		titleW = 24
 	}
-	badge := present.AgentBadge(s.Agent)
-	if present.MultiProfile(m.snap) {
-		badge += " " + pad(present.ProfileTag(s, 8), 8)
-	}
-	left := fmt.Sprintf(" %s %s %s %s ", g, badge, pad(loc, 10), pad(s.DisplayTitle(), titleW))
+	ws := ansi.Truncate(workstreamOf(s), wsW, "…")
+	left := fmt.Sprintf(" %s %s %s %s ", g, present.AgentBadge(s.Agent), pad(ws, wsW), pad(s.DisplayTitle(), titleW))
 	detailW := w - ansi.StringWidth(left) - ansi.StringWidth(meta) - 2
 	detail := ""
 	if detailW > 8 {
@@ -965,6 +985,9 @@ func (m *Model) renderPreview(s core.Session, pm previewMode, w, h int) string {
 	}
 	if s.Inferred {
 		info[0] += " (inferred)"
+	}
+	if s.Location != "" {
+		info = append(info, "tmux "+s.Location)
 	}
 	if s.Cwd != "" {
 		info = append(info, strings.Join(nonEmpty(s.Cwd, s.Branch), " · "))

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/charmbracelet/x/ansi"
 
 	"cccp/internal/catalog"
 	"cccp/internal/core"
@@ -440,20 +441,53 @@ func TestLivePanePreview(t *testing.T) {
 	}
 }
 
-func TestProfileTagsAndFilter(t *testing.T) {
+// Rows show the workstream; the profile and the exact tmux location are in
+// the selected session's preview.
+func TestRowsShowTheWorkstreamThePreviewTheRest(t *testing.T) {
 	m, _, _ := newModel(t)
-	if strings.Contains(m.render(), "acmecorp") {
-		t.Fatal("no tags with a single profile")
-	}
 	snap := snapshot()
 	snap.Sessions[0].Profile, snap.Sessions[1].Profile, snap.Sessions[2].Profile = "acmecorp", "homelab", "homelab"
+	snap.Sessions[0].TmuxSess, snap.Sessions[0].Location = "infra", "infra:2.1"
+	snap.Sessions[1].TmuxSess, snap.Sessions[1].Location = "a-much-longer-workstream-name", "a-much-longer-workstream-name:0"
 	m.Update(snapMsg(snap))
-	if out := m.render(); !strings.Contains(out, "acmecorp") || !strings.Contains(out, "homelab") {
-		t.Fatal("profile tags not shown with several profiles")
+	m.preview = previewConversation // the preview's facts, not a captured pane
+	var rows, preview []string
+	for _, l := range strings.Split(ansi.Strip(m.render()), "\n") {
+		left, right, _ := strings.Cut(l, "│")
+		rows, preview = append(rows, left), append(preview, right)
 	}
+	list, side := strings.Join(rows, "\n"), strings.Join(preview, "\n")
+	if strings.Contains(list, "acmecorp") || strings.Contains(list, "homelab") || strings.Contains(list, "infra:2.1") {
+		t.Fatalf("profile or location in the rows:\n%s", list)
+	}
+	if !strings.Contains(list, " infra ") || !strings.Contains(list, "a-much-longer-w…") {
+		t.Fatalf("workstream column (long names cut at %d):\n%s", maxWorkstreamWidth, list)
+	}
+	if !strings.Contains(side, "acmecorp profile") || !strings.Contains(side, "tmux infra:2.1") {
+		t.Fatalf("preview:\n%s", side)
+	}
+	// Still found by profile.
 	key(m, "/")
 	typeText(m, "acmecorp")
 	if v := m.visible(); len(v) != 1 || v[0].Key != "claude:a" {
 		t.Fatalf("filter by profile: %v", v)
+	}
+}
+
+func TestWorkstreamColumn(t *testing.T) {
+	for want, s := range map[string]core.Session{
+		"infra":      {TmuxSess: "infra", Location: "infra:1"},
+		"background": {Location: "background"},
+		"-":          {},
+	} {
+		if got := workstreamOf(s); got != want {
+			t.Errorf("%+v: %q", s, got)
+		}
+	}
+	if w := workstreamWidth([]core.Session{{TmuxSess: "ab"}, {TmuxSess: "abcdef"}}); w != 6 {
+		t.Fatalf("width %d", w)
+	}
+	if w := workstreamWidth([]core.Session{{TmuxSess: strings.Repeat("x", 40)}}); w != maxWorkstreamWidth {
+		t.Fatalf("width %d", w)
 	}
 }
