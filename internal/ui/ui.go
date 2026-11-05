@@ -74,6 +74,9 @@ type Options struct {
 	Workstream string
 	// JailStats reads a slice's live numbers (nil: only the snapshot's).
 	JailStats JailStats
+	// Usage lists the accounts whose subscription usage u shows (nil: no
+	// usage screen). Called in the background.
+	Usage func() []UsageSource
 }
 
 type mode int
@@ -85,6 +88,7 @@ const (
 	modeCreate // the new-workstream flow (creator)
 	modeMove   // moving a session to another workstream (mover)
 	modeLimits // a workstream's limits (limiter)
+	modeUsage  // subscription usage (usageView)
 )
 
 type snapMsg core.Snapshot
@@ -137,9 +141,11 @@ type Model struct {
 	previewKey  string
 	previewText string
 
-	creator *creator // the new-workstream flow, in modeCreate
-	mover   *mover   // the move flow, in modeMove
-	limiter *limiter // the limits picker, in modeLimits
+	creator  *creator   // the new-workstream flow, in modeCreate
+	mover    *mover     // the move flow, in modeMove
+	limiter  *limiter   // the limits picker, in modeLimits
+	usage    *usageView // the usage screen, in modeUsage
+	usageGen int
 
 	// jail holds each slice's numbers as last read, while the cockpit is
 	// open (every jailRead).
@@ -372,6 +378,12 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case usageSourcesMsg:
+		return m, m.usageSources(msg)
+	case usageMsg:
+		m.usageResult(msg)
+		return m, nil
+
 	case tea.KeyPressMsg:
 		return m.key(msg)
 	}
@@ -435,6 +447,8 @@ func (m *Model) key(k tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 	}
 	switch m.mode {
+	case modeUsage:
+		return m, m.usageKey(k)
 	case modeLimits:
 		done, c := m.limiter.update(k)
 		if !done {
@@ -605,6 +619,12 @@ func (m *Model) key(k tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.mode = modeLimits
 		}
 		return m, nil
+	case "u":
+		if m.opt.Usage == nil {
+			m.setStatus("usage is not available here")
+			break
+		}
+		return m, m.openUsage()
 	case "M":
 		s, ok := m.selected()
 		if !ok {
@@ -822,6 +842,8 @@ func (m *Model) renderHeader() string {
 func (m *Model) renderFooter() string {
 	var line string
 	switch m.mode {
+	case modeUsage:
+		line = sKeyHint.Render("r refresh · esc close")
 	case modeLimits:
 		line = sKeyHint.Render("enter set · ↑↓ choose · esc cancel")
 	case modeMove:
@@ -837,7 +859,7 @@ func (m *Model) renderFooter() string {
 		if m.hideClosed {
 			closed = "e show closed"
 		}
-		hint := "enter open/resume · tab next needing you · / search   · w workstream · M move · L limits · a alias · m seen · p preview · " + closed + " · r rescan · q quit"
+		hint := "enter open/resume · tab next needing you · / search   · w workstream · M move · L limits · u usage · a alias · m seen · p preview · " + closed + " · r rescan · q quit"
 		if f := m.filter.Value(); f != "" {
 			hint = "search: " + f + " · " + hint
 		}
@@ -858,6 +880,9 @@ func (m *Model) renderBody(h int) string {
 	}
 	if m.mode == modeLimits {
 		return m.limiter.view(m.width, h)
+	}
+	if m.mode == modeUsage {
+		return m.usage.view(m.now, m.width, h)
 	}
 
 	sel, hasSel := m.selected()

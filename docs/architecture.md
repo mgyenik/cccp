@@ -673,3 +673,17 @@ deadline. The daemon talks to systemd (`StartTransientUnit`,
 15 s. The limit is a hard `MemoryMax`, not a throttle point: one was
 measured to hang a runaway indefinitely. Design, facts and measurements:
 [jails.md](jails.md).
+
+## 16. Subscription usage (2026-11-05)
+
+`u` in the cockpit shows each account's usage limits, fetched when the
+screen opens (`r` refreshes; nothing polls). Both CLIs answer their own
+`/usage` non-interactively, without a model call: `claude -p "/usage"
+--output-format stream-json --verbose` carries `usage_report.rate_limits`
+(the server's rows: kind, percent, reset, scope, severity, as the status
+line gets them), run once per profile in that profile's environment and with
+the summarizer's isolation flags; `agy -p "/usage" --output-format json`
+carries `command.data.groups[].buckets[]`. `internal/usage` parses both
+(pure); `cmd/cccp/usage.go` runs them. A bar is coloured by the server's
+severity when it gives one (Claude), else by the share used (agy).
+

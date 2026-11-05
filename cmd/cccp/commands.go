@@ -445,6 +445,7 @@ func runUI(a *app, args []string) error {
 		Home:       a.l.Home,
 		Workstream: a.clientValue(*client, "#{session_name}"),
 		JailStats:  cgroups.New(os.Getuid()).Stats,
+		Usage:      a.usageSources,
 
 		Actions: ui.Actions{
 			OpenWorkstream: func(name string) error { return a.openWorkstream(*client, name) },

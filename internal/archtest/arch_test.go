@@ -27,6 +27,7 @@ var pure = map[string][]string{
 	"workstream": {"model"},
 	"dirpick":    {"fuzzy"},
 	"jail":       {},
+	"usage":      {},
 }
 
 // io are standard-library packages that perform I/O or reach the process

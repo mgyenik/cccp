@@ -119,6 +119,9 @@ func run(m *Model, cmd tea.Cmd) {
 		}
 	case doneMsg, searchMsg, movedMsg, limitsMsg:
 		m.Update(msg)
+	case usageSourcesMsg, usageMsg: // a chain: the accounts, then each fetch
+		_, next := m.Update(msg)
+		run(m, next)
 	}
 }
 
