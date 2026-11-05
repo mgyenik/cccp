@@ -51,6 +51,8 @@ func main() {
 		err = runStart(a, args)
 	case "resume-pane":
 		err = runResumePane(a, args)
+	case "limits":
+		err = runLimits(a, args)
 
 	case "help", "-h", "--help":
 		usage()
@@ -89,7 +91,10 @@ usage:
   cccp hook claude|agy   hook entry point (called by the agents)
     cccp notify tmux EVENT tmux hook entry point (called by tmux)
     cccp tmux-focus-since  record when focus reporting started (called by cccp.tmux)
-  cccp start             restore the workstreams (after a reboot), attach, open the cockpit
+    cccp start             restore the workstreams (after a reboot), attach, open the cockpit
+  cccp limits [WORKSTREAM normal|boost|max [--for 2h|--until-undone]]
+                         show the workstreams' memory and CPU limits, or boost one
+
   cccp resume-pane       a restored conversation's placeholder (run by cccp start)
 `)
 }

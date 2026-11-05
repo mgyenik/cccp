@@ -117,7 +117,7 @@ func run(m *Model, cmd tea.Cmd) {
 		for _, c := range msg {
 			run(m, c)
 		}
-	case doneMsg, searchMsg, movedMsg:
+	case doneMsg, searchMsg, movedMsg, limitsMsg:
 		m.Update(msg)
 	}
 }
@@ -484,10 +484,11 @@ func TestWorkstreamColumn(t *testing.T) {
 			t.Errorf("%+v: %q", s, got)
 		}
 	}
-	if w := workstreamWidth([]core.Session{{TmuxSess: "ab"}, {TmuxSess: "abcdef"}}); w != 6 {
+	m := &Model{}
+	if w := m.workstreamWidth([]core.Session{{TmuxSess: "ab"}, {TmuxSess: "abcdef"}}); w != 6 {
 		t.Fatalf("width %d", w)
 	}
-	if w := workstreamWidth([]core.Session{{TmuxSess: strings.Repeat("x", 40)}}); w != maxWorkstreamWidth {
+	if w := m.workstreamWidth([]core.Session{{TmuxSess: strings.Repeat("x", 40)}}); w != maxWorkstreamWidth {
 		t.Fatalf("width %d", w)
 	}
 }

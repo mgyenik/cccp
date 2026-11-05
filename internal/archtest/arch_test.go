@@ -17,15 +17,16 @@ import (
 var pure = map[string][]string{
 	"model":      {},
 	"reduce":     {"model"},
-	"config":     {},
-	"core":       {"model", "config", "workstream"},
+	"config":     {"jail"},
+	"core":       {"model", "config", "workstream", "jail"},
 	"present":    {"core", "model"},
-	"machine":    {"core", "model", "config", "present"},
+	"machine":    {"core", "model", "config", "present", "jail"},
 	"profile":    {"config", "model"},
 	"fuzzy":      {},
 	"nav":        {},
 	"workstream": {"model"},
 	"dirpick":    {"fuzzy"},
+	"jail":       {},
 }
 
 // io are standard-library packages that perform I/O or reach the process

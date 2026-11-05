@@ -21,6 +21,7 @@ import (
 	"cccp/internal/claudereg"
 	"cccp/internal/config"
 	"cccp/internal/core"
+	"cccp/internal/jail"
 	"cccp/internal/model"
 	"cccp/internal/paths"
 	"cccp/internal/procs"
@@ -112,6 +113,7 @@ type Deps struct {
 	AgyDB       AgyDB
 	Power       Power
 	Catalog     Catalog
+	Cgroups     Cgroups // nil: jails off
 	Hostname    string
 
 	// Home, DefaultClaudeDir and Configured feed profile.Resolve.
@@ -131,7 +133,10 @@ type Gatherer struct {
 	// $TMUX, which never changes), by pid and start time.
 	regTmux map[procKey]string
 
-	tmux   core.TmuxView
+	tmux core.TmuxView
+	// cgroups is where the tmux server and panes are, as of RefreshTmux.
+	cgroups core.JailView
+
 	agents []core.AgentProc
 	// conversations is the catalog as of the last RefreshCatalog.
 	conversations []core.Conversation
@@ -292,6 +297,33 @@ func (g *Gatherer) RefreshTmux() {
 		view.ServerPID, view.ServerStart = pid, start
 	}
 	g.tmux = view
+	g.readCgroups()
+}
+
+// readCgroups records the cgroup of the tmux server and of each pane's
+// process (reread with tmux: panes appear and move with tmux events).
+func (g *Gatherer) readCgroups() {
+	g.cgroups = core.JailView{}
+	if g.d.Cgroups == nil {
+		g.cgroups.Err = "no cgroups reader"
+		return
+	}
+	if err := g.d.Cgroups.Available(); err != nil {
+		g.cgroups.Err = err.Error()
+		return
+	}
+	g.cgroups.Available = true
+	g.cgroups.MemTotal = g.d.Cgroups.MemTotal()
+
+	if g.tmux.ServerPID != 0 {
+		g.cgroups.ServerCgroup = g.d.Cgroups.Cgroup(g.tmux.ServerPID)
+	}
+	g.cgroups.PaneCgroups = map[string]string{}
+	for _, p := range g.tmux.Panes {
+		if p.PID > 0 {
+			g.cgroups.PaneCgroups[p.ID] = g.d.Cgroups.Cgroup(p.PID)
+		}
+	}
 }
 
 type procKey struct {
@@ -316,6 +348,15 @@ func (g *Gatherer) registryTmux(e claudereg.Entry, seen map[procKey]string) stri
 
 // Tmux is the tmux view as of the last RefreshTmux.
 func (g *Gatherer) Tmux() core.TmuxView { return g.tmux }
+
+// Cgroups reads where processes are and a cccp slice's numbers
+// (cgroups.FS).
+type Cgroups interface {
+	Available() error
+	Cgroup(pid int) string
+	Stats(slice string) jail.Stats
+	MemTotal() int64
+}
 
 // Discover scans /proc for agent processes under the known panes. A Claude
 // process's CLAUDE_CONFIG_DIR names its profile; a new profile's registry is
@@ -361,7 +402,18 @@ func (g *Gatherer) profileOfRegistry(path string) (model.Profile, bool) {
 // Observe assembles an observation from the current view, reading the
 // transcripts core.Plan asks for.
 func (g *Gatherer) Observe(now time.Time) core.Observation {
+	jv := g.cgroups
+	if jv.Available {
+		// Each running workstream's slice, read now (a few small files).
+		jv.Stats = map[string]jail.Stats{jail.Root: g.d.Cgroups.Stats(jail.Root)}
+		for _, p := range g.tmux.Panes {
+			if s := jail.SliceFor(p.Session); jv.Stats[s] == (jail.Stats{}) {
+				jv.Stats[s] = g.d.Cgroups.Stats(s)
+			}
+		}
+	}
 	obs := core.Observation{
+		Jail:             jv,
 		Tmux:             g.tmux,
 		Agents:           g.agents,
 		OnBattery:        g.d.Power.OnBattery(),

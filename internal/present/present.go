@@ -310,3 +310,17 @@ func TitleWithProfile(s core.Session, show bool) string {
 	}
 	return s.DisplayTitle()
 }
+
+// Bytes formats a byte count in binary units: "812 MiB", "12.3 GiB" ("-"
+// for none).
+func Bytes(n int64) string {
+	switch {
+	case n <= 0:
+		return "-"
+	case n < 1<<20:
+		return fmt.Sprintf("%d KiB", n>>10)
+	case n < 1<<30:
+		return fmt.Sprintf("%d MiB", n>>20)
+	}
+	return fmt.Sprintf("%.1f GiB", float64(n)/(1<<30))
+}

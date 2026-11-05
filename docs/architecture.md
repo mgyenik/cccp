@@ -523,6 +523,8 @@ reading, and is reached only through interfaces.
 | `store`, `claudereg`, `transcript`, `agydb`, `procs`, `tmux`, `power`, `memfile`, `catalog`, `ipc` | adapters | one external resource each |
 | `ui` | Elm architecture | Bubble Tea model over `Source`, `Actions`, `Searcher`, `PaneCapturer` interfaces |
 | `paths` | pure | `Resolve(getenv, home, uid) Layout` |
+| `jail` | pure | cgroup limits and placement: unit names, presets and boosts, `Desired`, `Placement`, D-Bus property encoding |
+| `cgroups`, `systemd` | adapters | the cgroup tree under `/sys/fs/cgroup`; the systemd user manager over D-Bus |
 | `cmd/cccp` | composition root | the only code that reads the environment and constructs real adapters |
 
 ### Rules, and how they are enforced
@@ -656,3 +658,18 @@ records every workstream's windows, layouts, directories and conversations;
 `cccp start` restores them after a reboot, conversations as placeholders
 that resume in their own profile on Enter. Design, tmux facts and tests:
 [workstreams.md](workstreams.md).
+
+## 15. Jails (2026-11-05)
+
+tmux runs in `cccp.slice` and each workstream in its own slice under it, so
+a runaway cannot exhaust the machine's memory or starve the desktop or the
+other workstreams. `core` computes the desired limits and placement from
+the observation (`jail.Desired`, `jail.Placement`); the machine applies
+what differs and moves what is misplaced (`JailLimits`, `JailMove`,
+retried after a minute on failure), watches kills and use near the limit
+(notifications), and keeps boosts in `Memory` with their expiry as a
+deadline. The daemon talks to systemd (`StartTransientUnit`,
+`SetUnitProperties`, `AttachProcessesToUnit`) and polls the slices every
+15 s. The limit is a hard `MemoryMax`, not a throttle point: one was
+measured to hang a runaway indefinitely. Design, facts and measurements:
+[jails.md](jails.md).

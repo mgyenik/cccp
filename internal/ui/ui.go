@@ -45,6 +45,9 @@ type Actions struct {
 	// MoveSession moves a session into the workstream dest (made, or
 	// restored, if need be); the cockpit stays open. May be nil.
 	MoveSession func(s core.Session, dest string) error
+	// SetLimits gives a workstream a preset for a while (0: until undone;
+	// normal: ends its boost). May be nil.
+	SetLimits func(workstream, preset string, d time.Duration) error
 }
 
 // Searcher searches the conversation text (catalog.Index). The cockpit only
@@ -69,6 +72,8 @@ type Options struct {
 	// Workstream is the tmux session the cockpit's client is on ("" if
 	// unknown), shown in the header.
 	Workstream string
+	// JailStats reads a slice's live numbers (nil: only the snapshot's).
+	JailStats JailStats
 }
 
 type mode int
@@ -79,6 +84,7 @@ const (
 	modeAlias
 	modeCreate // the new-workstream flow (creator)
 	modeMove   // moving a session to another workstream (mover)
+	modeLimits // a workstream's limits (limiter)
 )
 
 type snapMsg core.Snapshot
@@ -133,6 +139,12 @@ type Model struct {
 
 	creator *creator // the new-workstream flow, in modeCreate
 	mover   *mover   // the move flow, in modeMove
+	limiter *limiter // the limits picker, in modeLimits
+
+	// jail holds each slice's numbers as last read, while the cockpit is
+	// open (every jailRead).
+	jail       map[string]jailSample
+	jailReadAt time.Time
 
 	status   string
 	statusAt time.Time
@@ -281,7 +293,30 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tickMsg:
 		m.now = time.Time(msg)
-		return m, tea.Batch(tick(), m.loadPreview())
+		var read tea.Cmd
+		if m.opt.JailStats != nil && m.snap.Jail.On && m.now.Sub(m.jailReadAt) >= jailRead {
+			m.jailReadAt = m.now
+			read = readJail(m.opt.JailStats, m.snap.Jail, m.now)
+		}
+		return m, tea.Batch(tick(), m.loadPreview(), read)
+
+	case jailStatsMsg:
+		if m.jail == nil {
+			m.jail = map[string]jailSample{}
+		}
+		for slice, st := range msg.stats {
+			m.jail[slice] = sample(m.jail[slice], st, msg.at)
+		}
+		return m, nil
+
+	case limitsMsg:
+		if msg.err != nil {
+			m.setStatus("limits: " + msg.err.Error())
+		} else {
+			m.setStatus(msg.text)
+			m.opt.Source.Refresh()
+		}
+		return m, nil
 
 	case previewMsg:
 		if msg.key == m.previewKey {
@@ -400,6 +435,21 @@ func (m *Model) key(k tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 	}
 	switch m.mode {
+	case modeLimits:
+		done, c := m.limiter.update(k)
+		if !done {
+			return m, nil
+		}
+		jw := m.limiter.ws
+		ws := jw.Name
+		m.mode, m.limiter = modeList, nil
+		if c == nil || m.opt.Actions.SetLimits == nil {
+			return m, nil
+		}
+		set, choice := m.opt.Actions.SetLimits, *c
+		return m, func() tea.Msg {
+			return limitsMsg{text: ws + ": " + choice.label(jw), err: set(ws, choice.Preset, choice.For)}
+		}
 	case modeMove:
 		cmd, done, dest := m.mover.update(k)
 		if !done {
@@ -538,6 +588,23 @@ func (m *Model) key(k tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.alias.CursorEnd()
 			return m, m.alias.Focus()
 		}
+	case "L":
+		s, ok := m.selected()
+		if !ok {
+			break
+		}
+		switch w, found := m.snap.Jail.Find(s.TmuxSess); {
+		case !m.snap.Jail.On:
+			m.setStatus("jails are off: " + m.snap.Jail.Why)
+		case !found:
+			m.setStatus("not in a running workstream")
+		case m.opt.Actions.SetLimits == nil:
+			m.setStatus("limits need the daemon (systemctl --user start cccp)")
+		default:
+			m.limiter = newLimiter(w, m.snap.Jail, m.jailSampleOf(w).stats.Memory)
+			m.mode = modeLimits
+		}
+		return m, nil
 	case "M":
 		s, ok := m.selected()
 		if !ok {
@@ -755,6 +822,8 @@ func (m *Model) renderHeader() string {
 func (m *Model) renderFooter() string {
 	var line string
 	switch m.mode {
+	case modeLimits:
+		line = sKeyHint.Render("enter set · ↑↓ choose · esc cancel")
 	case modeMove:
 		line = m.mover.input.View() + "  " + sKeyHint.Render("enter move · ↑↓ choose · esc cancel")
 	case modeCreate:
@@ -768,7 +837,7 @@ func (m *Model) renderFooter() string {
 		if m.hideClosed {
 			closed = "e show closed"
 		}
-		hint := "enter open/resume · tab next needing you · / search  · w workstream · M move · a alias · m seen · p preview · " + closed + " · r rescan · q quit"
+		hint := "enter open/resume · tab next needing you · / search   · w workstream · M move · L limits · a alias · m seen · p preview · " + closed + " · r rescan · q quit"
 		if f := m.filter.Value(); f != "" {
 			hint = "search: " + f + " · " + hint
 		}
@@ -786,6 +855,9 @@ func (m *Model) renderBody(h int) string {
 	}
 	if m.mode == modeMove {
 		return m.mover.view(m.width, h)
+	}
+	if m.mode == modeLimits {
+		return m.limiter.view(m.width, h)
 	}
 
 	sel, hasSel := m.selected()
@@ -823,7 +895,8 @@ func (m *Model) renderList(w, h int) string {
 	var lines []line
 	last := core.Group(-1)
 	searching := strings.TrimSpace(m.filter.Value()) != ""
-	wsW := workstreamWidth(vis)
+	wsW := m.workstreamWidth(vis)
+
 	for i, s := range vis {
 		if s.Group != last && !searching { // search results are one ranked list
 			lines = append(lines, line{groupStyle(s.Group).Render(s.Group.String()), -1})
@@ -897,11 +970,20 @@ func workstreamOf(s core.Session) string {
 	return "-"
 }
 
-// workstreamWidth sizes the workstream column to the longest name shown.
-func workstreamWidth(ss []core.Session) int {
+// workstreamLabel is a row's workstream column as shown: its name, marked
+// ⇧ while the workstream is boosted.
+func (m *Model) workstreamLabel(s core.Session) string {
+	if w, ok := m.snap.Jail.Find(s.TmuxSess); ok && w.Boosted {
+		return "⇧" + workstreamOf(s)
+	}
+	return workstreamOf(s)
+}
+
+// workstreamWidth sizes the workstream column to the longest label shown.
+func (m *Model) workstreamWidth(ss []core.Session) int {
 	w := 1
 	for _, s := range ss {
-		w = max(w, ansi.StringWidth(workstreamOf(s)))
+		w = max(w, ansi.StringWidth(m.workstreamLabel(s)))
 	}
 	return min(w, maxWorkstreamWidth)
 }
@@ -929,8 +1011,12 @@ func (m *Model) renderRow(s core.Session, w, wsW int, cursor bool) string {
 	if w < 90 {
 		titleW = 24
 	}
-	ws := ansi.Truncate(workstreamOf(s), wsW, "…")
-	left := fmt.Sprintf(" %s %s %s %s ", g, present.AgentBadge(s.Agent), pad(ws, wsW), pad(s.DisplayTitle(), titleW))
+	jw, jailed := m.snap.Jail.Find(s.TmuxSess)
+	ws := pad(ansi.Truncate(m.workstreamLabel(s), wsW, "…"), wsW)
+	if jailed && m.jailSampleOf(jw).nearLimit() && !cursor {
+		ws = lipgloss.NewStyle().Foreground(cYellow).Render(ws) // near its memory limit
+	}
+	left := fmt.Sprintf(" %s %s %s %s ", g, present.AgentBadge(s.Agent), ws, pad(s.DisplayTitle(), titleW))
 	detailW := w - ansi.StringWidth(left) - ansi.StringWidth(meta) - 2
 	detail := ""
 	if detailW > 8 {
@@ -988,6 +1074,9 @@ func (m *Model) renderPreview(s core.Session, pm previewMode, w, h int) string {
 	}
 	if s.Location != "" {
 		info = append(info, "tmux "+s.Location)
+	}
+	if w, ok := m.snap.Jail.Find(s.TmuxSess); ok {
+		info = append(info, jailLines(w, m.jailSampleOf(w), m.now)...)
 	}
 	if s.Cwd != "" {
 		info = append(info, strings.Join(nonEmpty(s.Cwd, s.Branch), " · "))

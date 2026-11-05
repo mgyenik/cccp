@@ -1,6 +1,7 @@
 package config
 
 import (
+	"cccp/internal/jail"
 	"testing"
 	"time"
 )
@@ -35,6 +36,54 @@ func TestParseProfiles(t *testing.T) {
 	} {
 		if _, err := Parse([]byte(bad)); err == nil {
 			t.Errorf("accepted %q", bad)
+		}
+	}
+}
+
+func TestJailSection(t *testing.T) {
+	if !Default().Jail.Enabled {
+		t.Fatal("jails are on by default")
+	}
+	c, err := Parse([]byte(`
+[jail]
+root = { memory_high = "60%" }
+
+[jail.preset.boost]
+cpu_weight = 800
+
+[[jail.workstream]]
+name = "builds"
+preset = "boost"
+
+[[jail.workstream]]
+name = "tight"
+memory_max = "8G"
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := c.Jail.Settings()
+	if s.Root.MemoryHigh != "60%" || s.Root.MemoryMax != jail.Defaults.Root.MemoryMax {
+		t.Fatalf("root merged over the defaults: %+v", s.Root)
+	}
+	if b := s.Presets[jail.PresetBoost]; b.CPUWeight != 800 || b.MemoryHigh != jail.Defaults.Presets[jail.PresetBoost].MemoryHigh {
+		t.Fatalf("boost preset: %+v", b)
+	}
+	if s.Workstreams["builds"].Preset != jail.PresetBoost || s.Workstreams["tight"].Custom.MemoryMax != "8G" {
+		t.Fatalf("workstreams: %+v", s.Workstreams)
+	}
+	if c, err := Parse([]byte("[jail]\nenabled = false\n")); err != nil || c.Jail.Enabled {
+		t.Fatal("jails can be turned off")
+	}
+	for _, bad := range []string{
+		"[jail.preset.turbo]\ncpu_weight = 1\n",
+		"[jail]\nroot = { memory_high = \"lots\" }\n",
+		"[[jail.workstream]]\npreset = \"boost\"\n",
+		"[[jail.workstream]]\nname = \"x\"\npreset = \"turbo\"\n",
+		"[[jail.workstream]]\nname = \"x\"\n[[jail.workstream]]\nname = \"x\"\n",
+	} {
+		if _, err := Parse([]byte(bad)); err == nil {
+			t.Errorf("accepted:\n%s", bad)
 		}
 	}
 }

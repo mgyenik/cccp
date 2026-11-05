@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/BurntSushi/toml"
+
+	"cccp/internal/jail"
 )
 
 // Config is the user configuration. Every field has a default.
@@ -39,6 +41,49 @@ type Config struct {
 	// sessions and ~/.claude* directories); configuration only adds names
 	// and overrides.
 	Profiles []Profile `toml:"profile"`
+
+	// Jail sets the memory and CPU limits of tmux and its workstreams
+	// (docs/jails.md).
+	Jail Jail `toml:"jail"`
+}
+
+// Jail is the [jail] section: on/off, changes to the built-in limits
+// (jail.Defaults), and workstreams' own settings.
+type Jail struct {
+	Enabled bool `toml:"enabled"`
+	// Root and RootMax change A's limits (all of tmux), normally and
+	// while a workstream is at max.
+	Root    jail.Limits `toml:"root"`
+	RootMax jail.Limits `toml:"root_max"`
+	// Presets change a preset's limits ([jail.preset.boost]).
+	Presets map[string]jail.Limits `toml:"preset"`
+	// Workstreams set a workstream's normal limits ([[jail.workstream]]).
+	Workstreams []JailWorkstream `toml:"workstream"`
+}
+
+// JailWorkstream is one workstream's normal limits: a preset, and/or
+// values of its own over it.
+type JailWorkstream struct {
+	Name   string `toml:"name"`
+	Preset string `toml:"preset"`
+	jail.Limits
+}
+
+// Settings are the limits in force: the built-in ones changed by j.
+func (j Jail) Settings() jail.Settings {
+	s := jail.Settings{
+		Root:        jail.Defaults.Root.Merge(j.Root),
+		RootMax:     jail.Defaults.RootMax.Merge(j.RootMax),
+		Presets:     map[string]jail.Limits{},
+		Workstreams: map[string]jail.WorkstreamSetting{},
+	}
+	for name, l := range jail.Defaults.Presets {
+		s.Presets[name] = l.Merge(j.Presets[name])
+	}
+	for _, w := range j.Workstreams {
+		s.Workstreams[w.Name] = jail.WorkstreamSetting{Preset: w.Preset, Custom: w.Limits}
+	}
+	return s
 }
 
 // Profile configures one Claude config directory.
@@ -76,6 +121,7 @@ func Default() Config {
 		DefaultCacheTTL: Duration{time.Hour},
 		EndedRetention:  Duration{7 * 24 * time.Hour},
 		QuietAfter:      Duration{10 * time.Second},
+		Jail:            Jail{Enabled: true},
 	}
 }
 
@@ -103,5 +149,53 @@ func Parse(data []byte) (Config, error) {
 		}
 		seen[p.Name] = p.Name != ""
 	}
+	if err := c.Jail.validate(); err != nil {
+		return Default(), err
+	}
 	return c, nil
+}
+
+// validate checks every limit encodes for systemd and every preset named
+// exists, so a mistake is reported when the config loads.
+func (j Jail) validate() error {
+	known := map[string]bool{}
+	for _, p := range jail.Presets {
+		known[p] = true
+	}
+	check := func(what string, l jail.Limits) error {
+		if _, err := jail.Properties(l); err != nil {
+			return fmt.Errorf("jail %s: %v", what, err)
+		}
+		return nil
+	}
+	if err := check("root", j.Root); err != nil {
+		return err
+	}
+	if err := check("root_max", j.RootMax); err != nil {
+		return err
+	}
+	for name, l := range j.Presets {
+		if !known[name] {
+			return fmt.Errorf("jail preset %q: the presets are %v", name, jail.Presets)
+		}
+		if err := check("preset "+name, l); err != nil {
+			return err
+		}
+	}
+	seen := map[string]bool{}
+	for _, w := range j.Workstreams {
+		switch {
+		case w.Name == "":
+			return errors.New("every [[jail.workstream]] needs a name")
+		case seen[w.Name]:
+			return fmt.Errorf("jail workstream %q set twice", w.Name)
+		case w.Preset != "" && !known[w.Preset]:
+			return fmt.Errorf("jail workstream %q: preset %q: the presets are %v", w.Name, w.Preset, jail.Presets)
+		}
+		seen[w.Name] = true
+		if err := check("workstream "+w.Name, w.Limits); err != nil {
+			return err
+		}
+	}
+	return nil
 }

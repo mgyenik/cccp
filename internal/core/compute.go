@@ -2,10 +2,12 @@ package core
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
 	"cccp/internal/config"
+	"cccp/internal/jail"
 	"cccp/internal/model"
 	"cccp/internal/workstream"
 )
@@ -48,7 +50,46 @@ func Compute(obs Observation, mem Memory, cfg config.Config, watchStart, now tim
 	}
 	c.mem.Workstreams = workstream.Observe(c.mem.Workstreams, LiveWorkstreams(obs.Tmux, snap.Sessions), now)
 	snap.Workstreams = c.mem.Workstreams.Clone()
+	c.mem.Boosts = jail.Expire(c.mem.Boosts, now)
+	snap.Jail = jailState(obs, cfg, c.mem.Boosts, now)
 	return snap, c.mem
+}
+
+// jailState is the jails' state for the running workstreams: their limits
+// (a boost, a configured preset, or normal), their numbers, and the moves
+// that put the tmux server and each pane where they belong.
+func jailState(obs Observation, cfg config.Config, boosts map[string]jail.Boost, now time.Time) Jail {
+	switch {
+	case !cfg.Jail.Enabled:
+		return Jail{Why: "off in the config ([jail] enabled = false)"}
+	case !obs.Jail.Available:
+		return Jail{Why: obs.Jail.Err}
+	}
+	s := cfg.Jail.Settings()
+	seen := map[string]bool{}
+	var names []string
+	var panes []jail.Pane
+	for _, p := range obs.Tmux.Panes {
+		if !seen[p.Session] {
+			seen[p.Session] = true
+			names = append(names, p.Session)
+		}
+		panes = append(panes, jail.Pane{ID: p.ID, PID: p.PID, Workstream: p.Session, Cgroup: obs.Jail.PaneCgroups[p.ID]})
+	}
+	sort.Strings(names)
+	desired := s.Desired(names, boosts, now)
+	j := Jail{On: true, Root: desired[jail.Root], RootStats: obs.Jail.Stats[jail.Root], Desired: desired, MemTotal: obs.Jail.MemTotal, Presets: s.Presets,
+		Moves: jail.Placement(obs.Tmux.ServerPID, obs.Jail.ServerCgroup, panes)}
+	for _, n := range names {
+		l, preset := s.Effective(n, boosts, now)
+		w := JailWorkstream{Name: n, Slice: jail.SliceFor(n), Preset: preset, Limits: l, Stats: obs.Jail.Stats[jail.SliceFor(n)]}
+		w.Normal, w.NormalPreset = s.Effective(n, nil, now)
+		if b, ok := boosts[n]; ok && b.Active(now) {
+			w.Boosted, w.Until = true, b.Until
+		}
+		j.Workstreams = append(j.Workstreams, w)
+	}
+	return j
 }
 
 // LiveWorkstreams is the running tmux server as the workstream record needs
@@ -124,6 +165,11 @@ func (c *computation) noteRegistryTransitions() {
 // workstream due to be forgotten), or zero.
 func NextDeadline(s Snapshot) time.Time {
 	t := s.Workstreams.Deadline() // a closed workstream to forget
+	for _, w := range s.Jail.Workstreams {
+		if w.Boosted && w.Until.After(s.At) && (t.IsZero() || w.Until.Before(t)) {
+			t = w.Until // a boost to revert
+		}
+	}
 	for _, x := range s.Sessions {
 		if x.Group == GroupWorking || x.Group == GroupClosed || !x.Cache.Known {
 			continue

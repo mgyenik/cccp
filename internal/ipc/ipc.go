@@ -22,6 +22,7 @@ const (
 	OpAlias     = "alias"     // set Value as alias for Key ("" clears); reply: OK
 	OpReload    = "reload"    // reread the config file; reply: OK
 	OpSummarize = "summarize" // summarise closed conversation Key if it has no summary; reply: OK
+	OpLimits    = "limits"    // give workstream Key preset Value for For ("normal": end its boost); reply: OK
 )
 
 // Request is a client message.
@@ -32,6 +33,8 @@ type Request struct {
 	Client string `json:"client,omitempty"`
 	Key    string `json:"key,omitempty"`
 	Value  string `json:"value,omitempty"`
+	// For is a boost's length (OpLimits; "" until undone).
+	For string `json:"for,omitempty"`
 }
 
 // Response is a daemon message.

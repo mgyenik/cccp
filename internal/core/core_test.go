@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"cccp/internal/config"
+	"cccp/internal/jail"
 	"cccp/internal/model"
 	"cccp/internal/workstream"
 )
@@ -1172,5 +1173,91 @@ func TestAgyCacheIsEstimated(t *testing.T) {
 		if c.warm && !NextDeadline(snap).Equal(at(0).Add(AgyColdAfter)) {
 			t.Errorf("after %v: deadline %v", c.after, NextDeadline(snap))
 		}
+	}
+}
+
+// --- jails ----------------------------------------------------------------------------
+
+func jailObs() Observation {
+	base := "/user.slice/user-1000.slice/user@1000.service"
+	p1, p2 := pane("%1", "@1", 1), pane("%2", "@2", 2)
+	p1.Session, p1.PID = "infra", 101
+	p2.Session, p2.PID = "docs", 102
+	return Observation{
+		Tmux: TmuxView{OK: true, ServerPID: 100, Panes: []model.TmuxPane{p1, p2}},
+		Jail: JailView{Available: true, ServerCgroup: base + "/cccp.slice/cccp-tmux.scope",
+			PaneCgroups: map[string]string{
+				"%1": base + "/cccp.slice/cccp-ws.slice/cccp-ws-infra.slice/cccp-pane-1.scope",
+				"%2": base + "/cccp.slice/tmux-spawn-x.scope", // a new pane
+			},
+			Stats: map[string]jail.Stats{"cccp-ws-infra.slice": {Memory: 1 << 30}}},
+	}
+}
+
+func TestJailState(t *testing.T) {
+	snap, _ := compute(jailObs(), nil, at(1))
+	j := snap.Jail
+	if !j.On || j.Root != jail.Defaults.Root || len(j.Workstreams) != 2 {
+		t.Fatalf("%+v", j)
+	}
+	infra, _ := j.Find("infra")
+	if infra.Preset != jail.PresetNormal || infra.Slice != "cccp-ws-infra.slice" || infra.Stats.Memory != 1<<30 || infra.Boosted {
+		t.Fatalf("%+v", infra)
+	}
+	if len(j.Moves) != 1 || j.Moves[0].Pane != "%2" || j.Moves[0].Slice != "cccp-ws-docs.slice" {
+		t.Fatalf("moves %+v", j.Moves)
+	}
+	if j.Desired["cccp-ws-docs.slice"] != jail.Defaults.Presets[jail.PresetNormal] {
+		t.Fatalf("desired %+v", j.Desired)
+	}
+}
+
+func TestJailOff(t *testing.T) {
+	c := cfg
+	c.Jail.Enabled = false
+	snap, _ := Compute(jailObs(), NewMemory(), c, t0, at(1))
+	if snap.Jail.On || !strings.Contains(snap.Jail.Why, "enabled = false") || len(snap.Jail.Moves) != 0 {
+		t.Fatalf("%+v", snap.Jail)
+	}
+	o := jailObs()
+	o.Jail = JailView{Err: "no memory controller"}
+	snap, _ = compute(o, nil, at(1))
+	if snap.Jail.On || snap.Jail.Why != "no memory controller" {
+		t.Fatalf("%+v", snap.Jail)
+	}
+}
+
+func TestBoostsShowExpireAndSetTheDeadline(t *testing.T) {
+	mem := NewMemory()
+	mem.Initialized = true
+	mem.Boosts["infra"] = jail.Boost{Preset: jail.PresetMax, Until: at(60)}
+	mem.Boosts["gone"] = jail.Boost{Preset: jail.PresetBoost} // a workstream not running: kept
+	snap, next := compute(jailObs(), &mem, at(1))
+	infra, _ := snap.Jail.Find("infra")
+	if infra.Preset != jail.PresetMax || !infra.Boosted || !infra.Until.Equal(at(60)) || snap.Jail.Root != jail.Defaults.RootMax {
+		t.Fatalf("max boost: %+v root %+v", infra, snap.Jail.Root)
+	}
+	// What ending the boost returns it to.
+	if infra.NormalPreset != jail.PresetNormal || infra.Normal != jail.Defaults.Presets[jail.PresetNormal] {
+		t.Fatalf("normal under the boost: %+v", infra)
+	}
+	c := cfg
+	c.Jail.Workstreams = []config.JailWorkstream{{Name: "infra", Limits: jail.Limits{MemoryMax: "64M"}}}
+	s2, _ := Compute(jailObs(), mem, c, t0, at(1))
+	if w, _ := s2.Jail.Find("infra"); w.NormalPreset != "custom" || w.Normal.MemoryMax != "64M" || w.Preset != jail.PresetMax {
+		t.Fatalf("custom normal under a boost: %+v", w)
+	}
+	if d := NextDeadline(snap); !d.Equal(at(60)) {
+		t.Fatalf("deadline %v", d)
+	}
+	snap, next = compute(jailObs(), &next, at(60))
+	if infra, _ := snap.Jail.Find("infra"); infra.Boosted || infra.Preset != jail.PresetNormal || snap.Jail.Root != jail.Defaults.Root {
+		t.Fatalf("expired: %+v", infra)
+	}
+	if _, ok := next.Boosts["infra"]; ok {
+		t.Fatal("an expired boost stays in memory")
+	}
+	if _, ok := next.Boosts["gone"]; !ok {
+		t.Fatal("an until-undone boost of a workstream not running was dropped")
 	}
 }

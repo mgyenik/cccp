@@ -3,6 +3,7 @@ package core
 import (
 	"time"
 
+	"cccp/internal/jail"
 	"cccp/internal/model"
 )
 
@@ -13,6 +14,7 @@ type Observation struct {
 	Hooks    []HookRecord
 	Registry []RegistryRecord
 	Tmux     TmuxView
+	Jail     JailView
 	// Agents are the agent processes found in tmux panes' process trees.
 	Agents []AgentProc
 
@@ -60,6 +62,20 @@ type RegistryRecord struct {
 	TmuxSocket string
 	// Alive: the registered process (pid and start time) still runs.
 	Alive bool
+}
+
+// JailView is where the tmux server and panes are in the cgroup tree, and
+// cccp's slices' numbers (docs/jails.md).
+type JailView struct {
+	// Available: cgroups v2 with the controllers delegated; Err says why
+	// not.
+	Available    bool
+	Err          string
+	ServerCgroup string
+	PaneCgroups  map[string]string // pane id → its process's cgroup
+	MemTotal     int64             // the machine's memory, bytes
+
+	Stats map[string]jail.Stats // by slice
 }
 
 // TmuxView is the tmux server's panes and clients.

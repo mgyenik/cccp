@@ -232,3 +232,12 @@ func (System) Environ(pid int, key string) string { return Environ(pid, key) }
 
 // StartWall converts a start time to wall-clock time.
 func (System) StartWall(ticks uint64) time.Time { return StartWall(ticks) }
+
+// Descendants is root and every process below it in the table.
+func (t Table) Descendants(root int) []int {
+	out := []int{root}
+	for i := 0; i < len(out); i++ {
+		out = append(out, t.Children[out[i]]...)
+	}
+	return out
+}

@@ -4,6 +4,7 @@ import (
 	"maps"
 	"time"
 
+	"cccp/internal/jail"
 	"cccp/internal/workstream"
 )
 
@@ -43,6 +44,8 @@ type Memory struct {
 	// Workstreams is the record of tmux sessions, for restoring them
 	// (persisted separately, memfile).
 	Workstreams workstream.Record `json:"-"`
+	// Boosts are workstreams' temporary limits (docs/jails.md), by name.
+	Boosts map[string]jail.Boost `json:"boosts,omitempty"`
 }
 
 // NewMemory returns empty memory.
@@ -53,6 +56,7 @@ func NewMemory() Memory {
 		RegCompletions: map[string]time.Time{},
 		Summaries:      map[string]SummaryRecord{},
 		RegLast:        map[string]RegStatus{},
+		Boosts:         map[string]jail.Boost{},
 	}
 }
 
@@ -66,6 +70,7 @@ func (m Memory) Clone() Memory {
 	maps.Copy(c.RegLast, m.RegLast)
 	c.Initialized = m.Initialized
 	c.Workstreams = m.Workstreams.Clone()
+	maps.Copy(c.Boosts, m.Boosts)
 	return c
 }
 
@@ -78,7 +83,10 @@ func (m Memory) Persisted(o Memory) bool {
 		maps.EqualFunc(m.Summaries, o.Summaries, func(a, b SummaryRecord) bool {
 			return a.InputHash == b.InputHash && a.Text == b.Text && a.At.Equal(b.At)
 		}) &&
-		m.Workstreams.Equal(o.Workstreams)
+		m.Workstreams.Equal(o.Workstreams) &&
+		maps.EqualFunc(m.Boosts, o.Boosts, func(a, b jail.Boost) bool {
+			return a.Preset == b.Preset && a.Until.Equal(b.Until)
+		})
 }
 
 // Prune returns a copy without records for sessions not in keep. Aliases

@@ -147,3 +147,11 @@ func TestCacheTextForAnEstimatedCache(t *testing.T) {
 		}
 	}
 }
+
+func TestBytes(t *testing.T) {
+	for n, want := range map[int64]string{0: "-", 4096: "4 KiB", 812 << 20: "812 MiB", 13207024435: "12.3 GiB"} {
+		if got := Bytes(n); got != want {
+			t.Errorf("%d: %q want %q", n, got, want)
+		}
+	}
+}

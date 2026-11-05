@@ -46,6 +46,7 @@ type fakes struct {
 	indexRuns    int
 	indexHold    chan struct{}
 	closedConv   bool // observe a closed conversation "claude:old"
+	jail         core.JailView
 
 	// effects
 	status    []string
@@ -113,6 +114,7 @@ func (f *fakes) Observe(now time.Time) core.Observation {
 			FirstPrompt: "do the thing", LastMessage: "Did it.", Last: time.Unix(1, 0)}}
 	}
 	return core.Observation{
+		Jail:          f.jail,
 		Conversations: convs,
 		Profiles:      append([]model.Profile(nil), f.profiles...),
 		Hooks:         []core.HookRecord{{Path: "/state/s1.json", State: st, ProcAlive: true}},
@@ -211,7 +213,7 @@ type harness struct {
 	reload chan struct{}
 }
 
-func start(t *testing.T, cfg config.Config) *harness {
+func start(t *testing.T, cfg config.Config, opts ...func(*fakes, *Ports)) *harness {
 	t.Helper()
 	dir := t.TempDir()
 	f := &fakes{activity: model.Working, since: time.Unix(1, 0)}
@@ -228,6 +230,9 @@ func start(t *testing.T, cfg config.Config) *harness {
 		LoadConfig: func() (config.Config, error) { return cfg, nil },
 		Now:        time.Now,
 		Log:        log.New(f, "", 0),
+	}
+	for _, o := range opts {
+		o(f, &ports)
 	}
 	mem := core.NewMemory()
 	mem.Initialized = true

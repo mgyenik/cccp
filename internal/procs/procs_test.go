@@ -2,6 +2,8 @@ package procs
 
 import (
 	"os"
+	"reflect"
+	"sort"
 	"testing"
 )
 
@@ -26,5 +28,14 @@ func TestAliveSelf(t *testing.T) {
 	}
 	if Alive(st.PID, st.StartTime+1) {
 		t.Fatal("start time mismatch must mean a different process")
+	}
+}
+
+func TestDescendants(t *testing.T) {
+	tab := Table{Children: map[int][]int{1: {2, 3}, 2: {4}, 9: {10}}}
+	got := tab.Descendants(1)
+	sort.Ints(got)
+	if !reflect.DeepEqual(got, []int{1, 2, 3, 4}) {
+		t.Fatal(got)
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -13,10 +14,15 @@ import (
 	"syscall"
 	"time"
 
+	"cccp/internal/cgroups"
 	"cccp/internal/core"
+	"cccp/internal/daemon"
 	"cccp/internal/dirs"
 	"cccp/internal/ipc"
+	"cccp/internal/jail"
 	"cccp/internal/model"
+	"cccp/internal/present"
+	"cccp/internal/procs"
 	"cccp/internal/tmux"
 	"cccp/internal/ui"
 	"cccp/internal/workstream"
@@ -358,4 +364,86 @@ func (a *app) restoreDormant(name string) (bool, error) {
 		}
 	}
 	return false, nil
+}
+
+// jailer is the daemon's Jailer, or nil when systemd cannot be reached
+// (jails are then off, and the snapshot says why).
+func (a *app) jailer() daemon.Jailer {
+	sd, err := a.systemd()
+	if err != nil {
+		return nil
+	}
+	return daemon.SystemdJailer{Systemd: sd, FS: cgroups.New(os.Getuid()),
+		Descend: func(pid int) []int { return procs.Snapshot().Descendants(pid) }}
+}
+
+// runLimits shows the workstreams' limits, or sets one's preset.
+func runLimits(a *app, args []string) error {
+	fs := flag.NewFlagSet("limits", flag.ExitOnError)
+	length := fs.String("for", "1h", "how long a boost lasts")
+	undone := fs.Bool("until-undone", false, "the boost lasts until set back to normal")
+	pos := parseInterspersed(fs, args)
+	switch len(pos) {
+	case 0:
+		printLimits(os.Stdout, a.snapshot(false))
+		return nil
+	case 2:
+		name, preset := pos[0], pos[1]
+		req := ipc.Request{Op: ipc.OpLimits, Key: name, Value: preset}
+		if preset != jail.PresetNormal && !*undone {
+			req.For = *length
+		}
+		resp, err := a.daemon.Call(req, 3*time.Second)
+		if err != nil {
+			return fmt.Errorf("limits need the daemon (systemctl --user start cccp): %w", err)
+		}
+		if resp.Error != "" {
+			return errors.New(resp.Error)
+		}
+		return nil
+	}
+	return errors.New("usage: cccp limits | cccp limits WORKSTREAM normal|boost|max [--for 2h | --until-undone]")
+}
+
+func printLimits(w io.Writer, snap core.Snapshot) {
+	j := snap.Jail
+	if !j.On {
+		fmt.Fprintf(w, "jails are off: %s\n", j.Why)
+		return
+	}
+	row := func(name, preset string, st jail.Stats, l jail.Limits) {
+		fmt.Fprintf(w, "%-18s %-16s %10s of %10s  cpu %-4d  killed at the limit %d\n",
+			name, preset, present.Bytes(st.Memory), present.Bytes(st.Max), l.CPUWeight, st.OOMKills)
+	}
+	row("(all of tmux)", "", j.RootStats, j.Root)
+	for _, ws := range j.Workstreams {
+		preset := ws.Preset
+		if ws.Boosted {
+			preset += " " + boostLeft(snap.At, ws.Until)
+		}
+		row(ws.Name, preset, ws.Stats, ws.Limits)
+	}
+}
+
+// boostLeft is a boost's time left ("47m"), or "∞" until undone.
+func boostLeft(now, until time.Time) string {
+	if until.IsZero() {
+		return "∞"
+	}
+	return present.Age(until.Sub(now))
+}
+
+// parseInterspersed parses flags wherever they are among the arguments
+// (`cccp limits infra boost --for 2h`; the flag package stops at the first
+// argument that is not a flag) and returns the rest, in order.
+func parseInterspersed(fs *flag.FlagSet, args []string) []string {
+	var pos []string
+	for {
+		_ = fs.Parse(args)
+		if fs.NArg() == 0 {
+			return pos
+		}
+		pos = append(pos, fs.Arg(0))
+		args = fs.Args()[1:]
+	}
 }

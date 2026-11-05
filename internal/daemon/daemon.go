@@ -25,6 +25,7 @@ import (
 	"cccp/internal/config"
 	"cccp/internal/core"
 	"cccp/internal/ipc"
+	"cccp/internal/jail"
 	"cccp/internal/machine"
 	"cccp/internal/model"
 	"cccp/internal/store"
@@ -49,6 +50,23 @@ type Observer interface {
 // first time, so it runs off the event loop.
 type Indexer interface {
 	Update(configDirs []string) error
+}
+
+// Jailer configures cccp's slices and moves processes into them
+// (docs/jails.md): systemd for the changes, cgroups for what is where.
+type Jailer interface {
+	SetLimits(slice string, l jail.Limits) error
+	Move(scope, slice string, pids []int) error
+	Attach(unit string, pids []int) error
+	// Procs are the processes in a cgroup; Descendants a process and those
+	// below it; Cgroup the cgroup a process is in.
+	Procs(cgroup string) []int
+	Descendants(pid int) []int
+	Cgroup(pid int) string
+	// EventsFile is a slice's memory.events, watched for kills at the limit;
+	// Stats a slice's numbers.
+	EventsFile(slice string) string
+	Stats(slice string) jail.Stats
 }
 
 // TmuxWriter sets cccp's tmux options.
@@ -87,6 +105,8 @@ type Ports struct {
 	Memory     MemoryStore
 	Files      FileRemover
 	Indexer    Indexer
+	Jail       Jailer // nil: jails off
+
 	// LoadConfig rereads the configuration (on SIGHUP or a reload request).
 	LoadConfig func() (config.Config, error)
 	Now        func() time.Time
@@ -160,6 +180,11 @@ type Daemon struct {
 	// registryDirs are the watched profile registries (true) or those that
 	// could not be watched yet (false: retried on the next observation).
 	registryDirs map[string]bool
+	// eventFiles are the slices' memory.events files being watched.
+	eventFiles map[string]bool
+	// reobserve: processes were moved or a slice's limits changed; look
+	// again so the snapshot shows the result.
+	reobserve bool
 }
 
 type request struct {
@@ -185,6 +210,7 @@ func New(opt Options, ports Ports, m *machine.Machine) *Daemon {
 		indexed:      make(chan error, 1),
 		subs:         map[*subscriber]bool{},
 		registryDirs: map[string]bool{},
+		eventFiles:   map[string]bool{},
 	}
 }
 
@@ -234,8 +260,16 @@ func (d *Daemon) Run(ctx context.Context, reload <-chan struct{}) error {
 	}
 	d.index() // bring the conversation catalog up to date
 
+	// Memory grows with no event to observe: while workstreams are jailed,
+	// read their numbers (a few small files) every JailPoll for warnings
+	// near their limits.
+	poll := time.NewTicker(JailPoll)
+	defer poll.Stop()
+
 	for {
 		select {
+		case <-poll.C:
+			d.pollJail()
 		case <-ctx.Done():
 			d.exec(d.m.Step(machine.Stop{At: d.ports.Now()}))
 			d.ports.Log.Printf("cccp daemon stopped")
@@ -318,6 +352,10 @@ func (d *Daemon) fileEvent(ev fsnotify.Event, sc *Scope) {
 			d.index()
 		}
 	default:
+		if d.eventFiles[ev.Name] {
+			sc.add(scopeSources) // a slice's memory.events: a kill at its limit?
+			return
+		}
 		if !d.registryDirs[filepath.Dir(ev.Name)] || !claudereg.IsEntryFile(name) {
 			return
 		}
@@ -344,6 +382,30 @@ func (d *Daemon) observe(sc Scope) {
 	obs := o.Observe(now)
 	d.watchRegistries(obs.Profiles)
 	d.exec(d.m.Step(machine.Observed{Obs: obs, At: now}))
+	d.watchJails()
+	if d.reobserve {
+		// Once: what was just done is in the next observation, and the
+		// machine repeats neither a move (within machine.JailRetry) nor
+		// limits already applied, so this cannot loop.
+		d.reobserve = false
+		d.observe(scopeTmux)
+	}
+}
+
+// watchJails watches each running workstream's memory.events (kills at
+// its limit). A slice systemd has not made yet is retried on the next
+// observation (its directory appears when systemd's job has run).
+func (d *Daemon) watchJails() {
+	snap, ok := d.m.Snapshot()
+	if !ok || d.ports.Jail == nil {
+		return
+	}
+	for _, w := range snap.Jail.Workstreams {
+		f := d.ports.Jail.EventsFile(w.Slice)
+		if !d.eventFiles[f] && d.watcher.Add(f) == nil {
+			d.eventFiles[f] = true
+		}
+	}
 }
 
 // watchRegistries watches every profile's registry directory. A directory
@@ -391,6 +453,14 @@ func (d *Daemon) request(r request, sc *Scope) {
 		d.index() // also picks up conversations created outside tmux
 	case ipc.OpSummarize:
 		d.exec(d.m.Step(machine.RequestSummary{Key: r.req.Key, At: now}))
+		reply(r.reply, ipc.Response{OK: true})
+	case ipc.OpLimits:
+		in, err := boostRequest(r.req, now)
+		if err != nil {
+			reply(r.reply, ipc.Response{Error: err.Error()})
+			break
+		}
+		d.exec(d.m.Step(in))
 		reply(r.reply, ipc.Response{OK: true})
 	case ipc.OpTmux:
 		sc.add(TmuxEventScope(r.req.Event))
@@ -477,6 +547,10 @@ func (d *Daemon) exec(effs []machine.Effect) {
 			d.arm(e.At)
 		case machine.Log:
 			d.ports.Log.Print(e.Msg)
+		case machine.JailLimits:
+			d.jailLimits(e)
+		case machine.JailMove:
+			d.jailMove(e.Move)
 		default:
 			d.ports.Log.Printf("daemon: unknown effect %T", e)
 		}

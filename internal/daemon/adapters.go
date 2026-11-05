@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"cccp/internal/jail"
 	"cccp/internal/model"
 	"cccp/internal/tmux"
 )
@@ -124,3 +125,29 @@ func withoutEnv(env []string, key string) []string {
 	}
 	return out
 }
+
+// SystemdJailer is the Jailer: systemd makes the changes, the cgroup
+// filesystem and /proc say what is where.
+type SystemdJailer struct {
+	Systemd interface {
+		SetLimits(slice string, l jail.Limits) error
+		Move(scope, slice string, pids []int) error
+		Attach(unit string, pids []int) error
+	}
+	FS interface {
+		Procs(cgroup string) []int
+		EventsFile(slice string) string
+		Cgroup(pid int) string
+		Stats(slice string) jail.Stats
+	}
+	Descend func(pid int) []int
+}
+
+func (j SystemdJailer) SetLimits(s string, l jail.Limits) error { return j.Systemd.SetLimits(s, l) }
+func (j SystemdJailer) Move(sc, sl string, pids []int) error    { return j.Systemd.Move(sc, sl, pids) }
+func (j SystemdJailer) Attach(u string, pids []int) error       { return j.Systemd.Attach(u, pids) }
+func (j SystemdJailer) Procs(cg string) []int                   { return j.FS.Procs(cg) }
+func (j SystemdJailer) Descendants(pid int) []int               { return j.Descend(pid) }
+func (j SystemdJailer) EventsFile(slice string) string          { return j.FS.EventsFile(slice) }
+func (j SystemdJailer) Cgroup(pid int) string                   { return j.FS.Cgroup(pid) }
+func (j SystemdJailer) Stats(slice string) jail.Stats           { return j.FS.Stats(slice) }

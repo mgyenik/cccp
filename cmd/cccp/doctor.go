@@ -12,6 +12,7 @@ import (
 	"cccp/internal/core"
 	"cccp/internal/install"
 	"cccp/internal/ipc"
+	"cccp/internal/jail"
 )
 
 // runDoctor checks each part of the installation and reports what it found.
@@ -109,6 +110,27 @@ func runDoctor(a *app, args []string) error {
 	check("hook errors (24h)", recent == 0, fmt.Sprintf("%d (see %s)", recent, l.HookErrorLog))
 
 	snap := a.snapshot(false)
+	if j := snap.Jail; !j.On {
+		check("jails", false, "off: "+j.Why)
+	} else {
+		server, panes := true, 0
+		for _, m := range j.Moves {
+			if m.Pane == "" {
+				server = false
+			} else {
+				panes++
+			}
+		}
+		detail := fmt.Sprintf("%d workstreams in their slices; all of tmux in %s", len(j.Workstreams), jail.Root)
+		switch {
+		case !server:
+			detail = "the tmux server is not in " + jail.Root + " yet (is the daemon running?)"
+		case panes > 0:
+			detail = fmt.Sprintf("%d panes not in their workstream's slice yet", panes)
+		}
+		check("jails", server && panes == 0, detail)
+	}
+
 	by := map[core.Tracking]int{}
 	for _, s := range snap.Sessions {
 		if s.Alive {

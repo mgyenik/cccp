@@ -9,6 +9,7 @@ package core
 import (
 	"time"
 
+	"cccp/internal/jail"
 	"cccp/internal/model"
 	"cccp/internal/workstream"
 )
@@ -166,6 +167,47 @@ type Snapshot struct {
 	Problems   []string  `json:"problems,omitempty"`
 	// Workstreams: the tmux sessions, running and dormant (docs/workstreams.md).
 	Workstreams workstream.Record `json:"workstreams"`
+	// Jail: the limits of tmux and its workstreams (docs/jails.md).
+	Jail Jail `json:"jail"`
+}
+
+// Jail is the jails' state: whether they are on, each running workstream's
+// limits and numbers, and what is to be done.
+type Jail struct {
+	On          bool                   `json:"on"`
+	Why         string                 `json:"why,omitempty"` // why off
+	Root        jail.Limits            `json:"root"`
+	RootStats   jail.Stats             `json:"root_stats"`
+	Workstreams []JailWorkstream       `json:"workstreams,omitempty"`
+	Desired     map[string]jail.Limits `json:"desired,omitempty"` // by unit
+	Moves       []jail.Move            `json:"moves,omitempty"`
+	MemTotal    int64                  `json:"mem_total,omitempty"` // the machine's memory, for limits given as percentages
+	Presets     map[string]jail.Limits `json:"presets,omitempty"`   // as configured
+}
+
+// JailWorkstream is one running workstream's jail.
+type JailWorkstream struct {
+	Name    string      `json:"name"`
+	Slice   string      `json:"slice"`
+	Preset  string      `json:"preset"`         // in force: normal, boost, max or custom
+	Until   time.Time   `json:"until,omitzero"` // a boost's end (zero: none, or until undone)
+	Boosted bool        `json:"boosted,omitempty"`
+	Limits  jail.Limits `json:"limits"`
+	// Normal is what it has without a boost (its configured setting), and
+	// NormalPreset where that comes from: what ending a boost returns it to.
+	Normal       jail.Limits `json:"normal"`
+	NormalPreset string      `json:"normal_preset"`
+	Stats        jail.Stats  `json:"stats"`
+}
+
+// Find returns a workstream's jail.
+func (j Jail) Find(name string) (JailWorkstream, bool) {
+	for _, w := range j.Workstreams {
+		if w.Name == name {
+			return w, true
+		}
+	}
+	return JailWorkstream{}, false
 }
 
 // Counts returns the number of sessions per group.

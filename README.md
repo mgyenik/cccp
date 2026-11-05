@@ -77,6 +77,7 @@ full tracking.
 | cockpit | `/` | search everything, live and closed: names, projects, prompts and summaries match at once (fuzzy), conversation text after a pause in typing; `esc` clears |
 | cockpit | `w` | new workstream (a tmux session): type a name, then pick or type its directory (a new path is created); an existing name opens it |
 | cockpit | `M` | move the session to another workstream, or a new one (its whole window moves; a closed conversation resumes there); the cockpit stays open |
+| cockpit | `L` | memory and CPU limits of the session's workstream: boost it for a while (see Memory and CPU limits) |
 | cockpit | `a` | set an alias for the session |
 | cockpit | `m` | mark seen |
 | cockpit | `p` | preview: live pane → conversation → off |
@@ -85,6 +86,7 @@ full tracking.
 | shell | `cccp ls [--all] [--json]` | list sessions |
 | shell | `cccp search TERMS…` | search transcripts (`"quoted phrase"` supported) |
 | shell | `cccp start` | after a reboot: restore the workstreams, attach, open the cockpit |
+| shell | `cccp limits [WS PRESET [--for 2h \| --until-undone]]` | show the workstreams' limits and use, or boost one |
 | shell | `cccp status` | one-line counts |
 | shell | `cccp jump --next` / `--back` / `cccp jump KEY` | jump from scripts |
 
@@ -106,6 +108,26 @@ that resumes it (in its own profile) when you press Enter in it, and the
 terminal attaches to the one you used last with the cockpit open. Nothing
 starts by itself; a bare terminal stays bare. Design:
 [docs/workstreams.md](docs/workstreams.md).
+
+### Memory and CPU limits (jails)
+
+Agents run heavy things. cccp keeps tmux and each workstream in its own
+cgroup through your systemd user manager, so one runaway build cannot take
+the machine's memory or starve the desktop and the other workstreams:
+
+* all of tmux may use 80% of memory, at a lower CPU priority than the
+  desktop;
+* each workstream may use 47% (`normal`); at its limit the kernel kills a
+  process in that workstream, not your browser. cccp notifies you at 85%.
+
+When a workstream needs more, `L` in the cockpit (or `cccp limits infra
+boost --for 2h`) raises it to `boost` (80%, four times the CPU share) or
+`max` (90%, above the desktop), for 1 h by default, 2 h, 8 h or until
+undone; it reverts by itself. `cccp limits` shows every workstream's use and
+limits. Installing it needs no restart: the running tmux server and panes
+are moved. Without a systemd user manager (or cgroups v2) it is off and
+`cccp doctor` says why. Design and measurements:
+[docs/jails.md](docs/jails.md).
 
 ### Notifications
 
@@ -148,6 +170,24 @@ quiet_after = "10s"            # unmanaged session: pending tool + quiet pane �
 
 Summaries run `claude -p` with no tools, no settings and no session
 persistence. With `"ac"` they only run on mains power.
+
+Jails (all optional; the built-in values are in docs/jails.md):
+
+```toml
+[jail]
+enabled = true
+
+[jail.root]                    # all of tmux
+memory_max = "80%"
+
+[jail.preset.normal]           # change a preset
+memory_max = "40G"
+
+[[jail.workstream]]            # one workstream's own normal limits
+name = "builds"
+preset = "boost"               # and/or custom values over it:
+cpu_weight = 200
+```
 
 ### Profiles (several Claude accounts)
 

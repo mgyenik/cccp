@@ -173,6 +173,8 @@ type Machine struct {
 	// requested: closed conversations the user asked to summarise.
 	requested map[string]bool
 
+	js jailState
+
 	dirty     bool
 	saveDue   time.Time
 	lastPrune time.Time
@@ -189,6 +191,7 @@ func New(cfg config.Config, mem core.Memory, start time.Time) *Machine {
 		windows:    map[string]string{},
 		sum:        newSumQueue(),
 		requested:  map[string]bool{},
+		js:         newJailState(),
 	}
 }
 
@@ -237,6 +240,13 @@ func (m *Machine) Step(in Input) []Effect {
 	case RequestSummary:
 		m.requested[in.Key] = true
 		return m.recompute(in.At)
+	case SetBoost:
+		m.setBoost(in)
+		return m.recompute(in.At)
+	case JailDone:
+		return append(m.jailDone(in), m.arm(m.snap)...)
+	case JailStatsRead:
+		return m.jailStatsRead(in)
 	case Stop:
 		return m.stop()
 	}
@@ -277,6 +287,7 @@ func (m *Machine) recompute(now time.Time) []Effect {
 		m.prime(snap)
 	}
 	effs = append(effs, m.summaries(snap, wasAlive, now)...)
+	effs = append(effs, m.jail(snap, now)...)
 	effs = append(effs, Publish{Snapshot: snap})
 	effs = append(effs, m.prune(snap, now)...)
 	if m.dirty && !now.Before(m.saveDue) {
@@ -570,6 +581,9 @@ func (m *Machine) arm(snap core.Snapshot) []Effect {
 	at := core.NextDeadline(snap)
 	if m.dirty && (at.IsZero() || m.saveDue.Before(at)) {
 		at = m.saveDue
+	}
+	if r := m.jailDeadline(snap.At); !r.IsZero() && (at.IsZero() || r.Before(at)) {
+		at = r
 	}
 	if at.Equal(m.timerAt) {
 		return nil

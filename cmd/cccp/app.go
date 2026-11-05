@@ -5,10 +5,12 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sync"
 	"time"
 
 	"cccp/internal/agydb"
 	"cccp/internal/catalog"
+	"cccp/internal/cgroups"
 	"cccp/internal/claudereg"
 	"cccp/internal/config"
 	"cccp/internal/core"
@@ -20,6 +22,7 @@ import (
 	"cccp/internal/power"
 	"cccp/internal/procs"
 	"cccp/internal/store"
+	"cccp/internal/systemd"
 	"cccp/internal/tmux"
 	"cccp/internal/transcript"
 )
@@ -33,6 +36,10 @@ type app struct {
 	daemon ipc.Client
 	store  store.Store
 	stderr io.Writer
+
+	sdOnce sync.Once
+	sd     *systemd.Manager
+	sdErr  error
 }
 
 func newApp() *app {
@@ -122,6 +129,33 @@ func (a *app) updateCatalog(g *gather.Gatherer) {
 	g.RefreshCatalog()
 }
 
+// cgroups is the cgroup reader for jails: unavailable, with the reason,
+// when systemd cannot be reached (jails need it to make changes, so they
+// must not look on without it).
+func (a *app) cgroups() gather.Cgroups {
+	fs := cgroups.New(os.Getuid())
+	if _, err := a.systemd(); err != nil {
+		return unavailable{fs, err}
+	}
+	return fs
+}
+
+// systemd connects to the user's systemd manager once.
+func (a *app) systemd() (*systemd.Manager, error) {
+	a.sdOnce.Do(func() { a.sd, a.sdErr = systemd.Connect() })
+	return a.sd, a.sdErr
+}
+
+// unavailable is a cgroup reader that reports why jails are off.
+type unavailable struct {
+	cgroups.FS
+	err error
+}
+
+func (u unavailable) Available() error {
+	return fmt.Errorf("no systemd user manager on D-Bus: %v", u.err)
+}
+
 // gatherer wires the real sources.
 func (a *app) gatherer(cfg config.Config) *gather.Gatherer {
 	host, _ := os.Hostname()
@@ -133,6 +167,7 @@ func (a *app) gatherer(cfg config.Config) *gather.Gatherer {
 		Transcripts:      transcript.NewReader(),
 		Files:            gather.DiskFiles{Home: a.l.Home, AgyBrainDir: a.l.AgyBrainDir},
 		Catalog:          a.catalog(nil), // reading the catalog needs no transcript directories
+		Cgroups:          a.cgroups(),
 		AgyDB:            agydb.NewCache(a.l.AgySummariesDB),
 		Power:            power.System{},
 		Hostname:         host,

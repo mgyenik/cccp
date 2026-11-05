@@ -23,6 +23,7 @@ import (
 
 	"cccp"
 	"cccp/internal/catalog"
+	"cccp/internal/cgroups"
 	"cccp/internal/core"
 	"cccp/internal/daemon"
 	"cccp/internal/dirs"
@@ -387,6 +388,7 @@ func runDaemon(a *app, args []string) error {
 	}, daemon.Ports{
 		Observer:   g,
 		Indexer:    indexer{base: a.catalog(nil)},
+		Jail:       a.jailer(),
 		Tmux:       daemon.TmuxOptions{Client: a.tmux},
 		Notifier:   daemon.ExecNotifier{},
 		Summarizer: daemon.ClaudeSummarizer{Dir: a.l.CacheDir},
@@ -442,10 +444,25 @@ func runUI(a *app, args []string) error {
 		Dirs:       dirs.FS{},
 		Home:       a.l.Home,
 		Workstream: a.clientValue(*client, "#{session_name}"),
+		JailStats:  cgroups.New(os.Getuid()).Stats,
 
 		Actions: ui.Actions{
 			OpenWorkstream: func(name string) error { return a.openWorkstream(*client, name) },
 			MoveSession:    func(s core.Session, dest string) error { return a.moveSession(s, dest) },
+			SetLimits: func(ws, preset string, d time.Duration) error {
+				if !hasDaemon {
+					return needDaemon("limits")
+				}
+				req := ipc.Request{Op: ipc.OpLimits, Key: ws, Value: preset}
+				if d > 0 {
+					req.For = d.String()
+				}
+				resp, err := a.daemon.Call(req, 3*time.Second)
+				if err == nil && resp.Error != "" {
+					err = errors.New(resp.Error)
+				}
+				return err
+			},
 			NewWorkstream: func(name, dir string, create bool) error {
 				return a.newWorkstream(*client, name, dir, create)
 			},
