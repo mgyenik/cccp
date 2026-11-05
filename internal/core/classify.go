@@ -190,6 +190,7 @@ func (c *computation) build(b *builder) (Session, bool) {
 		infer(&s, b.agent, m, tp, c.cfg.QuietAfter.Duration, c.now)
 	default:
 		mergeActivity(&s, hs, r, m.claude)
+		s.BackgroundShell = r != nil && r.BackgroundShell() && s.Activity == model.Idle
 	}
 	if hs != nil {
 		s.LastEventAt = hs.LastEventAt
@@ -257,11 +258,20 @@ func (c *computation) build(b *builder) (Session, bool) {
 
 	c.attention(&s, b, hs, m)
 
-	if rec, ok := c.mem.Summaries[s.Key]; ok {
-		s.Summary = rec.Text
-	}
 	s.Alias = c.mem.Aliases[s.Key]
 	s.Group = groupOf(s, c.now)
+	// A summary describes the state it was written for: a newer turn's
+	// session shows none until its own is written.
+	if rec, ok := c.mem.Summaries[s.Key]; ok {
+		if _, hash := SummaryInput(s); rec.InputHash == hash {
+			s.Summary, s.SummaryVerdict = rec.Text, rec.Verdict
+		}
+	}
+	// A finished turn waiting on its own background shell, with nothing
+	// for the user yet, is still work in progress.
+	if s.Group == GroupYourTurn && s.BackgroundShell && s.SummaryVerdict == VerdictWait {
+		s.Group = GroupWorking
+	}
 	// A closed session is listed while its transcript exists; without one
 	// (only hook state left), for the retention period.
 	if s.Group == GroupClosed && b.conv == nil && !s.EndedAt.IsZero() && c.now.Sub(s.EndedAt) > c.cfg.EndedRetention.Duration {
@@ -303,7 +313,9 @@ func mergeActivity(s *Session, h *model.HookState, r *model.RegistryEntry, cm mo
 	if r != nil {
 		regAct, regAt = r.Activity(), r.StatusAt()
 	}
-	useHook := h != nil && (r == nil || classOf(h.Activity) == classOf(regAct) || !regAt.After(h.ActivityAt))
+	// A registry status cccp does not know says nothing: it never
+	// overrides the hook's (Claude Code adds statuses over time).
+	useHook := h != nil && (r == nil || regAct == model.Unknown || classOf(h.Activity) == classOf(regAct) || !regAt.After(h.ActivityAt))
 	if useHook {
 		s.Activity, s.ActivitySince = h.Activity, h.ActivityAt
 		s.Tool, s.ToolDetail, s.Question = h.Tool, h.ToolDetail, h.Question
@@ -386,11 +398,16 @@ func (c *computation) fillText(s *Session, h *model.HookState, r *model.Registry
 	// Last prompt / message: whichever source is newest.
 	var msgAt time.Time
 	if h != nil {
-		s.LastPrompt, s.LastPromptAt = h.LastPrompt, h.LastPromptAt
+		// State written before automatic prompts were skipped may still
+		// hold one: it is not the user's prompt.
+		if !model.AutoPrompt(h.LastPrompt) {
+			s.LastPrompt, s.LastPromptAt = h.LastPrompt, h.LastPromptAt
+		}
 		s.LastMessage, msgAt = h.LastMessage, h.LastMessageAt
 	}
 	if m.hasClaude {
 		cm := m.claude
+		s.AutoTurn = cm.LastTurnAuto
 		if cm.LastPrompt != "" && (s.LastPrompt == "" || cm.LastPromptAt.After(s.LastPromptAt)) {
 			s.LastPrompt = cm.LastPrompt
 			if !cm.LastPromptAt.IsZero() {

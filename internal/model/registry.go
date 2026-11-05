@@ -67,7 +67,10 @@ func (e RegistryEntry) Activity() Activity {
 	switch e.Status {
 	case "busy":
 		return Working
-	case "idle":
+	case "idle", "shell":
+		// "shell": idle at the prompt while a background Bash task the
+		// session started still runs (Claude Code 2.1.318: status is
+		// "shell" when idle and any local_bash task is not finished).
 		return Idle
 	case "waiting":
 		switch e.WaitingFor {
@@ -79,6 +82,10 @@ func (e RegistryEntry) Activity() Activity {
 	}
 	return Unknown
 }
+
+// BackgroundShell: idle at the prompt with a background Bash task still
+// running (status "shell").
+func (e RegistryEntry) BackgroundShell() bool { return e.Status == "shell" }
 
 // Question describes what a waiting session waits for.
 func (e RegistryEntry) Question() string {

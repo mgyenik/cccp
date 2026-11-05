@@ -96,7 +96,9 @@ func applyClaude(s *model.HookState, ev model.Event, fresh bool) {
 		}
 
 	case "UserPromptSubmit":
-		if ev.Prompt != "" && !ev.Time.Before(s.LastPromptAt) {
+		// A prompt Claude Code sent itself (a background report) starts a
+		// turn but is not the user's last prompt.
+		if ev.Prompt != "" && !model.AutoPrompt(ev.Prompt) && !ev.Time.Before(s.LastPromptAt) {
 			s.LastPrompt, s.LastPromptAt = ev.Prompt, ev.Time
 		}
 		if set(s, ev, fresh, model.Working) {

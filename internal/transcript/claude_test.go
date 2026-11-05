@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"cccp/internal/model"
 )
 
 func ts(sec int) string {
@@ -118,5 +120,72 @@ func TestClaudeSidechainIgnored(t *testing.T) {
 	m, _ := NewReader().Claude(p)
 	if m.PendingTool || m.LastAssistantText != "main answer" {
 		t.Fatalf("sidechain leaked: %+v", m)
+	}
+}
+
+// entry is a main-thread user entry with Claude Code's turn fields.
+func entry(sec int, text, extra string) string {
+	return fmt.Sprintf(`{"type":"user","isSidechain":false,"sessionId":"S","timestamp":%q,%s"message":{"role":"user","content":%q}}`, ts(sec), extra, text)
+}
+
+// Who started the last turn: the user, or Claude Code on a background
+// task's or subagent's report (as the real entries record it, 2.1.318).
+func TestLastTurnOrigin(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "S.jsonl")
+	r := NewReader()
+	turn := func(lines ...string) model.ClaudeMeta {
+		t.Helper()
+		write(t, p, lines...)
+		m, err := r.Claude(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return m
+	}
+	m := turn(entry(1, "check on the agents", `"promptSource":"typed","turnOrigin":"human",`), asst(2, "end_turn", `{"type":"text","text":"ok"}`, 0, 0))
+	if m.LastTurnAuto || !m.LastTurnAt.Equal(time.Date(2026, 11, 2, 12, 0, 1, 0, time.UTC)) {
+		t.Fatalf("typed: %+v", m)
+	}
+	m = turn(entry(3, "<task-notification> <task-id>b1</task-id> <status>completed</status>", `"promptSource":"system","turnOrigin":"task_notification",`), asst(4, "end_turn", `{"type":"text","text":"still waiting"}`, 0, 0))
+	if !m.LastTurnAuto || m.LastPrompt != "check on the agents" {
+		t.Fatalf("task notification: %+v", m)
+	}
+	// A subagent's hand-back is a meta entry, but it starts a turn.
+	m = turn(entry(5, "Another Claude session sent a message:\n<agent-message from=\"a1\">", `"isMeta":true,"promptSource":"system","turnOrigin":"peer",`))
+	if !m.LastTurnAuto || m.LastTurnAt.Second() != 5 {
+		t.Fatalf("peer: %+v", m)
+	}
+	// Tool results and system reminders start no turn.
+	m = turn(toolResult(6), entry(7, "<system-reminder>x</system-reminder>", `"isMeta":true,`))
+	if !m.LastTurnAuto || m.LastTurnAt.Second() != 5 {
+		t.Fatalf("no new turn: %+v", m)
+	}
+	m = turn(entry(8, "go ahead", `"promptSource":"suggestion_accepted","turnOrigin":"human",`))
+	if m.LastTurnAuto {
+		t.Fatalf("an accepted suggestion is the user's: %+v", m)
+	}
+	// A tool result never starts a turn, even with text beside it.
+	mixed := fmt.Sprintf(`{"type":"user","isSidechain":false,"sessionId":"S","timestamp":%q,"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t","content":"ok"},{"type":"text","text":"note"}]}}`, ts(8))
+	if m = turn(entry(8, "<task-notification>", `"turnOrigin":"task_notification",`), mixed); !m.LastTurnAuto || m.LastTurnAt.Second() != 8 {
+		t.Fatalf("tool result with text: %+v", m)
+	}
+	// promptSource alone (no turnOrigin) decides too.
+	if m = turn(entry(8, "typed text", `"promptSource":"typed",`)); m.LastTurnAuto {
+		t.Fatalf("typed: %+v", m)
+	}
+	if m = turn(entry(8, "a scheduled prompt", `"promptSource":"system",`)); !m.LastTurnAuto {
+		t.Fatalf("system: %+v", m)
+	}
+	// A meta entry without the fields (a caveat) starts no turn.
+	if m = turn(entry(9, "Caveat: the messages below were generated", `"isMeta":true,`)); !m.LastTurnAuto || m.LastTurnAt.Second() != 8 {
+		t.Fatalf("meta caveat: %+v", m)
+	}
+	// Older entries without the fields: a task notification by its text,
+	// a plain prompt as the user's.
+	if m = turn(user(9, "plain"), user(9, "<task-notification> <task-id>b2</task-id>")); !m.LastTurnAuto {
+		t.Fatalf("old notification: %+v", m)
+	}
+	if m = turn(user(10, "next")); m.LastTurnAuto || m.LastTurnAt.Second() != 10 {
+		t.Fatalf("old prompt: %+v", m)
 	}
 }

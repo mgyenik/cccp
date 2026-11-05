@@ -184,15 +184,19 @@ var (
 )
 
 type rawEntry struct {
-	Type        string          `json:"type"`
-	SessionID   string          `json:"sessionId"`
-	Timestamp   time.Time       `json:"timestamp"`
-	IsSidechain bool            `json:"isSidechain"`
-	IsMeta      bool            `json:"isMeta"`
-	AITitle     string          `json:"aiTitle"`
-	LastPrompt  string          `json:"lastPrompt"`
-	QuerySource string          `json:"querySource"`
-	Message     json.RawMessage `json:"message"`
+	Type        string    `json:"type"`
+	SessionID   string    `json:"sessionId"`
+	Timestamp   time.Time `json:"timestamp"`
+	IsSidechain bool      `json:"isSidechain"`
+	IsMeta      bool      `json:"isMeta"`
+	AITitle     string    `json:"aiTitle"`
+	LastPrompt  string    `json:"lastPrompt"`
+	QuerySource string    `json:"querySource"`
+	// Who started a turn: turnOrigin "human", "task_notification",
+	// "peer"…; promptSource "typed", "suggestion_accepted", "system"….
+	TurnOrigin   string          `json:"turnOrigin"`
+	PromptSource string          `json:"promptSource"`
+	Message      json.RawMessage `json:"message"`
 }
 
 type rawMessage struct {
@@ -320,6 +324,25 @@ func (e *claudeEntry) parseAssistant(line []byte, seq int64) {
 	e.meta.Interrupted = false
 }
 
+// turnStart reports whether a user entry starts a turn, and whether Claude
+// Code started it on its own (not the user). Entries record it in
+// turnOrigin or promptSource; older ones carry neither, and then a task
+// notification is recognised by its text and any other plain prompt is the
+// user's (meta entries and command wrappers start no turn).
+func turnStart(r rawEntry, prompt string) (starts, auto bool) {
+	switch {
+	case r.TurnOrigin != "":
+		return true, r.TurnOrigin != "human"
+	case r.PromptSource != "":
+		return true, r.PromptSource == "system"
+	case model.AutoPrompt(prompt):
+		return true, true
+	case r.IsMeta || prompt == "" || strings.HasPrefix(prompt, "<") || strings.HasPrefix(prompt, "[Request interrupted by user"):
+		return false, false
+	}
+	return true, false
+}
+
 func (e *claudeEntry) parseUser(line []byte, seq int64) {
 	var r rawEntry
 	if json.Unmarshal(line, &r) != nil || r.Type != "user" || r.IsSidechain {
@@ -354,6 +377,11 @@ func (e *claudeEntry) parseUser(line []byte, seq int64) {
 	}
 	e.seqUser = seq
 	e.meta.LastUserAt = r.Timestamp
+	if !toolResult {
+		if starts, auto := turnStart(r, prompt); starts {
+			e.meta.LastTurnAuto, e.meta.LastTurnAt = auto, r.Timestamp
+		}
+	}
 	if toolResult {
 		e.meta.PendingTool, e.meta.PendingToolName = false, ""
 		e.meta.Interrupted = false

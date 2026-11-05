@@ -13,6 +13,9 @@ type SummaryRecord struct {
 	InputHash string    `json:"input_hash"`
 	Text      string    `json:"text"`
 	At        time.Time `json:"at"`
+	// Verdict is a live session's VerdictAct or VerdictWait ("" for a closed
+	// conversation, or a summary that gave none).
+	Verdict string `json:"verdict,omitempty"`
 }
 
 // RegStatus is a registry session's last observed status.
@@ -81,7 +84,7 @@ func (m Memory) Persisted(o Memory) bool {
 		maps.Equal(m.Aliases, o.Aliases) &&
 		maps.EqualFunc(m.RegCompletions, o.RegCompletions, time.Time.Equal) &&
 		maps.EqualFunc(m.Summaries, o.Summaries, func(a, b SummaryRecord) bool {
-			return a.InputHash == b.InputHash && a.Text == b.Text && a.At.Equal(b.At)
+			return a.InputHash == b.InputHash && a.Text == b.Text && a.At.Equal(b.At) && a.Verdict == b.Verdict
 		}) &&
 		m.Workstreams.Equal(o.Workstreams) &&
 		maps.EqualFunc(m.Boosts, o.Boosts, func(a, b jail.Boost) bool {

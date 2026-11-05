@@ -133,6 +133,13 @@ func Detail(s core.Session) string {
 			return s.Tool + ": " + s.ToolDetail
 		}
 		return s.Tool
+	case s.BackgroundShell && s.Group == core.GroupWorking:
+		// Waiting on its own background shell, nothing for the user yet.
+		text := s.Summary
+		if text == "" {
+			text = LastLine(s.LastMessage)
+		}
+		return "background shell · " + text
 	case s.Summary != "" && (s.Group == core.GroupYourTurn || s.Group == core.GroupNeedsYou):
 		return s.Summary
 	case s.Group == core.GroupYourTurn && s.LastMessage != "":

@@ -10,8 +10,6 @@
 package machine
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"sort"
 	"strings"
@@ -168,6 +166,8 @@ type Machine struct {
 	// notified holds, per session, the attention state last notified (or
 	// present when watching began, so existing states never notify).
 	notified map[string]string
+	// held: automatic turns' notifications waiting for their summary.
+	held map[string]held
 
 	sum *sumQueue
 	// requested: closed conversations the user asked to summarise.
@@ -189,6 +189,7 @@ func New(cfg config.Config, mem core.Memory, start time.Time) *Machine {
 		mem:        mem.Clone(),
 		watchStart: start,
 		windows:    map[string]string{},
+		held:       map[string]held{},
 		sum:        newSumQueue(),
 		requested:  map[string]bool{},
 		js:         newJailState(),
@@ -353,8 +354,26 @@ func (m *Machine) prime(snap core.Snapshot) {
 	}
 }
 
+// HoldForSummary bounds how long an automatic turn's notification waits
+// for the summary that decides it.
+const HoldForSummary = 2 * time.Minute
+
+// held is an automatic turn's notification waiting for its summary.
+type held struct {
+	sig   string
+	since time.Time
+}
+
 // notify emits a notification for each session that newly needs attention
 // while its pane is not visible.
+//
+// A turn the user started notifies at once. A turn that may be waiting on
+// background work (Session.Background: Claude Code started it on a
+// background report, or a background shell still runs) is usually a
+// progress report: its notification waits for the turn's summary and goes
+// out only if the summary says there is something to do (VerdictAct). It goes out anyway
+// if no summary can come (summaries off or not allowed, failing or paused)
+// or none has come within HoldForSummary.
 func (m *Machine) notify(snap core.Snapshot) []Effect {
 	var effs []Effect
 	live := map[string]bool{}
@@ -363,27 +382,83 @@ func (m *Machine) notify(snap core.Snapshot) []Effect {
 		sig := signature(s)
 		if sig == "" {
 			delete(m.notified, s.Key)
+			delete(m.held, s.Key)
 			continue
 		}
 		if m.notified[s.Key] == sig {
 			continue
 		}
-		m.notified[s.Key] = sig
+		title, body := notificationText(s, len(m.obs.Profiles) > 1)
+		what := fmt.Sprintf("%s (%s, %s): %s — %s", s.Key, s.Group, orDash(s.Location), title, body)
 		if !m.cfg.Notify || len(m.cfg.NotifyCommand) == 0 || s.Visible {
+			m.notified[s.Key] = sig
+			delete(m.held, s.Key)
+			if s.Visible {
+				// Every attention state leaves a trace in the log, so a
+				// missing notification can be told from a missed one.
+				effs = append(effs, Log{Msg: "not notifying (pane visible) " + what})
+			}
 			continue
 		}
-		title, body := notificationText(s, len(m.obs.Profiles) > 1)
+		if s.Group == core.GroupYourTurn && s.Background() {
+			if s.Summary == "" && m.summaryComing(s, snap.OnBattery, snap.At) {
+				h, ok := m.held[s.Key]
+				if !ok || h.sig != sig {
+					h = held{sig: sig, since: snap.At}
+					m.held[s.Key] = h
+				}
+				if snap.At.Sub(h.since) < HoldForSummary {
+					continue
+				}
+			}
+			delete(m.held, s.Key)
+			if s.SummaryVerdict == core.VerdictWait {
+				m.notified[s.Key] = sig
+				effs = append(effs, Log{Msg: "not notifying (background work, nothing to do) " + what})
+				continue
+			}
+		}
+		m.notified[s.Key] = sig
 		argv := append(append([]string{}, m.cfg.NotifyCommand...), title, body)
-		effs = append(effs,
-			Log{Msg: fmt.Sprintf("notify %s (%s, %s): %s", s.Key, s.Group, orDash(s.Location), title)},
-			Notify{Key: s.Key, Argv: argv})
+		effs = append(effs, Log{Msg: "notify " + what}, Notify{Key: s.Key, Argv: argv})
 	}
 	for k := range m.notified {
 		if !live[k] {
 			delete(m.notified, k)
 		}
 	}
+	for k := range m.held {
+		if !live[k] {
+			delete(m.held, k)
+		}
+	}
 	return effs
+}
+
+// summaryComing reports whether a summary of s as it is now is on its way:
+// one will be offered (summaries() would) and has neither failed nor been
+// paused.
+func (m *Machine) summaryComing(s core.Session, onBattery bool, now time.Time) bool {
+	if !s.Alive || (s.LastMessage == "" && s.Question == "") {
+		return false
+	}
+	prof, ok := m.summaryProfile(s)
+	if !ok || !m.summariesAllowed(prof.Summaries, onBattery) {
+		return false
+	}
+	_, hash := core.SummaryInput(s)
+	return !m.sum.stalled(s.Key, hash, now)
+}
+
+// heldDeadline is when the first held notification stops waiting.
+func (m *Machine) heldDeadline() time.Time {
+	var t time.Time
+	for _, h := range m.held {
+		if d := h.since.Add(HoldForSummary); t.IsZero() || d.Before(t) {
+			t = d
+		}
+	}
+	return t
 }
 
 func notificationText(s core.Session, showProfile bool) (title, body string) {
@@ -411,57 +486,21 @@ func orDash(s string) string {
 // conversation.
 const (
 	LiveSummaryPrompt = "You write one-line status lines for a dashboard of coding-agent sessions. " +
-		"Given a session's title, the user's last prompt and the assistant's last message, say in one line " +
-		"under 90 characters what the session needs from the user next (a decision, an answer, a review, " +
-		"or nothing). No preamble, no quotes, no trailing period."
+		"Given a session's title and the assistant's last message (and, for a turn the user started, the " +
+		"user's prompt), decide whether the user has something to do now, then say in one line under 90 " +
+		"characters what the session needs from the user next, then end the line with \" [act]\" or \" [wait]\".\n" +
+		"[act]: the assistant's last message asks the user a question, asks for a decision or approval, tells " +
+		"the user to do something (run a command, review a result), or says new work is ready for the user to try.\n" +
+		"[wait]: it only reports progress, says agents or tasks are still running, or says what the assistant " +
+		"itself will do next.\n" +
+		"No preamble, no quotes, no trailing period."
+	// The verdict comes last, after the line is written: asked for first, it
+	// was measured to contradict the line it then wrote (docs/notifications.md).
 	ClosedSummaryPrompt = "You write one-line descriptions for a list of past coding-agent conversations. " +
 		"Given a conversation's title, the user's first and last prompts and the assistant's last message, " +
 		"say in one line under 90 characters what the conversation was about and where it left off. " +
 		"No preamble, no quotes, no trailing period."
 )
-
-func hashOf(s string) string {
-	h := sha256.Sum256([]byte(s))
-	return hex.EncodeToString(h[:8])
-}
-
-// closedSummaryInput builds the summarizer input for a closed conversation.
-func closedSummaryInput(s core.Session) (input, hash string) {
-	var b strings.Builder
-	b.WriteString("Conversation title: " + s.DisplayTitle() + "\n")
-	b.WriteString("User's first prompt:\n" + tail(s.FirstPrompt, 1200) + "\n")
-	b.WriteString("User's last prompt:\n" + tail(s.LastPrompt, 1200) + "\n")
-	b.WriteString("Assistant's last message (end):\n" + tail(s.LastMessage, 2000) + "\n")
-	input = b.String()
-	return input, hashOf("closed\n" + input)
-}
-
-// summaryInput builds the summarizer input and its hash for a session.
-func summaryInput(s core.Session) (input, hash string) {
-	var b strings.Builder
-	b.WriteString("Session title: " + s.DisplayTitle() + "\n")
-	if s.Question != "" {
-		b.WriteString("It is waiting on: " + s.Question + "\n")
-	}
-	if s.Tool != "" && s.Group == core.GroupNeedsYou {
-		b.WriteString("Pending tool: " + s.Tool + " " + s.ToolDetail + "\n")
-	}
-	b.WriteString("User's last prompt:\n" + tail(s.LastPrompt, 1500) + "\n")
-	b.WriteString("Assistant's last message (end):\n" + tail(s.LastMessage, 2500) + "\n")
-	input = b.String()
-	return input, hashOf(input)
-}
-
-func tail(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	cut := len(s) - n
-	for cut < len(s) && s[cut]&0xC0 == 0x80 { // do not split a UTF-8 sequence
-		cut++
-	}
-	return "…" + s[cut:]
-}
 
 // summaryProfile is the profile a session's summary runs under: its own,
 // or (for agy sessions, which have none) the default profile.
@@ -495,14 +534,14 @@ func (m *Machine) summaries(snap core.Snapshot, wasAlive map[string]bool, now ti
 		var in, hash, prompt string
 		switch {
 		case s.Alive && s.NeedsAttention() && (s.LastMessage != "" || s.Question != ""):
-			in, hash = summaryInput(s)
+			in, hash = core.SummaryInput(s)
 			prompt = LiveSummaryPrompt
 		case s.Group == core.GroupClosed && (wasAlive[s.Key] || m.requested[s.Key]):
 			delete(m.requested, s.Key)
 			if s.FirstPrompt == "" && s.LastMessage == "" {
 				continue // nothing to summarise
 			}
-			in, hash = closedSummaryInput(s)
+			in, hash = core.SummaryInput(s)
 			prompt = ClosedSummaryPrompt
 		default:
 			continue
@@ -539,12 +578,36 @@ func (m *Machine) summaryDone(in SummaryDone) []Effect {
 	}
 	if in.Err != nil {
 		effs = append(effs, Log{Msg: fmt.Sprintf("summary for %s failed: %v", in.Key, in.Err)})
-	} else if text := cleanSummary(in.Text); text != "" {
+	} else if verdict, text := splitVerdict(firstLine(in.Text)); cleanSummary(text) != "" {
+		text = cleanSummary(text)
 		mem := m.mem.Clone()
-		mem.Summaries[in.Key] = core.SummaryRecord{InputHash: in.Hash, Text: text, At: in.At}
+		mem.Summaries[in.Key] = core.SummaryRecord{InputHash: in.Hash, Text: text, At: in.At, Verdict: verdict}
 		m.setMem(mem, in.At)
 	}
 	return append(effs, m.recompute(in.At)...)
+}
+
+// splitVerdict takes a live summary's closing "[act]" or "[wait]" off its
+// line (LiveSummaryPrompt); without one the verdict is "".
+func splitVerdict(s string) (verdict, text string) {
+	t := strings.TrimSpace(s)
+	for _, v := range []string{core.VerdictAct, core.VerdictWait} {
+		tag := "[" + v + "]"
+		// t is trimmed and longer than the tag: text before it is never empty.
+		if len(t) > len(tag) && strings.EqualFold(t[len(t)-len(tag):], tag) {
+			return v, strings.TrimSpace(t[:len(t)-len(tag)])
+		}
+	}
+	return "", s
+}
+
+// firstLine is s's first non-empty line, trimmed.
+func firstLine(s string) string {
+	s = strings.TrimSpace(s)
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		s = strings.TrimSpace(s[:i])
+	}
+	return s
 }
 
 // cleanSummary keeps the first line, unquoted, at most 120 characters.
@@ -584,6 +647,9 @@ func (m *Machine) arm(snap core.Snapshot) []Effect {
 	}
 	if r := m.jailDeadline(snap.At); !r.IsZero() && (at.IsZero() || r.Before(at)) {
 		at = r
+	}
+	if h := m.heldDeadline(); !h.IsZero() && (at.IsZero() || h.Before(at)) {
+		at = h
 	}
 	if at.Equal(m.timerAt) {
 		return nil

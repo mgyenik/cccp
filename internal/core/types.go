@@ -100,8 +100,18 @@ type Session struct {
 	Title       string `json:"title"`
 	TitleSource string `json:"title_source,omitempty"`
 	Alias       string `json:"alias,omitempty"`
-	Summary     string `json:"summary,omitempty"`
-	Cwd         string `json:"cwd,omitempty"`
+	// Summary is the one-line summary of the session as it is now (none
+	// while one for its current state is still being written), and
+	// SummaryVerdict its VerdictAct / VerdictWait.
+	Summary        string `json:"summary,omitempty"`
+	SummaryVerdict string `json:"summary_verdict,omitempty"`
+	// AutoTurn: the last turn was started by Claude Code on a background
+	// task's or subagent's report, not by the user.
+	AutoTurn bool `json:"auto_turn,omitempty"`
+	// BackgroundShell: the turn is over but a background shell command the
+	// session started still runs (Claude Code's registry status "shell").
+	BackgroundShell bool   `json:"background_shell,omitempty"`
+	Cwd             string `json:"cwd,omitempty"`
 	// Profile is the Claude profile's name and ConfigDir its directory
 	// (Claude sessions only).
 	Profile   string `json:"profile,omitempty"`
@@ -151,6 +161,12 @@ func (s Session) DisplayTitle() string {
 	}
 	return s.Title
 }
+
+// Background reports whether the session's finished turn may be waiting on
+// its own background work rather than on the user: the turn answered a
+// background report, or a background shell still runs. Whether it needs
+// the user then is the summary's verdict (docs/notifications.md).
+func (s Session) Background() bool { return s.AutoTurn || s.BackgroundShell }
 
 // NeedsAttention: blocked on the user, or an unseen completion.
 func (s Session) NeedsAttention() bool {

@@ -209,3 +209,21 @@ func TestPaneAndServerChangeTogether(t *testing.T) {
 		t.Fatalf("%q %q", s.Pane, s.TmuxSocket)
 	}
 }
+
+// A turn Claude Code starts on a background report is a turn (working, then
+// a turn end), but its prompt is not the user's last prompt.
+func TestAutomaticPromptIsNotTheUsersPrompt(t *testing.T) {
+	s := run(
+		cl("UserPromptSubmit", 1, func(e *model.Event) { e.Prompt = "dispatch three agents" }),
+		cl("Stop", 2),
+		cl("UserPromptSubmit", 3, func(e *model.Event) { e.Prompt = "<task-notification> <task-id>b1</task-id>" }),
+	)
+	if s.Activity != model.Working || s.LastPrompt != "dispatch three agents" || !s.LastPromptAt.Equal(at(1)) {
+		t.Fatalf("task notification: %+v", s)
+	}
+	s = Apply(s, cl("Stop", 4))
+	s = Apply(s, cl("UserPromptSubmit", 5, func(e *model.Event) { e.Prompt = "Another Claude session sent a message:\n<agent-message from=\"a1\">" }))
+	if s.Activity != model.Working || s.LastPrompt != "dispatch three agents" {
+		t.Fatalf("subagent message: %+v", s)
+	}
+}

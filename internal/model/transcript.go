@@ -1,6 +1,9 @@
 package model
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // TTL buckets of the prompt cache.
 const (
@@ -41,6 +44,20 @@ type ClaudeMeta struct {
 	// LastUserAt is the time of the last main-thread user entry (prompt or
 	// tool result).
 	LastUserAt time.Time
+	// LastTurnAuto: the last main-thread turn was started by Claude Code
+	// itself (a background task's or a subagent's report), not by the user.
+	// LastTurnAt is when that turn started (zero: none in view).
+	LastTurnAuto bool
+	LastTurnAt   time.Time
+}
+
+// AutoPrompt reports whether a prompt is one Claude Code sends on its own
+// when background work reports: a task notification, or a message from
+// another session (a subagent's hand-back). The transcript's turnOrigin
+// says so authoritatively; a hook payload has only the text.
+func AutoPrompt(p string) bool {
+	p = strings.TrimLeft(p, " \t\n")
+	return strings.HasPrefix(p, "<task-notification>") || strings.HasPrefix(p, "Another Claude session sent a message:")
 }
 
 // LastActivity is when the cache was last refreshed: the later of the last

@@ -69,6 +69,9 @@ func TestDetailPriority(t *testing.T) {
 		{core.Session{Group: core.GroupYourTurn, Summary: "Approve the release"}, "Approve the release"},
 		{core.Session{Group: core.GroupYourTurn, LastMessage: "Done.\n\nShip it?\n```"}, "Ship it?"},
 		{core.Session{LastPrompt: "fix\nthe bug"}, "› fix the bug"},
+		{core.Session{Group: core.GroupWorking, BackgroundShell: true, Summary: "Build running"}, "background shell · Build running"},
+		{core.Session{Group: core.GroupWorking, BackgroundShell: true, LastMessage: "Started it.\nI'll report back."}, "background shell · I'll report back."},
+		{core.Session{Group: core.GroupYourTurn, BackgroundShell: true, Summary: "Try the dev server"}, "Try the dev server"},
 		{core.Session{Notes: []string{"no transcript found"}}, "no transcript found"},
 	}
 	for i, c := range cases {

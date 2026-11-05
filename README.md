@@ -137,6 +137,17 @@ looking at it: its window is on screen in a tmux client whose terminal has
 focus. It fires once per change, not for states already present when the
 daemon starts, and `notify = false` turns it off.
 
+A turn Claude Code starts by itself, to take in a background task's or a
+subagent's report, notifies only if its one-line summary says there is
+something for you to do (a question, a decision, something ready to try);
+progress reports stay in the cockpit as YOUR TURN without a notification.
+A turn that ends with a background shell still running (a build, a test
+run) is judged the same way and shows under WORKING as `background shell`
+until there is something for you.
+Without summaries (`summaries = "off"`, or on battery with `"ac"`) every
+turn end notifies. Details and measurements:
+[docs/notifications.md](docs/notifications.md).
+
 "Whose terminal has focus" needs tmux's `focus-events`, and tmux asks a
 terminal for focus reports **only when it attaches**: a terminal attached
 before `focus-events` was on never reports, and tmux keeps it flagged

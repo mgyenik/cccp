@@ -29,7 +29,10 @@ type scene struct {
 	tmuxDown  bool
 	ended     bool
 	battery   bool
-	lastResp  int // transcript: last response, seconds (cache)
+	lastResp  int  // transcript: last response, seconds (cache)
+	auto      bool // transcript: the last turn was started by a background report
+	prompt    string
+	shell     bool // registry: idle with a background shell running
 }
 
 func (sc scene) obs() core.Observation {
@@ -57,9 +60,16 @@ func (sc scene) obs() core.Observation {
 			},
 			Clients: []model.TmuxClient{{Name: "c", Pane: focus, Focused: true, Created: t0, FocusSince: t0}}},
 	}
-	if sc.lastResp > 0 {
+	st.LastPrompt = sc.prompt
+	o.Hooks[0].State = st
+	if sc.shell {
+		o.Registry = []core.RegistryRecord{{Path: "/reg/42.json", ConfigDir: "/h/.claude", Alive: true, Entry: model.RegistryEntry{
+			PID: 42, SessionID: "s1", Kind: "interactive", Entrypoint: "cli", Status: "shell", Cwd: "/w/proj",
+			StatusUpdatedMs: at(sc.since).Add(time.Second).UnixMilli()}}}
+	}
+	if sc.lastResp > 0 || sc.auto {
 		o.ClaudeTranscripts = map[string]core.ClaudeTranscript{"s1": {Path: "/t", Meta: model.ClaudeMeta{
-			LastAssistantAt: at(sc.lastResp), TTL: model.TTL5m}}}
+			LastAssistantAt: at(sc.lastResp), TTL: model.TTL5m, LastTurnAuto: sc.auto}}}
 	}
 	return o
 }
@@ -173,8 +183,16 @@ func TestFinishedTurnNotifiesYourTurn(t *testing.T) {
 func TestNoNotificationWhenVisibleOrDisabled(t *testing.T) {
 	m := newMachine(testConfig())
 	m.Step(Observed{Obs: scene{activity: model.Working, since: 5, visible: true}.obs(), At: at(6)})
-	if n := of[Notify](m.Step(Observed{Obs: scene{activity: model.NeedsApproval, since: 8, visible: true}.obs(), At: at(9)})); len(n) != 0 {
+	effs := m.Step(Observed{Obs: scene{activity: model.NeedsApproval, since: 8, visible: true}.obs(), At: at(9)})
+	if n := of[Notify](effs); len(n) != 0 {
 		t.Fatalf("visible session notified: %v", n)
+	}
+	// Logged once, so the log accounts for every attention state.
+	if l := fmt.Sprint(of[Log](effs)); !strings.Contains(l, "not notifying (pane visible) claude:s1 (NEEDS YOU") {
+		t.Fatalf("not logged: %s", l)
+	}
+	if l := of[Log](m.Step(Observed{Obs: scene{activity: model.NeedsApproval, since: 8, visible: true}.obs(), At: at(10)})); len(l) != 0 {
+		t.Fatalf("logged again: %v", l)
 	}
 
 	c := testConfig()
@@ -411,11 +429,162 @@ func TestCleanSummary(t *testing.T) {
 	}
 }
 
-func TestSummaryInputTailKeepsUTF8(t *testing.T) {
-	s := core.Session{Title: "t", LastMessage: strings.Repeat("é", 2000)}
-	in, hash := summaryInput(s)
-	if !strings.Contains(in, "…") || strings.ContainsRune(in, '�') || len(hash) != 16 {
-		t.Fatalf("hash %q, invalid UTF-8 or no ellipsis", hash)
+func TestSplitVerdict(t *testing.T) {
+	for in, want := range map[string][2]string{
+		"Pick the minimal or full test set [act]": {core.VerdictAct, "Pick the minimal or full test set"},
+		"Agents still running [WAIT] ":            {core.VerdictWait, "Agents still running"},
+		"Review the diff":                         {"", "Review the diff"},
+		"[act]":                                   {"", "[act]"},
+		"act: an old-style verdict":               {"", "act: an old-style verdict"},
+	} {
+		if v, s := splitVerdict(in); v != want[0] || s != want[1] {
+			t.Errorf("%q → %q %q", in, v, s)
+		}
+	}
+}
+
+// done is a turn that ended at 9 s; auto: started by a background report.
+func done(auto bool, msg string) scene {
+	return scene{activity: model.Idle, since: 9, turnEnded: 9, message: msg, auto: auto, prompt: "dispatch the agents"}
+}
+
+// An automatic turn's notification waits for its summary, and goes out
+// only if the summary says there is something to do.
+func TestAutomaticTurnNotifiesOnlyWhenSummaryAsks(t *testing.T) {
+	for _, c := range []struct {
+		reply  string
+		notify bool
+	}{
+		{"Two agents still running; nothing to do yet [wait]", false},
+		{"Choose between the minimal and full test sets [act]", true},
+		// The tag survives a line cut to fit: it is read before cutting.
+		{strings.Repeat("long ", 40) + "Choose between the minimal and full test sets [wait]", false},
+		{"Choose between the minimal and full test sets", true}, // no verdict: notify
+	} {
+		m := newMachine(summaryConfig("always"))
+		m.Step(Observed{Obs: scene{activity: model.Working, since: 5}.obs(), At: at(6)})
+		effs := m.Step(Observed{Obs: done(true, "The agent is waiting on its sub-agent.").obs(), At: at(10)})
+		ss := of[StartSummary](effs)
+		if len(of[Notify](effs)) != 0 || len(ss) != 1 {
+			t.Fatalf("%q: notified before the summary, or no summary started: %v", c.reply, effs)
+		}
+		// It answers the report, not the user's (older) prompt.
+		if !strings.Contains(ss[0].Input, "not started by the user") || strings.Contains(ss[0].Input, "dispatch the agents") {
+			t.Fatalf("summary input:\n%s", ss[0].Input)
+		}
+		effs = m.Step(SummaryDone{Key: ss[0].Key, Hash: ss[0].Hash, Text: c.reply, At: at(12)})
+		n := of[Notify](effs)
+		if (len(n) == 1) != c.notify || (c.notify && !strings.Contains(n[0].Argv[3], "Choose between")) {
+			t.Fatalf("%q: %v", c.reply, effs)
+		}
+		if !c.notify && !strings.Contains(fmt.Sprint(of[Log](effs)), "not notifying (background work") {
+			t.Fatalf("a held-back notification is logged: %v", effs)
+		}
+		// Decided once: the same state does not notify later.
+		if n := of[Notify](m.Step(Observed{Obs: done(true, "The agent is waiting on its sub-agent.").obs(), At: at(13)})); len(n) != 0 {
+			t.Fatalf("%q: repeated %v", c.reply, n)
+		}
+	}
+}
+
+// A turn the user started notifies at once, and never with the summary of
+// an earlier turn.
+func TestUsersTurnNotifiesAtOnceWithoutAStaleSummary(t *testing.T) {
+	m := newMachine(summaryConfig("always"))
+	m.Step(Observed{Obs: scene{activity: model.Working, since: 5}.obs(), At: at(6)})
+	effs := m.Step(Observed{Obs: done(false, "First answer.").obs(), At: at(10)})
+	ss := of[StartSummary](effs)
+	if len(of[Notify](effs)) != 1 || len(ss) != 1 {
+		t.Fatalf("%v", effs)
+	}
+	m.Step(SummaryDone{Key: ss[0].Key, Hash: ss[0].Hash, Text: "Review the first answer [act]", At: at(11)})
+	m.Step(Observed{Obs: scene{activity: model.Working, since: 20}.obs(), At: at(21)})
+	next := done(false, "Second answer. Merge it?")
+	next.since, next.turnEnded = 30, 30
+	effs = m.Step(Observed{Obs: next.obs(), At: at(31)})
+	n := of[Notify](effs)
+	if len(n) != 1 || strings.Contains(n[0].Argv[3], "first answer") || !strings.Contains(n[0].Argv[3], "Merge it?") {
+		t.Fatalf("stale summary in the notification: %v", n)
+	}
+	if s := session(t, published(t, effs)); s.Summary != "" {
+		t.Fatalf("the earlier turn's summary is shown: %q", s.Summary)
+	}
+}
+
+// When no summary will come, an automatic turn notifies as any other.
+func TestAutomaticTurnFallsBackWhenNoSummaryComes(t *testing.T) {
+	auto := done(true, "Status update.")
+	// Summaries off.
+	m := newMachine(testConfig())
+	m.Step(Observed{Obs: scene{activity: model.Working, since: 5}.obs(), At: at(6)})
+	if n := of[Notify](m.Step(Observed{Obs: auto.obs(), At: at(10)})); len(n) != 1 {
+		t.Fatalf("summaries off: %v", n)
+	}
+	// The summary fails.
+	m = newMachine(summaryConfig("always"))
+	m.Step(Observed{Obs: scene{activity: model.Working, since: 5}.obs(), At: at(6)})
+	ss := of[StartSummary](m.Step(Observed{Obs: auto.obs(), At: at(10)}))
+	if n := of[Notify](m.Step(SummaryDone{Key: ss[0].Key, Hash: ss[0].Hash, Err: errors.New("usage limit"), At: at(11)})); len(n) != 1 {
+		t.Fatalf("failed summary: %v", n)
+	}
+	// No answer within HoldForSummary: the timer is set for it, and fires.
+	m = newMachine(summaryConfig("always"))
+	m.Step(Observed{Obs: scene{activity: model.Working, since: 5}.obs(), At: at(6)})
+	m.Step(Observed{Obs: auto.obs(), At: at(10)})
+	// The pending save is due first; once it is done, the timer is set
+	// for the end of the wait.
+	if a := of[ArmTimer](m.Step(TimerFired{At: at(10).Add(SaveDelay)})); len(a) != 1 || !a[0].At.Equal(at(10).Add(HoldForSummary)) {
+		t.Fatalf("timer %v, want %v", a, at(10).Add(HoldForSummary))
+	}
+	if n := of[Notify](m.Step(TimerFired{At: at(10).Add(HoldForSummary - time.Second)})); len(n) != 0 {
+		t.Fatalf("early: %v", n)
+	}
+	if n := of[Notify](m.Step(TimerFired{At: at(10).Add(HoldForSummary)})); len(n) != 1 {
+		t.Fatalf("no notification after waiting %v: %v", HoldForSummary, n)
+	}
+	// No message to summarise: nothing will come, so at once.
+	m = newMachine(summaryConfig("always"))
+	m.Step(Observed{Obs: scene{activity: model.Working, since: 5}.obs(), At: at(6)})
+	if n := of[Notify](m.Step(Observed{Obs: done(true, "").obs(), At: at(10)})); len(n) != 1 {
+		t.Fatalf("no message: %v", n)
+	}
+	// Summaries paused (after repeated failures): at once.
+	m = newMachine(summaryConfig("always"))
+	m.sum.pausedUntil = at(10).Add(pauseFor)
+	m.Step(Observed{Obs: scene{activity: model.Working, since: 5}.obs(), At: at(6)})
+	if n := of[Notify](m.Step(Observed{Obs: auto.obs(), At: at(10)})); len(n) != 1 {
+		t.Fatalf("paused: %v", n)
+	}
+	// A question in an automatic turn needs the user: at once.
+	m = newMachine(summaryConfig("always"))
+	m.Step(Observed{Obs: scene{activity: model.Working, since: 5}.obs(), At: at(6)})
+	ask := scene{activity: model.NeedsApproval, since: 9, question: "Allow Bash: rm -rf build", message: "x", auto: true}
+	if n := of[Notify](m.Step(Observed{Obs: ask.obs(), At: at(10)})); len(n) != 1 {
+		t.Fatalf("needs you in an automatic turn: %v", n)
+	}
+	// A newer automatic turn waits its own full time.
+	m = newMachine(summaryConfig("always"))
+	m.Step(Observed{Obs: scene{activity: model.Working, since: 5}.obs(), At: at(6)})
+	m.Step(Observed{Obs: auto.obs(), At: at(10)})
+	later := auto
+	later.since, later.turnEnded, later.message = 60, 60, "Another update."
+	m.Step(Observed{Obs: later.obs(), At: at(60)})
+	if n := of[Notify](m.Step(TimerFired{At: at(10).Add(HoldForSummary)})); len(n) != 0 {
+		t.Fatalf("the newer turn was cut short: %v", n)
+	}
+	if n := of[Notify](m.Step(TimerFired{At: at(60).Add(HoldForSummary)})); len(n) != 1 {
+		t.Fatalf("the newer turn: %v", n)
+	}
+	// Back at work while held: nothing.
+	m = newMachine(summaryConfig("always"))
+	m.Step(Observed{Obs: scene{activity: model.Working, since: 5}.obs(), At: at(6)})
+	m.Step(Observed{Obs: auto.obs(), At: at(10)})
+	m.Step(Observed{Obs: scene{activity: model.Working, since: 15}.obs(), At: at(15)})
+	if !m.heldDeadline().IsZero() {
+		t.Fatal("a turn already over still holds a deadline")
+	}
+	if n := of[Notify](m.Step(TimerFired{At: at(10).Add(HoldForSummary)})); len(n) != 0 {
+		t.Fatalf("notified a turn already over: %v", n)
 	}
 }
 
@@ -604,5 +773,37 @@ func TestClosedConversationsAreSummarisedOnlyOnRequest(t *testing.T) {
 	// A request is consumed: later observations do not summarise c1 or c3.
 	if ss := of[StartSummary](m.Step(Observed{Obs: obs, At: at(6)})); len(ss) != 0 {
 		t.Fatalf("%+v", ss)
+	}
+}
+
+// A turn that ends while its own background shell runs: "wait" keeps the
+// session in WORKING without a notification; "act" (a server left running
+// to try) notifies.
+func TestBackgroundShellTurn(t *testing.T) {
+	for _, c := range []struct {
+		reply  string
+		notify bool
+		group  core.Group
+	}{
+		{"Build running in the background; will report when done [wait]", false, core.GroupWorking},
+		{"Dev server is up on :5173; try the new tool [act]", true, core.GroupYourTurn},
+	} {
+		m := newMachine(summaryConfig("always"))
+		m.Step(Observed{Obs: scene{activity: model.Working, since: 5}.obs(), At: at(6)})
+		sh := done(false, "Started the build in the background.")
+		sh.shell = true
+		effs := m.Step(Observed{Obs: sh.obs(), At: at(10)})
+		ss := of[StartSummary](effs)
+		if s := session(t, published(t, effs)); !s.BackgroundShell || s.Group != core.GroupYourTurn || len(of[Notify](effs)) != 0 || len(ss) != 1 {
+			t.Fatalf("%q: held for the summary: %+v %v", c.reply, s, effs)
+		}
+		if !strings.Contains(ss[0].Input, "background shell command") {
+			t.Fatalf("input:\n%s", ss[0].Input)
+		}
+		effs = m.Step(SummaryDone{Key: ss[0].Key, Hash: ss[0].Hash, Text: c.reply, At: at(12)})
+		s := session(t, published(t, effs))
+		if (len(of[Notify](effs)) == 1) != c.notify || s.Group != c.group {
+			t.Fatalf("%q: group %s, %v", c.reply, s.Group, effs)
+		}
 	}
 }

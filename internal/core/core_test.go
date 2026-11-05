@@ -106,7 +106,9 @@ func TestMergeActivity(t *testing.T) {
 		{"interrupt: newer registry idle wins", hook(model.Working, 5), reg("idle", "", 9), model.Idle, "", at(9)},
 		{"manual deny: newer registry busy wins", hook(model.NeedsApproval, 5), reg("busy", "", 9), model.Working, "", at(9)},
 		{"older registry loses", hook(model.Working, 9), reg("idle", "", 5), model.Working, "Bash", at(9)},
-		{"unknown registry status, newer", hook(model.Working, 5), reg("weird", "", 9), model.Unknown, "", at(9)},
+		{"unknown registry status, newer: the hook stands", hook(model.Idle, 5), reg("weird", "", 9), model.Idle, "Bash", at(5)},
+		{"unknown registry status alone", nil, reg("weird", "", 9), model.Unknown, "", at(9)},
+		{"shell: idle with a background shell running", hook(model.Working, 5), reg("shell", "", 9), model.Idle, "", at(9)},
 		{"neither", nil, nil, model.Unknown, "", time.Time{}},
 	}
 	for _, c := range cases {
@@ -1259,5 +1261,69 @@ func TestBoostsShowExpireAndSetTheDeadline(t *testing.T) {
 	}
 	if _, ok := next.Boosts["gone"]; !ok {
 		t.Fatal("an until-undone boost of a workstream not running was dropped")
+	}
+}
+
+// The transcript says who started the last turn; a prompt Claude Code sent
+// itself, left in hook state written before such prompts were skipped, is
+// not shown as the user's.
+func TestAutomaticTurnAndLegacyPrompt(t *testing.T) {
+	o := yourTurnObs(false)
+	o.Hooks[0].State.LastPrompt = "<task-notification> <task-id>b1</task-id>"
+	o.ClaudeTranscripts = map[string]ClaudeTranscript{"s1": {Path: "/t", Meta: model.ClaudeMeta{
+		LastPrompt: "dispatch the agents", LastPromptAt: at(1), LastTurnAuto: true, LastTurnAt: at(5)}}}
+	snap, _ := compute(o, nil, at(11))
+	s := find(t, snap, "claude:s1")
+	if !s.AutoTurn || s.LastPrompt != "dispatch the agents" {
+		t.Fatalf("%+v", s)
+	}
+	o.ClaudeTranscripts["s1"] = ClaudeTranscript{Path: "/t", Meta: model.ClaudeMeta{LastPrompt: "x", LastPromptAt: at(1)}}
+	if s := find(t, func() Snapshot { s, _ := compute(o, nil, at(11)); return s }(), "claude:s1"); s.AutoTurn {
+		t.Fatal("a turn the user started")
+	}
+}
+
+// A summary is shown only for the state it was written for.
+func TestSummaryOnlyForItsOwnState(t *testing.T) {
+	o := yourTurnObs(false)
+	o.Hooks[0].State.LastMessage = "Second answer."
+	snap, _ := compute(o, nil, at(11))
+	s := find(t, snap, "claude:s1")
+	_, hash := SummaryInput(s)
+	mem := NewMemory()
+	mem.Initialized = true
+	mem.Summaries["claude:s1"] = SummaryRecord{InputHash: "an earlier turn", Text: "old"}
+	if s := find(t, func() Snapshot { s, _ := compute(o, &mem, at(11)); return s }(), "claude:s1"); s.Summary != "" {
+		t.Fatalf("an earlier turn's summary: %q", s.Summary)
+	}
+	mem.Summaries["claude:s1"] = SummaryRecord{InputHash: hash, Text: "new", Verdict: VerdictWait}
+	if s := find(t, func() Snapshot { s, _ := compute(o, &mem, at(11)); return s }(), "claude:s1"); s.Summary != "new" || s.SummaryVerdict != VerdictWait {
+		t.Fatalf("its own summary: %+v", s)
+	}
+}
+
+// "shell": idle with a background shell running. Flagged only while idle,
+// and in WORKING only when the turn's summary says nothing is needed yet.
+func TestBackgroundShell(t *testing.T) {
+	o := yourTurnObs(false)
+	o.Registry = []RegistryRecord{regRec("s1", 42, "shell", at(11), nil)}
+	snap, _ := compute(o, nil, at(12))
+	s := find(t, snap, "claude:s1")
+	if !s.BackgroundShell || s.Group != GroupYourTurn || !s.Background() {
+		t.Fatalf("shell, no summary yet: %+v", s)
+	}
+	_, hash := SummaryInput(s)
+	for verdict, want := range map[string]Group{VerdictWait: GroupWorking, VerdictAct: GroupYourTurn, "": GroupYourTurn} {
+		mem := NewMemory()
+		mem.Initialized = true
+		mem.Summaries["claude:s1"] = SummaryRecord{InputHash: hash, Text: "x", Verdict: verdict}
+		if s := find(t, func() Snapshot { s, _ := compute(o, &mem, at(12)); return s }(), "claude:s1"); s.Group != want {
+			t.Errorf("verdict %q: %s, want %s", verdict, s.Group, want)
+		}
+	}
+	// A newer hook says it is working again: no longer idle, not flagged.
+	o.Hooks[0].State.Activity, o.Hooks[0].State.ActivityAt = model.Working, at(13)
+	if s := find(t, func() Snapshot { s, _ := compute(o, nil, at(14)); return s }(), "claude:s1"); s.BackgroundShell {
+		t.Fatalf("working: %+v", s)
 	}
 }

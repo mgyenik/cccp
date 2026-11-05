@@ -111,6 +111,16 @@ func (q *sumQueue) done(key, hash string, failed bool, now time.Time) (paused bo
 	return false
 }
 
+// stalled reports whether a summary of key's input hash will not come
+// soon: it failed (a retry is a minute or more away) or all are paused.
+func (q *sumQueue) stalled(key, hash string, now time.Time) bool {
+	if now.Before(q.pausedUntil) {
+		return true
+	}
+	f, ok := q.failures[key]
+	return ok && f.hash == hash
+}
+
 // forget drops state for sessions that no longer exist.
 func (q *sumQueue) forget(keep map[string]bool) {
 	for k := range q.failures {
