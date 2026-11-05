@@ -69,6 +69,11 @@ type Cache struct {
 	TTLAssumed   bool          `json:"ttl_assumed"`   // TTL is the configured default
 	LastActivity time.Time     `json:"last_activity"` // last request or response
 	ExpiresAt    time.Time     `json:"expires_at"`
+	// Fades: a best-effort cache with no TTL (Gemini's implicit caching,
+	// agy), whose state is estimated: likely warm until CoolingAt, fading
+	// until ExpiresAt, then taken as cold.
+	Fades     bool      `json:"fades,omitempty"`
+	CoolingAt time.Time `json:"cooling_at,omitzero"`
 }
 
 // Warm reports whether the cache is warm at t.
@@ -170,4 +175,23 @@ func (s Snapshot) Counts() map[Group]int {
 		m[x.Group]++
 	}
 	return m
+}
+
+// agy's prompt cache, estimated. agy runs Gemini 4 models, which have only
+// implicit caching: best effort, with no documented lifetime (explicit
+// caching, with a TTL, "is not supported … for Gemini 4 Argon and onward":
+// ai.google.dev/gemini-api/docs/caching). Measured on 8,624 agy model calls
+// (2026-11-04), the chance a call's input was cached, by the time since the
+// previous call: under 1 min 97–99%, 1–5 min 85–89%, 5–15 min 50–57%,
+// 15–30 min 31%, 30–60 min 8%, over 1 h about 0%. So: likely warm for
+// AgyWarmFor, then fading, and taken as cold after AgyColdAfter.
+const (
+	AgyWarmFor   = 5 * time.Minute
+	AgyColdAfter = 30 * time.Minute
+)
+
+// Cooling reports whether a fading cache is past its likely-warm period at t
+// (and not yet taken as cold).
+func (c Cache) Cooling(t time.Time) bool {
+	return c.Fades && c.Warm(t) && !t.Before(c.CoolingAt)
 }

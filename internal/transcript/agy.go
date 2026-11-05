@@ -88,6 +88,7 @@ func (e *agyEntry) parse(buf []byte) {
 				e.meta.LastPromptAt = s.CreatedAt
 			}
 		case "PLANNER_RESPONSE":
+			e.meta.LastModelCallAt = s.CreatedAt
 			if t := agyText(s.Content); t != "" {
 				e.meta.LastMessage = t
 				e.meta.LastMessageAt = s.CreatedAt

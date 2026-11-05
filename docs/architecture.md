@@ -194,8 +194,27 @@ Derived per session:
 * **Cache**: last main-thread model activity time (transcript) + TTL, where
   the TTL comes from the last request's `cache_creation` split (1h if it wrote
   1h tokens, 5m if it wrote 5m tokens; else the previous request's bucket;
-  else the configured default). `warm until T` / `cold since T`. Shown only
-  for Claude: agy's cache behaviour isn't observable.
+  else the configured default). `warm until T` / `cold since T`.
+* **agy's cache** is estimated (`Cache.Fades`). agy runs Gemini 4 models,
+  which have only implicit caching: best effort, with no documented
+  lifetime; explicit caching, which has a TTL, "is not supported … for
+  Gemini 4 Argon and onward" ([Google's caching
+  docs](https://ai.google.dev/gemini-api/docs/caching)). agy's transcripts
+  record each model call's `input_tokens`, `cache_read_tokens` and
+  `created_at`, so the cache's behaviour was measured instead (8,624 calls
+  over 14 conversations, 2026-11-04). The chance a call's input was cached,
+  by the time since the previous call:
+
+  | Gap | under 1 min | 1–5 min | 5–15 min | 15–30 min | 30–60 min | over 1 h |
+  |---|---|---|---|---|---|---|
+  | Cache hit | 97–99% | 85–89% | 50–57% | 31% | 8% | ~0% |
+
+  So the cache fades rather than expiring: from agy's last model call
+  (`AgyMeta.LastModelCallAt`, any planner response) it is shown `warm?` for
+  5 minutes (`core.AgyWarmFor`), `cooling?` until 30 (`core.AgyColdAfter`),
+  and after that the session is COLD (`cold 2h?`). The thresholds are fixed;
+  Google can change the cache's behaviour, and the table can be re-measured
+  from the same transcripts.
 * **Context**: input + cache read + cache creation tokens of the last
   main-thread request.
 

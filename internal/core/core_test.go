@@ -138,7 +138,8 @@ func TestGroupOf(t *testing.T) {
 		{Session{Alive: true, Activity: model.Idle, Agent: model.Claude, Cache: warm}, GroupIdle},
 		{Session{Alive: true, Activity: model.Idle, Agent: model.Claude, Cache: cold}, GroupCold},
 		{Session{Alive: true, Activity: model.Idle, Agent: model.Claude}, GroupIdle},
-		{Session{Alive: true, Activity: model.Idle, Agent: model.Agy, Cache: cold}, GroupIdle},
+		{Session{Alive: true, Activity: model.Idle, Agent: model.Agy, Cache: cold}, GroupCold}, // an estimated agy cache past its cold point
+		{Session{Alive: true, Activity: model.Idle, Agent: model.Agy}, GroupIdle},              // no estimate: idle
 		{Session{Alive: true, Activity: model.Unknown}, GroupUnknown},
 		{Session{Alive: false, Activity: model.Working}, GroupClosed},
 		{Session{Alive: true, Activity: model.Ended}, GroupClosed},
@@ -1132,5 +1133,44 @@ func TestPlanMove(t *testing.T) {
 	outside := Session{Alive: true, Agent: model.Claude, SessionID: "o1", PID: 9, Title: "Out"}
 	if m := PlanMove(outside, "docs"); m.Kind != MoveImpossible || !strings.Contains(m.Reason, "outside tmux") {
 		t.Fatalf("outside tmux: %+v", m)
+	}
+}
+
+// agy's cache is estimated from its last model call: likely warm, then
+// cooling, then cold (Gemini's implicit cache has no TTL).
+func TestAgyCacheIsEstimated(t *testing.T) {
+	obs := func() Observation {
+		return Observation{
+			Tmux:   TmuxView{OK: true, Panes: []model.TmuxPane{pane("%4", "@4", 4)}},
+			Agents: []AgentProc{{PID: 50, Agent: model.Agy, Pane: "%4", Cwd: "/w"}},
+			Hooks: []HookRecord{hookRec("a1", 50, true, func(s *model.HookState) {
+				s.Agent, s.Activity, s.Pane, s.TranscriptPath = model.Agy, model.Idle, "%4", "/t/a1"
+				s.ActivityAt, s.LastEventAt = at(0), at(0)
+			})},
+			AgyTranscripts: map[string]AgyTranscript{"a1": {Path: "/t/a1", Meta: model.AgyMeta{LastModelCallAt: at(0), LastStepAt: at(0)}}},
+		}
+	}
+	for _, c := range []struct {
+		after time.Duration
+		group Group
+		warm  bool
+		cool  bool
+	}{
+		{time.Minute, GroupIdle, true, false},
+		{AgyWarmFor, GroupIdle, true, true},
+		{AgyColdAfter - time.Second, GroupIdle, true, true},
+		{AgyColdAfter, GroupCold, false, false},
+		{3 * time.Hour, GroupCold, false, false},
+	} {
+		now := at(0).Add(c.after)
+		snap, _ := compute(obs(), nil, now)
+		s := find(t, snap, "agy:a1")
+		if s.Group != c.group || !s.Cache.Known || !s.Cache.Fades || s.Cache.Warm(now) != c.warm || s.Cache.Cooling(now) != c.cool {
+			t.Errorf("after %v: group %s cache %+v", c.after, s.Group, s.Cache)
+		}
+		// The snapshot changes when the estimate turns cold: a deadline.
+		if c.warm && !NextDeadline(snap).Equal(at(0).Add(AgyColdAfter)) {
+			t.Errorf("after %v: deadline %v", c.after, NextDeadline(snap))
+		}
 	}
 }

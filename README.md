@@ -22,7 +22,10 @@ COLD
   pane (on a focused terminal) clears it.
 * **WORKING / IDLE / COLD**: COLD means the prompt cache has expired, so the
   next message re-sends the whole context uncached. IDLE is sorted by soonest
-  cache expiry.
+  cache expiry. For agy it is an estimate (`warm?`, `cooling?`, `cold 2h?`):
+  Gemini's cache has no fixed lifetime, so cccp counts it as warm for 5
+  minutes after agy's last model call, cooling until 30, and cold after
+  that (measured from agy's own transcripts; see docs/architecture.md).
 * `~` marks a state that is **inferred** (a session without hooks) rather
   than observed.
 

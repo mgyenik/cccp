@@ -1003,7 +1003,11 @@ func (m *Model) renderPreview(s core.Session, pm previewMode, w, h int) string {
 		}
 		info = append(info, strings.Join(nonEmpty(s.Model, ctx), " · "))
 	}
-	if c := present.CacheText(s, m.now); c != "" {
+	if c := present.CacheText(s, m.now); c != "" && s.Cache.Fades {
+		info = append(info, "cache "+c+" · estimated: Gemini's cache has no TTL; likely warm "+
+			present.Age(core.AgyWarmFor)+", fading to cold by "+present.Age(core.AgyColdAfter)+" (last call "+
+			present.Since(m.now, s.Cache.LastActivity)+" ago)")
+	} else if c != "" {
 		ttl := s.Cache.TTL.String()
 		if s.Cache.TTLAssumed {
 			ttl += " (assumed)"

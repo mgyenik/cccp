@@ -66,4 +66,7 @@ type AgyMeta struct {
 	// and no later step exists.
 	PendingTools  bool
 	ContextTokens int
+	// LastModelCallAt is the last model call (a planner response, with or
+	// without text): what Gemini's prompt cache ages from.
+	LastModelCallAt time.Time
 }

@@ -81,10 +81,15 @@ func CacheText(s core.Session, now time.Time) string {
 		return ""
 	}
 	suffix := ""
-	if s.Cache.TTLAssumed {
+	if s.Cache.TTLAssumed || s.Cache.Fades {
 		suffix = "?"
 	}
-	if s.Cache.Warm(now) {
+	switch {
+	case s.Cache.Fades && s.Cache.Cooling(now):
+		return "cooling?" // a best-effort cache has no deadline to count down to
+	case s.Cache.Fades && s.Cache.Warm(now):
+		return "warm?"
+	case s.Cache.Warm(now):
 		return "warm " + Age(s.Cache.ExpiresAt.Sub(now)) + suffix
 	}
 	return "cold " + Age(now.Sub(s.Cache.ExpiresAt)) + suffix

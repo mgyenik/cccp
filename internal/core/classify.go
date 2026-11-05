@@ -240,14 +240,19 @@ func (c *computation) build(b *builder) (Session, bool) {
 		s.ContextTokens = m.agy.ContextTokens
 	}
 
-	// Prompt cache (Claude only: agy's caching is not observable).
-	if b.agent == model.Claude && m.hasClaude && !m.claude.LastActivity().IsZero() {
+	// Prompt cache.
+	switch {
+	case b.agent == model.Claude && m.hasClaude && !m.claude.LastActivity().IsZero():
 		ttl, assumed := m.claude.TTL, false
 		if ttl == 0 {
 			ttl, assumed = c.cfg.DefaultCacheTTL.Duration, true
 		}
 		last := m.claude.LastActivity()
 		s.Cache = Cache{Known: true, TTL: ttl, TTLAssumed: assumed, LastActivity: last, ExpiresAt: last.Add(ttl)}
+	case b.agent == model.Agy && m.hasAgy && !m.agy.LastModelCallAt.IsZero():
+		last := m.agy.LastModelCallAt
+		s.Cache = Cache{Known: true, Fades: true, TTL: AgyColdAfter, LastActivity: last,
+			CoolingAt: last.Add(AgyWarmFor), ExpiresAt: last.Add(AgyColdAfter)}
 	}
 
 	c.attention(&s, b, hs, m)
@@ -522,7 +527,7 @@ func groupOf(s Session, now time.Time) Group {
 	case s.Activity == model.Idle && s.Unseen:
 		return GroupYourTurn
 	case s.Activity == model.Idle:
-		if s.Agent == model.Claude && s.Cache.Known && !s.Cache.Warm(now) {
+		if s.Cache.Known && !s.Cache.Warm(now) {
 			return GroupCold
 		}
 		return GroupIdle

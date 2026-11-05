@@ -132,3 +132,18 @@ func TestAroundKeepsTheMatchVisible(t *testing.T) {
 		t.Fatalf("%q", got)
 	}
 }
+
+func TestCacheTextForAnEstimatedCache(t *testing.T) {
+	last := t0.Add(-time.Minute)
+	s := core.Session{Group: core.GroupIdle, Cache: core.Cache{Known: true, Fades: true, LastActivity: last,
+		CoolingAt: last.Add(core.AgyWarmFor), ExpiresAt: last.Add(core.AgyColdAfter)}}
+	for after, want := range map[time.Duration]string{
+		time.Minute:                   "warm?",
+		core.AgyWarmFor:               "cooling?",
+		core.AgyColdAfter + time.Hour: "cold 1h?",
+	} {
+		if got := CacheText(s, last.Add(after)); got != want {
+			t.Errorf("after %v: %q want %q", after, got, want)
+		}
+	}
+}
