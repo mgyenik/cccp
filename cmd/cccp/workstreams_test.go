@@ -23,7 +23,7 @@ import (
 // testApp is an app on a sandboxed tmux server: every path (state, cache,
 // sockets, home) in a temp directory, no daemon, and a stand-in claude on
 // the server's PATH.
-func testApp(t *testing.T) (*app, string) {
+func testApp(t *testing.T, conf ...string) (*app, string) {
 	t.Helper()
 	if _, err := exec.LookPath("tmux"); err != nil {
 		t.Skip("tmux not installed")
@@ -45,11 +45,18 @@ func testApp(t *testing.T) (*app, string) {
 		"XDG_CONFIG_HOME": filepath.Join(dir, "config"),
 	}
 	l := paths.Resolve(func(k string) string { return env[k] }, home, os.Getuid())
-	conf := filepath.Join(dir, "tmux.conf")
-	if err := os.WriteFile(conf, []byte("set -g exit-empty off\nset -g base-index 0\n"), 0o644); err != nil {
+	// The default shell records each start, so a test can tell whether an
+	// action started a shell.
+	shell := filepath.Join(bin, "shell")
+	if err := os.WriteFile(shell, []byte("#!/bin/sh\necho started >> "+filepath.Join(dir, "shell-starts")+"\nexec sleep 60\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	boot := exec.Command("tmux", "-S", l.TmuxSocket, "-f", conf, "start-server")
+	cfg := filepath.Join(dir, "tmux.conf")
+	lines := append([]string{"set -g exit-empty off", "set -g default-command " + shell}, conf...)
+	if err := os.WriteFile(cfg, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	boot := exec.Command("tmux", "-S", l.TmuxSocket, "-f", cfg, "start-server")
 	boot.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"))
 	if out, err := boot.CombinedOutput(); err != nil {
 		t.Fatalf("starting tmux: %v: %s", err, out)
@@ -107,8 +114,14 @@ func TestMoveIntoAnExistingWorkstream(t *testing.T) {
 	}
 }
 
+// shellStarts counts the default shells started so far.
+func shellStarts(dir string) int {
+	b, _ := os.ReadFile(filepath.Join(dir, "shell-starts"))
+	return strings.Count(string(b), "started")
+}
+
 func TestMoveTheLastWindowIntoANewWorkstream(t *testing.T) {
-	a, dir := testApp(t)
+	a, dir := testApp(t, "set -g base-index 1")
 	proj := filepath.Join(dir, "proj")
 	if err := os.Mkdir(proj, 0o755); err != nil {
 		t.Fatal(err)
@@ -119,8 +132,18 @@ func TestMoveTheLastWindowIntoANewWorkstream(t *testing.T) {
 	if _, err := a.tmux.Run("new-session", "-d", "-s", "other", "-n", "o", "-c", dir); err != nil {
 		t.Fatal(err)
 	}
+	before := shellStarts(dir)
 	if err := a.moveSession(sessionIn(t, a, "=old:only"), "api"); err != nil {
 		t.Fatal(err)
+	}
+	// The window tmux makes the new session start with ran no shell (one
+	// killed mid-start can leave locks behind), and the moved window took
+	// its place: the session's first index.
+	if n := shellStarts(dir); n != before {
+		t.Fatalf("the move started %d shell(s)", n-before)
+	}
+	if out, _ := a.tmux.Run("list-windows", "-t", "=api", "-F", "#{window_index}"); strings.TrimSpace(out) != "1" {
+		t.Fatalf("moved window at index %q, want the first (base-index 1)", out)
 	}
 	// The window is api's only one (no scratch window left), and old, now
 	// empty, has closed.
@@ -153,6 +176,25 @@ func TestMoveIntoADormantWorkstreamRestoresIt(t *testing.T) {
 	}
 	if got := layout(t, a); got != "docs:notes docs:w" {
 		t.Fatalf("restored, then moved into: %s", got)
+	}
+}
+
+func TestMoveAClosedConversationIntoANewWorkstream(t *testing.T) {
+	a, dir := testApp(t)
+	if _, err := a.tmux.Run("new-session", "-d", "-s", "keep", "-c", dir); err != nil {
+		t.Fatal(err)
+	}
+	before := shellStarts(dir)
+	closed := core.Session{Key: "claude:c1", Agent: model.Claude, SessionID: "c1", Cwd: dir, DefaultProfile: true, Title: "Old"}
+	if err := a.moveSession(closed, "fresh"); err != nil {
+		t.Fatal(err)
+	}
+	out, err := a.tmux.Run("list-panes", "-s", "-t", "=fresh", "-F", "#{window_index} #{pane_start_command}")
+	if err != nil || !strings.HasPrefix(out, "0 ") || strings.Count(out, "\n") != 1 || !strings.Contains(out, "claude --resume c1") {
+		t.Fatalf("panes:\n%s %v", out, err)
+	}
+	if n := shellStarts(dir); n != before {
+		t.Fatalf("the move started %d shell(s)", n-before)
 	}
 }
 

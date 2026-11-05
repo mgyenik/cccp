@@ -113,7 +113,11 @@ What moves (`core.PlanMove`):
 The new window does not become the destination's current window (`-d`), so
 nobody viewing it is moved. A new workstream starts in the session's
 directory (where its new windows open); tmux cannot create an empty session,
-so the window it starts with is closed once the moved one is in. Moving a
+so the window it starts with is closed once the moved one is in, and the
+moved one takes its index (the session's first, `base-index`). That window
+runs `sleep`, never your shell: a shell killed while it starts up can leave
+its startup half done (found 2026-11-04: `pyenv rehash` killed mid-way left
+its lock file, and every later shell waited 60 s for it). Moving a
 workstream's last window out closes that workstream, and the usual rules
 apply (anyone viewing it goes back to the previous one; it is forgotten
 after 10 s). The snippet hooks `window-linked` and `window-unlinked`, so the
