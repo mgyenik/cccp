@@ -138,6 +138,9 @@ type ClaudeTranscript struct {
 type AgyTranscript struct {
 	Path string
 	Meta model.AgyMeta
+	// Exec is how the conversation's latest execution ended, from agy's
+	// database (the only record of an interrupt).
+	Exec model.AgyExecution
 }
 
 // ProjectTranscript is one transcript in a Claude project directory, used to

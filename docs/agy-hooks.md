@@ -121,3 +121,34 @@ installed version, both for the normal path and for a crashing hook.
 [sc-agy]: https://docs.rs/safe-chains/latest/src/safe_chains/targets/agy.rs.html
 [gh1183]: https://github.com/google-antigravity/antigravity-cli/issues/1183
 [gh1310]: https://github.com/google-antigravity/antigravity-cli/issues/1310
+
+## Interrupts (2026-11-05)
+
+**agy runs no hook when the user interrupts a turn** (Escape; "Interrupted ·
+What should Antigravity CLI do instead?"), though its bundled docs list
+`USER_CANCELED` as a `Stop` reason. Tested in an isolated workspace with a
+hook logging every event, interrupting once while a tool ran and once while
+the model was writing: neither `Stop` nor `PostInvocation` fired, on 1.4.12
+(a session started before agy updated itself) and 1.5.1. The transcript
+records nothing either. Without a correction a session stays WORKING
+forever. A background task finishing after the turn also fires a late
+`PostToolUse`, which reads as work.
+
+agy does record it: each conversation's own database
+(`~/.gemini/antigravity-cli/conversations/<id>.db`) gets an
+`executor_metadata` row when an execution (the agent's run on one prompt)
+ends, however it ends, and none while it runs. The row is a protobuf whose
+leading varint fields are 1, the `ExecutorTerminationReason` (the enum's
+order in the binary: `UNSPECIFIED, ERROR, USER_CANCELED, MAX_INVOCATIONS,
+NO_TOOL_CALL, …`), 2, the number of model calls, and 3, the execution's last
+step index. Across 35 rows of two conversations every normal end was 4
+(`NO_TOOL_CALL`), every interrupt 2 (`USER_CANCELED`), and field 3 equalled
+the transcript's last `step_index`.
+
+So an agy turn the hooks call working is over when the latest execution has
+ended and the transcript has no step after its last one (a new prompt adds
+a step at once), once the hooks have been quiet for 10 s (the moment a new
+prompt's hook has arrived and its transcript step has not). An interrupt is
+not a completion (the user was there). This reads undocumented internals:
+if the layout changes, the decoder finds no reason and cccp behaves as
+before.

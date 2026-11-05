@@ -1327,3 +1327,73 @@ func TestBackgroundShell(t *testing.T) {
 		t.Fatalf("working: %+v", s)
 	}
 }
+
+// An interrupted agy turn: no Stop hook (agy runs none on an interrupt),
+// but agy's database records the execution's end, and the transcript has
+// nothing after it.
+func TestAgyInterruptEndsTheTurnWithoutAHook(t *testing.T) {
+	obs := func(lastStep int) Observation {
+		return Observation{
+			Hooks: []HookRecord{hookRec("a1", 42, true, func(s *model.HookState) {
+				s.Agent, s.Pane = model.Agy, "%3"
+				s.Activity, s.ActivityAt, s.LastEventAt = model.Working, at(100), at(100)
+				s.Tool, s.TurnEndedAt, s.StartedAt = "run_command", at(10), at(1)
+				s.LastPrompt, s.LastPromptAt = "continue the simulations", at(20) // after that turn end: seen
+			})},
+			Tmux: TmuxView{OK: true, Panes: []model.TmuxPane{pane("%3", "@7", 2), pane("%9", "@8", 3)},
+				Clients: []model.TmuxClient{reporting("c", "%9", true)}},
+			AgyTranscripts: map[string]AgyTranscript{"a1": {Path: "/t", Meta: model.AgyMeta{LastStepIndex: lastStep, LastStepAt: at(99)},
+				Exec: model.AgyExecution{Known: true, Reason: model.AgyUserCanceled, LastStep: 690}}},
+		}
+	}
+	// Within AgySettle of the last hook: still working, recheck when settled.
+	snap, mem := compute(obs(690), nil, at(105))
+	s := find(t, snap, "agy:a1")
+	if s.Activity != model.Working || !s.RecheckAt.Equal(at(100).Add(AgySettle)) || !NextDeadline(snap).Equal(s.RecheckAt) {
+		t.Fatalf("settling: %+v", s)
+	}
+	// Settled: the turn is over; an interrupt is not a completion.
+	snap, _ = compute(obs(690), &mem, at(111))
+	s = find(t, snap, "agy:a1")
+	if s.Activity != model.Idle || s.Group == GroupYourTurn || s.Tool != "" || !s.ActivitySince.Equal(at(100)) || !s.RecheckAt.IsZero() {
+		t.Fatalf("settled: %+v", s)
+	}
+	if len(s.Notes) != 1 || s.Notes[0] != "interrupted" {
+		t.Fatalf("notes %v", s.Notes)
+	}
+	// A step after the execution's last: a new execution runs.
+	snap, _ = compute(obs(691), &mem, at(200))
+	if s := find(t, snap, "agy:a1"); s.Activity != model.Working {
+		t.Fatalf("a new execution: %+v", s)
+	}
+	// A normal end the hooks already reported, then a background task's
+	// late PostToolUse (working again): over, and not "interrupted".
+	o := obs(690)
+	o.AgyTranscripts["a1"] = AgyTranscript{Path: "/t", Meta: model.AgyMeta{LastStepIndex: 690},
+		Exec: model.AgyExecution{Known: true, Reason: model.AgyNoToolCall, LastStep: 690}}
+	snap, _ = compute(o, &mem, at(200))
+	if s := find(t, snap, "agy:a1"); s.Activity != model.Idle || len(s.Notes) != 0 {
+		t.Fatalf("late PostToolUse: %+v", s)
+	}
+	// Only a turn the hooks call working: an error stays an error.
+	o = obs(690)
+	o.Hooks[0].State.Activity = model.Errored
+	snap, _ = compute(o, &mem, at(200))
+	if s := find(t, snap, "agy:a1"); s.Activity != model.Errored {
+		t.Fatalf("errored: %+v", s)
+	}
+	// No record, with an empty transcript: as before.
+	o = obs(0)
+	o.AgyTranscripts["a1"] = AgyTranscript{Path: "/t"}
+	snap, _ = compute(o, &mem, at(200))
+	if s := find(t, snap, "agy:a1"); s.Activity != model.Working {
+		t.Fatalf("no record, no steps: %+v", s)
+	}
+	// No record (an older agy, or unreadable): as before.
+	o = obs(690)
+	o.AgyTranscripts["a1"] = AgyTranscript{Path: "/t", Meta: model.AgyMeta{LastStepIndex: 690}}
+	snap, _ = compute(o, &mem, at(200))
+	if s := find(t, snap, "agy:a1"); s.Activity != model.Working {
+		t.Fatalf("no record: %+v", s)
+	}
+}

@@ -15,7 +15,7 @@ func TestAgyMeta(t *testing.T) {
 		`{"type":"PLANNER_RESPONSE","created_at":"2026-11-04T10:00:05Z","content":"On it.","input_tokens":100,"cache_read_tokens":5000}`,
 		`{"type":"GENERIC","created_at":"2026-11-04T10:00:06Z","content":"tool output"}`,
 		// A model call that only calls tools: no text, but a model call.
-		`{"type":"PLANNER_RESPONSE","created_at":"2026-11-04T10:00:09Z","content":"","tool_calls":[{"name":"x"}],"input_tokens":300,"cache_read_tokens":6000}`,
+		`{"step_index":3,"type":"PLANNER_RESPONSE","created_at":"2026-11-04T10:00:09Z","content":"","tool_calls":[{"name":"x"}],"input_tokens":300,"cache_read_tokens":6000}`,
 	}
 	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -31,7 +31,7 @@ func TestAgyMeta(t *testing.T) {
 	if m.LastMessage != "On it." || !m.LastMessageAt.Equal(at("2026-11-04T10:00:05Z")) {
 		t.Fatalf("last message %q at %v (the last one with text)", m.LastMessage, m.LastMessageAt)
 	}
-	if m.LastPrompt != "build it" || !m.PendingTools || m.ContextTokens != 6300 {
+	if m.LastPrompt != "build it" || !m.PendingTools || m.ContextTokens != 6300 || m.LastStepIndex != 3 {
 		t.Fatalf("%+v", m)
 	}
 }

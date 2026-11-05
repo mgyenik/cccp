@@ -72,6 +72,7 @@ func (m ClaudeMeta) LastActivity() time.Time {
 // AgyMeta is what cccp knows from an agy transcript
 // (brain/<id>/.system_generated/logs/transcript_full.jsonl).
 type AgyMeta struct {
+	LastStepIndex  int // step_index of the last step
 	LastStepAt     time.Time
 	LastStepType   string
 	LastStepStatus string

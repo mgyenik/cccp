@@ -17,6 +17,7 @@ type agyEntry struct {
 }
 
 type agyStep struct {
+	Index     int             `json:"step_index"`
 	Type      string          `json:"type"`
 	Status    string          `json:"status"`
 	CreatedAt time.Time       `json:"created_at"`
@@ -77,6 +78,7 @@ func (e *agyEntry) parse(buf []byte) {
 		if json.Unmarshal(line, &s) != nil {
 			continue
 		}
+		e.meta.LastStepIndex = s.Index
 		e.meta.LastStepAt = s.CreatedAt
 		e.meta.LastStepType = s.Type
 		e.meta.LastStepStatus = s.Status

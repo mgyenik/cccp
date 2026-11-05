@@ -149,6 +149,12 @@ func (f *fakeFiles) ProfileDirs() []string          { return f.profileDirs }
 type fakeAgy struct{}
 
 func (fakeAgy) All() map[string]model.AgyConversation { return nil }
+func (fakeAgy) LastExecution(id string) model.AgyExecution {
+	if id == "g1" {
+		return model.AgyExecution{Known: true, Reason: model.AgyUserCanceled, LastStep: 7}
+	}
+	return model.AgyExecution{}
+}
 
 type fakeCatalog struct {
 	docs []catalog.Doc
@@ -529,5 +535,18 @@ func TestServerIdentity(t *testing.T) {
 	w.g.RefreshTmux()
 	if obs := w.g.Observe(now); obs.Tmux.OK || !obs.Tmux.NoServer {
 		t.Fatalf("no server: %+v", obs.Tmux)
+	}
+}
+
+// An agy session's transcript comes with how its latest execution ended.
+func TestObserveReadsAgyExecutions(t *testing.T) {
+	w := newWorld()
+	w.hooks.files["/s/g1.json"] = model.HookState{Agent: model.Agy, SessionID: "g1", PID: 10, TranscriptPath: "/t/g1.jsonl"}
+	w.procs.alive[10] = true
+	w.tr.agy["/t/g1.jsonl"] = transcript.AgyMeta{LastStepIndex: 7}
+	w.g.Reload()
+	obs := w.g.Observe(now)
+	if got := obs.AgyTranscripts["g1"]; got.Meta.LastStepIndex != 7 || got.Exec != (model.AgyExecution{Known: true, Reason: model.AgyUserCanceled, LastStep: 7}) {
+		t.Fatalf("%+v", got)
 	}
 }

@@ -29,6 +29,16 @@ type Cache struct {
 // NewCache returns a cache for the database at path.
 func NewCache(path string) *Cache { return &Cache{Path: path} }
 
+// DB is agy's databases: the conversation summaries, and each
+// conversation's own (for how its executions ended).
+type DB struct {
+	*Cache
+	Exec *Executions
+}
+
+// LastExecution is how conversation id's latest execution ended.
+func (d DB) LastExecution(id string) model.AgyExecution { return d.Exec.Last(id) }
+
 func stamp(p string) string {
 	var b strings.Builder
 	for _, f := range []string{p, p + "-wal"} {

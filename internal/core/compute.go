@@ -171,6 +171,9 @@ func NextDeadline(s Snapshot) time.Time {
 		}
 	}
 	for _, x := range s.Sessions {
+		if x.RecheckAt.After(s.At) && (t.IsZero() || x.RecheckAt.Before(t)) {
+			t = x.RecheckAt
+		}
 		if x.Group == GroupWorking || x.Group == GroupClosed || !x.Cache.Known {
 			continue
 		}

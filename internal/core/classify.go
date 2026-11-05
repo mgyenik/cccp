@@ -61,6 +61,7 @@ type computation struct {
 type meta struct {
 	claude    model.ClaudeMeta
 	agy       model.AgyMeta
+	agyExec   model.AgyExecution
 	hasClaude bool
 	hasAgy    bool
 	path      string
@@ -84,7 +85,7 @@ func (c *computation) transcriptFor(b *builder) meta {
 		}
 	case model.Agy:
 		if t, ok := c.obs.AgyTranscripts[b.sid]; ok && t.Path != "" {
-			return meta{agy: t.Meta, hasAgy: true, path: t.Path}
+			return meta{agy: t.Meta, agyExec: t.Exec, hasAgy: true, path: t.Path}
 		}
 	}
 	return m
@@ -191,6 +192,7 @@ func (c *computation) build(b *builder) (Session, bool) {
 	default:
 		mergeActivity(&s, hs, r, m.claude)
 		s.BackgroundShell = r != nil && r.BackgroundShell() && s.Activity == model.Idle
+		c.agyTurnOverWithoutHook(&s, hs, m)
 	}
 	if hs != nil {
 		s.LastEventAt = hs.LastEventAt
@@ -333,6 +335,38 @@ func mergeActivity(s *Session, h *model.HookState, r *model.RegistryEntry, cm mo
 	s.Question = r.Question()
 	if regAct == model.NeedsApproval && cm.PendingToolName != "" {
 		s.Tool = cm.PendingToolName
+	}
+}
+
+// AgySettle is how long an agy session's hooks must have been quiet before
+// agy's own record of an ended execution ends a turn the hooks did not. It
+// covers the moment a new prompt's first hook has arrived and its
+// transcript step has not yet been written.
+const AgySettle = 10 * time.Second
+
+// agyTurnOverWithoutHook ends an agy turn the hooks still call working when
+// agy's database says its latest execution has ended and the transcript has
+// no step after that execution's last. agy runs no hook when the user
+// interrupts (docs/agy-hooks.md), and a background task finishing after
+// the turn fires a PostToolUse that reads as work. It is not a completion:
+// an interrupt means the user was there, and a finished turn's completion
+// came with its Stop.
+func (c *computation) agyTurnOverWithoutHook(s *Session, hs *model.HookState, m meta) {
+	if hs == nil || s.Activity != model.Working || !m.hasAgy { // hasAgy: an agy session
+		return
+	}
+	ex := m.agyExec
+	if !ex.Known || ex.LastStep < m.agy.LastStepIndex {
+		return // a later step: a new execution is running
+	}
+	if settled := hs.LastEventAt.Add(AgySettle); c.now.Before(settled) {
+		s.RecheckAt = settled
+		return
+	}
+	s.Activity, s.ActivitySince = model.Idle, maxTime(hs.LastEventAt, m.agy.LastStepAt)
+	s.Tool, s.ToolDetail, s.Question = "", "", ""
+	if ex.Reason == model.AgyUserCanceled {
+		s.Notes = append(s.Notes, "interrupted")
 	}
 }
 

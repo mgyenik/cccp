@@ -38,8 +38,10 @@ type Layout struct {
 	// Antigravity CLI.
 	AgyDir         string
 	AgySummariesDB string
-	AgyBrainDir    string
-	AgyPluginDir   string
+	// AgyConversationsDir holds a database per agy conversation.
+	AgyConversationsDir string
+	AgyBrainDir         string
+	AgyPluginDir        string
 
 	// Installed artefacts.
 	ShareDir       string // ~/.local/share/cccp
@@ -101,6 +103,7 @@ func Resolve(getenv func(string) string, home string, uid int) Layout {
 
 	l.AgyDir = filepath.Join(home, ".gemini", "antigravity-cli")
 	l.AgySummariesDB = filepath.Join(l.AgyDir, "conversation_summaries.db")
+	l.AgyConversationsDir = filepath.Join(l.AgyDir, "conversations")
 	l.AgyBrainDir = filepath.Join(l.AgyDir, "brain")
 	l.AgyPluginDir = filepath.Join(home, ".gemini", "config", "plugins", "cccp")
 

@@ -90,6 +90,8 @@ type Files interface {
 // AgyDB reads agy's conversation summaries.
 type AgyDB interface {
 	All() map[string]model.AgyConversation
+	// LastExecution is how a conversation's latest execution ended.
+	LastExecution(conversationID string) model.AgyExecution
 }
 
 // Power reports the power source.
@@ -472,7 +474,7 @@ func (g *Gatherer) Observe(now time.Time) core.Observation {
 			p = g.d.Files.AgyTranscript(n.ConversationID)
 		}
 		if m, err := g.d.Transcripts.Agy(p); err == nil {
-			obs.AgyTranscripts[n.ConversationID] = core.AgyTranscript{Path: p, Meta: m}
+			obs.AgyTranscripts[n.ConversationID] = core.AgyTranscript{Path: p, Meta: m, Exec: g.d.AgyDB.LastExecution(n.ConversationID)}
 		}
 	}
 	obs.Projects = map[core.ProjectKey][]core.ProjectTranscript{}

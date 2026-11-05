@@ -168,7 +168,7 @@ func (a *app) gatherer(cfg config.Config) *gather.Gatherer {
 		Files:            gather.DiskFiles{Home: a.l.Home, AgyBrainDir: a.l.AgyBrainDir},
 		Catalog:          a.catalog(nil), // reading the catalog needs no transcript directories
 		Cgroups:          a.cgroups(),
-		AgyDB:            agydb.NewCache(a.l.AgySummariesDB),
+		AgyDB:            agydb.DB{Cache: agydb.NewCache(a.l.AgySummariesDB), Exec: agydb.NewExecutions(a.l.AgyConversationsDir)},
 		Power:            power.System{},
 		Hostname:         host,
 		Home:             a.l.Home,

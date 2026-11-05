@@ -110,8 +110,11 @@ type Session struct {
 	AutoTurn bool `json:"auto_turn,omitempty"`
 	// BackgroundShell: the turn is over but a background shell command the
 	// session started still runs (Claude Code's registry status "shell").
-	BackgroundShell bool   `json:"background_shell,omitempty"`
-	Cwd             string `json:"cwd,omitempty"`
+	BackgroundShell bool `json:"background_shell,omitempty"`
+	// RecheckAt is when the session's state may change with no new event
+	// (zero: never): Compute must run again then (NextDeadline).
+	RecheckAt time.Time `json:"recheck_at,omitzero"`
+	Cwd       string    `json:"cwd,omitempty"`
 	// Profile is the Claude profile's name and ConfigDir its directory
 	// (Claude sessions only).
 	Profile   string `json:"profile,omitempty"`
