@@ -42,6 +42,9 @@ type Actions struct {
 	// switches to it. Either may be nil (no workstream support).
 	OpenWorkstream func(name string) error
 	NewWorkstream  func(name, dir string, create bool) error
+	// MoveSession moves a session into the workstream dest (made, or
+	// restored, if need be); the cockpit stays open. May be nil.
+	MoveSession func(s core.Session, dest string) error
 }
 
 // Searcher searches the conversation text (catalog.Index). The cockpit only
@@ -75,6 +78,7 @@ const (
 	modeFilter
 	modeAlias
 	modeCreate // the new-workstream flow (creator)
+	modeMove   // moving a session to another workstream (mover)
 )
 
 type snapMsg core.Snapshot
@@ -128,6 +132,7 @@ type Model struct {
 	previewText string
 
 	creator *creator // the new-workstream flow, in modeCreate
+	mover   *mover   // the move flow, in modeMove
 
 	status   string
 	statusAt time.Time
@@ -323,6 +328,15 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case movedMsg:
+		if msg.err != nil {
+			m.setStatus("move: " + msg.err.Error())
+		} else {
+			m.setStatus(fmt.Sprintf("moved %q to %s", msg.title, msg.dest))
+			m.opt.Source.Refresh()
+		}
+		return m, nil
+
 	case tea.KeyPressMsg:
 		return m.key(msg)
 	}
@@ -334,6 +348,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.filter, cmd = m.filter.Update(msg)
 	case modeAlias:
 		m.alias, cmd = m.alias.Update(msg)
+	case modeMove:
+		m.mover.input, cmd = m.mover.input.Update(msg)
 	case modeCreate:
 		if m.creator.step == stepName {
 			m.creator.name, cmd = m.creator.name.Update(msg)
@@ -384,6 +400,20 @@ func (m *Model) key(k tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 	}
 	switch m.mode {
+	case modeMove:
+		cmd, done, dest := m.mover.update(k)
+		if !done {
+			return m, cmd
+		}
+		s := m.mover.sess
+		m.mode, m.mover = modeList, nil
+		if dest == "" {
+			return m, cmd
+		}
+		move := m.opt.Actions.MoveSession
+		return m, tea.Batch(cmd, func() tea.Msg {
+			return movedMsg{title: s.DisplayTitle(), dest: dest, err: move(s, dest)}
+		})
 	case modeCreate:
 		cmd, done, res := m.creator.update(k)
 		if !done {
@@ -508,6 +538,18 @@ func (m *Model) key(k tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.alias.CursorEnd()
 			return m, m.alias.Focus()
 		}
+	case "M":
+		s, ok := m.selected()
+		if !ok {
+			break
+		}
+		if m.opt.Actions.MoveSession == nil {
+			m.setStatus("moving sessions is not available here")
+			break
+		}
+		m.mover = newMover(s, m.snap)
+		m.mode = modeMove
+		return m, m.mover.input.Focus()
 	case "w":
 		if m.opt.Actions.NewWorkstream == nil {
 			m.setStatus("workstreams are not available here")
@@ -713,6 +755,8 @@ func (m *Model) renderHeader() string {
 func (m *Model) renderFooter() string {
 	var line string
 	switch m.mode {
+	case modeMove:
+		line = m.mover.input.View() + "  " + sKeyHint.Render("enter move · ↑↓ choose · esc cancel")
 	case modeCreate:
 		line = m.creator.input() + "  " + sKeyHint.Render(m.creator.hint())
 	case modeFilter:
@@ -724,7 +768,7 @@ func (m *Model) renderFooter() string {
 		if m.hideClosed {
 			closed = "e show closed"
 		}
-		hint := "enter open/resume · tab next needing you · / search · w workstream · a alias · m seen · p preview · " + closed + " · r rescan · q quit"
+		hint := "enter open/resume · tab next needing you · / search  · w workstream · M move · a alias · m seen · p preview · " + closed + " · r rescan · q quit"
 		if f := m.filter.Value(); f != "" {
 			hint = "search: " + f + " · " + hint
 		}
@@ -739,6 +783,9 @@ func (m *Model) renderFooter() string {
 func (m *Model) renderBody(h int) string {
 	if m.mode == modeCreate {
 		return m.creator.view(m.width, h)
+	}
+	if m.mode == modeMove {
+		return m.mover.view(m.width, h)
 	}
 
 	sel, hasSel := m.selected()

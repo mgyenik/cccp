@@ -1110,3 +1110,27 @@ func TestALiveConversationOutranksAPlaceholderMark(t *testing.T) {
 		t.Fatalf("%+v", c)
 	}
 }
+
+func TestPlanMove(t *testing.T) {
+	inPane := Session{Alive: true, Pane: "%3", WindowID: "@7", TmuxSess: "infra", Title: "T"}
+	if m := PlanMove(inPane, "docs"); m.Kind != MoveWindow || m.Window != "@7" {
+		t.Fatalf("%+v", m)
+	}
+	if m := PlanMove(inPane, "infra"); m.Kind != MoveImpossible || !strings.Contains(m.Reason, "already in infra") {
+		t.Fatalf("%+v", m)
+	}
+	closed := Session{Agent: model.Claude, SessionID: "c1", Cwd: "/w", ConfigDir: "/h/.claude-work"}
+	m := PlanMove(closed, "docs")
+	if m.Kind != MoveOpen || m.Open.TmuxSession != "docs" || !m.Open.Resume || m.Open.Dir != "/w" ||
+		!reflect.DeepEqual(m.Open.Argv, []string{"claude", "--resume", "c1"}) {
+		t.Fatalf("closed: %+v", m)
+	}
+	bg := Session{Alive: true, Kind: "background", Agent: model.Claude, SessionID: "b1", Cwd: "/w", DefaultProfile: true}
+	if m := PlanMove(bg, "docs"); m.Kind != MoveOpen || m.Open.Argv[len(m.Open.Argv)-2] != "attach" || m.Open.TmuxSession != "docs" {
+		t.Fatalf("background: %+v", m)
+	}
+	outside := Session{Alive: true, Agent: model.Claude, SessionID: "o1", PID: 9, Title: "Out"}
+	if m := PlanMove(outside, "docs"); m.Kind != MoveImpossible || !strings.Contains(m.Reason, "outside tmux") {
+		t.Fatalf("outside tmux: %+v", m)
+	}
+}

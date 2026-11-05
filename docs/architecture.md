@@ -542,7 +542,9 @@ reading, and is reached only through interfaces.
    process killed while watched), and `tmux`: a workstream restore plan run
    against a real tmux server on a socket in a temp directory, configured
    with `-f` (never `~/.tmux.conf`), checking windows, layouts, directories
-   and resume marks.
+   and resume marks; and `cmd/cccp`'s move action on the same kind of
+   sandbox (into an existing, a new and a dormant workstream, and a closed
+   conversation).
 4. **Manual end-to-end** (not in `go test`, because they cost money or touch
    the user's environment): a `claude -p --plugin-dir` run with a scratch
    copy of the plugin, the cockpit rendered in an isolated tmux server

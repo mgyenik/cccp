@@ -39,6 +39,10 @@ set-hook -g session-closed[97]         'run-shell -b "$HOME/.local/bin/cccp noti
 set-hook -g session-renamed[97]        'run-shell -b "$HOME/.local/bin/cccp notify tmux session-renamed"'
 set-hook -g window-renamed[97]         'run-shell -b "$HOME/.local/bin/cccp notify tmux window-renamed"'
 set-hook -g window-layout-changed[97]  'run-shell -b "$HOME/.local/bin/cccp notify tmux window-layout-changed"'
+# A window moved to another session (cccp's M, or tmux's move-window).
+set-hook -g window-linked[97]          'run-shell -b "$HOME/.local/bin/cccp notify tmux window-linked"'
+set-hook -g window-unlinked[97]        'run-shell -b "$HOME/.local/bin/cccp notify tmux window-unlinked"'
+
 
 # --- workstreams (docs/workstreams.md) -----------------------------------------
 # Closing a session's last window goes back to the session used before it,

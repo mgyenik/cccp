@@ -248,7 +248,7 @@ func (a *app) jump(client string, s core.Session) error {
 		if sess == "" {
 			sess = a.clientValue(client, "#{session_name}")
 		}
-		pane, err := a.tmux.NewWindow(sess, dir, "", p.Env, p.Argv)
+		pane, err := a.tmux.NewWindow(sess, dir, "", p.Env, p.Argv, false)
 		if err != nil {
 			return err
 		}
@@ -445,6 +445,7 @@ func runUI(a *app, args []string) error {
 
 		Actions: ui.Actions{
 			OpenWorkstream: func(name string) error { return a.openWorkstream(*client, name) },
+			MoveSession:    func(s core.Session, dest string) error { return a.moveSession(s, dest) },
 			NewWorkstream: func(name, dir string, create bool) error {
 				return a.newWorkstream(*client, name, dir, create)
 			},

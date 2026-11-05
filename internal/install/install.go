@@ -292,7 +292,7 @@ var Hooks = []string{
 	"client-session-changed", "session-window-changed", "window-pane-changed", "client-focus-in",
 	"client-focus-out", "client-attached", "client-detached", "after-new-window", "after-split-window",
 	"pane-exited", "session-created", "session-closed", "session-renamed", "window-renamed",
-	"window-layout-changed",
+	"window-layout-changed", "window-linked", "window-unlinked",
 }
 
 // Saved is the tmux state cccp.tmux overrides. It is stored as data and

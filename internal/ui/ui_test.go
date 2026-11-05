@@ -116,7 +116,7 @@ func run(m *Model, cmd tea.Cmd) {
 		for _, c := range msg {
 			run(m, c)
 		}
-	case doneMsg, searchMsg:
+	case doneMsg, searchMsg, movedMsg:
 		m.Update(msg)
 	}
 }

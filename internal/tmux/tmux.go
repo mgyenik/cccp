@@ -362,14 +362,19 @@ func (c *Client) CapturePane(pane string, ansi bool, lines int) (string, error) 
 }
 
 // NewWindow opens a window in session running cmd in dir, with env
-// (KEY=VALUE) set for the command, and returns its pane id.
-func (c *Client) NewWindow(session, dir, name string, env, cmd []string) (string, error) {
+// (KEY=VALUE) set for the command, and returns its pane id. detached: it
+// does not become the session's current window (nobody viewing the session
+// is moved to it).
+func (c *Client) NewWindow(session, dir, name string, env, cmd []string, detached bool) (string, error) {
 	a := []string{"new-window", "-P", "-F", "#{pane_id}"}
+	if detached {
+		a = append(a, "-d")
+	}
 	for _, kv := range env {
 		a = append(a, "-e", kv)
 	}
 	if session != "" {
-		a = append(a, "-t", session+":")
+		a = append(a, "-t", "="+session+":") // exactly this session, not one it prefixes
 	}
 	if dir != "" {
 		a = append(a, "-c", dir)

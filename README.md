@@ -73,6 +73,7 @@ full tracking.
 | cockpit | `tab` / `shift+tab` | next / previous session needing you |
 | cockpit | `/` | search everything, live and closed: names, projects, prompts and summaries match at once (fuzzy), conversation text after a pause in typing; `esc` clears |
 | cockpit | `w` | new workstream (a tmux session): type a name, then pick or type its directory (a new path is created); an existing name opens it |
+| cockpit | `M` | move the session to another workstream, or a new one (its whole window moves; a closed conversation resumes there); the cockpit stays open |
 | cockpit | `a` | set an alias for the session |
 | cockpit | `m` | mark seen |
 | cockpit | `p` | preview: live pane → conversation → off |

@@ -281,3 +281,43 @@ func SessionForDir(panes []model.TmuxPane, dir string) string {
 	}
 	return best
 }
+
+// MoveKind is how to move a session to another workstream.
+type MoveKind int
+
+const (
+	// MoveWindow: move the session's tmux window (all its panes) as it is.
+	MoveWindow MoveKind = iota
+	// MoveOpen: open the session in a new window there (Open: attach a
+	// background session, or resume a closed conversation).
+	MoveOpen
+	// MoveImpossible: Reason says why.
+	MoveImpossible
+)
+
+// Move is the plan for moving a session to the workstream (tmux session)
+// dest.
+type Move struct {
+	Kind   MoveKind
+	Window string // MoveWindow: the window id (@N)
+	Open   Jump   // MoveOpen: the window to open, its TmuxSession dest
+	Reason string
+}
+
+// PlanMove decides how to move s into workstream dest. A session in a pane
+// takes its whole window along (whatever else is split beside it); one with
+// no window of its own is opened there as Enter would open it, but in dest.
+func PlanMove(s Session, dest string) Move {
+	if s.Alive && s.Pane != "" {
+		if s.TmuxSess == dest {
+			return Move{Kind: MoveImpossible, Reason: s.DisplayTitle() + " is already in " + dest}
+		}
+		return Move{Kind: MoveWindow, Window: s.WindowID}
+	}
+	j := PlanJump(s, nil)
+	if j.Kind != JumpNewWindow {
+		return Move{Kind: MoveImpossible, Reason: j.Reason}
+	}
+	j.TmuxSession = dest
+	return Move{Kind: MoveOpen, Open: j}
+}

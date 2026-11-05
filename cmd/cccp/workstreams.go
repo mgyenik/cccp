@@ -75,20 +75,11 @@ func (a *app) running(name string) bool {
 // it is dormant.
 func (a *app) openWorkstream(client, name string) error {
 	if !a.running(name) {
-		dormant, _, err := a.dormant()
+		restored, err := a.restoreDormant(name)
 		if err != nil {
 			return err
 		}
-		found := false
-		for _, w := range dormant {
-			if w.Name == name {
-				if err := a.restore(w); err != nil {
-					return err
-				}
-				found = true
-			}
-		}
-		if !found {
+		if !restored {
 			return fmt.Errorf("no workstream %q", name)
 		}
 		a.pokeDaemon()
@@ -282,4 +273,71 @@ func (a *app) paneShell(cwd string) error {
 		_ = os.Chdir(cwd)
 	}
 	return syscall.Exec(shell, []string{"-" + filepath.Base(shell)}, os.Environ())
+}
+
+// moveSession moves a session into the workstream dest, which is created
+// (in the session's directory) or restored first if need be. The client
+// stays where it is (docs/workstreams.md).
+func (a *app) moveSession(s core.Session, dest string) error {
+	if err := workstream.Validate(dest); err != nil {
+		return err
+	}
+	p := core.PlanMove(s, dest)
+	if p.Kind == core.MoveImpossible {
+		return errors.New(p.Reason)
+	}
+	if p.Kind == core.MoveOpen && p.Open.Resume && !(dirs.FS{}).Exists(p.Open.Dir) {
+		return fmt.Errorf("cannot resume %s: its directory %s no longer exists", s.DisplayTitle(), p.Open.Dir)
+	}
+	// tmux cannot make an empty session: a new one starts with a window,
+	// closed once the session has the moved one.
+	scratch := ""
+	if !a.running(dest) {
+		restored, err := a.restoreDormant(dest)
+		if err != nil {
+			return err
+		}
+		if !restored {
+			dir := s.Cwd
+			if !(dirs.FS{}).Exists(dir) {
+				dir = a.l.Home
+			}
+			out, err := a.tmux.Run("new-session", "-d", "-P", "-F", "#{window_id}", "-s", dest, "-c", dir)
+			if err != nil {
+				return err
+			}
+			scratch = strings.TrimSpace(out)
+		}
+	}
+	switch p.Kind {
+	case core.MoveWindow:
+		if _, err := a.tmux.Run("move-window", "-s", p.Window, "-t", "="+dest+":"); err != nil {
+			return err
+		}
+	case core.MoveOpen:
+		if _, err := a.tmux.NewWindow(dest, p.Open.Dir, "", p.Open.Env, p.Open.Argv, true); err != nil {
+			return err
+		}
+	}
+	if scratch != "" {
+		if _, err := a.tmux.Run("kill-window", "-t", scratch); err != nil {
+			return err
+		}
+	}
+	a.pokeDaemon()
+	return nil
+}
+
+// restoreDormant restores the dormant workstream name, if there is one.
+func (a *app) restoreDormant(name string) (bool, error) {
+	dormant, _, err := a.dormant()
+	if err != nil {
+		return false, err
+	}
+	for _, w := range dormant {
+		if w.Name == name {
+			return true, a.restore(w)
+		}
+	}
+	return false, nil
 }

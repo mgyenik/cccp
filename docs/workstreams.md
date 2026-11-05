@@ -91,6 +91,34 @@ Two steps, `Esc` going back one:
 Then `tmux new-session -d -s NAME -c DIR`, the client switches to it, and
 the cockpit closes.
 
+## Moving a session: `M` in the cockpit
+
+`M` on a session row opens a picker of the other workstreams (fuzzy;
+dormant ones marked, and restored first). A name matching none adds `+ new
+workstream «name»` after the matches; Enter takes the highlighted row. The
+cockpit stays open (a status line says what moved), so several sessions can
+be sorted in a row; Enter afterwards jumps as usual.
+
+What moves (`core.PlanMove`):
+
+* a session in a tmux pane: its **whole window**, with whatever else is
+  split beside it (`move-window`, everything keeps running);
+* a background session: its `claude attach` window opens in the
+  destination;
+* a closed conversation: it resumes in a new window in the destination
+  (its directory must still exist);
+* a session open outside tmux: refused, as Enter refuses it;
+* into its own workstream: refused.
+
+The new window does not become the destination's current window (`-d`), so
+nobody viewing it is moved. A new workstream starts in the session's
+directory (where its new windows open); tmux cannot create an empty session,
+so the window it starts with is closed once the moved one is in. Moving a
+workstream's last window out closes that workstream, and the usual rules
+apply (anyone viewing it goes back to the previous one; it is forgotten
+after 10 s). The snippet hooks `window-linked` and `window-unlinked`, so the
+record follows at once.
+
 ## Closing, and forgetting
 
 Closing a workstream is ordinary tmux: close its last window (or
