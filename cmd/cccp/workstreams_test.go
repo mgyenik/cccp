@@ -36,7 +36,9 @@ func testApp(t *testing.T, conf ...string) (*app, string) {
 			t.Fatal(err)
 		}
 	}
-	if err := os.WriteFile(filepath.Join(bin, "claude"), []byte("#!/bin/sh\nexec sleep 60\n"), 0o755); err != nil {
+	// The stand-in claude records the profile it was started in.
+	claude := "#!/bin/sh\necho \"${CLAUDE_CONFIG_DIR-<unset>}\" >> " + filepath.Join(dir, "claude-profile") + "\nexec sleep 60\n"
+	if err := os.WriteFile(filepath.Join(bin, "claude"), []byte(claude), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	env := map[string]string{
@@ -56,8 +58,10 @@ func testApp(t *testing.T, conf ...string) (*app, string) {
 	if err := os.WriteFile(cfg, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	// The stand-ins on PATH for this process too: a session made by
+	// new-session takes its environment from the client that makes it.
+	t.Setenv("PATH", bin+":"+os.Getenv("PATH"))
 	boot := exec.Command("tmux", "-S", l.TmuxSocket, "-f", cfg, "start-server")
-	boot.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"))
 	if out, err := boot.CombinedOutput(); err != nil {
 		t.Fatalf("starting tmux: %v: %s", err, out)
 	}
@@ -185,10 +189,15 @@ func TestMoveAClosedConversationIntoANewWorkstream(t *testing.T) {
 		t.Fatal(err)
 	}
 	before := shellStarts(dir)
-	closed := core.Session{Key: "claude:c1", Agent: model.Claude, SessionID: "c1", Cwd: dir, DefaultProfile: true, Title: "Old"}
+	closed := core.Session{Key: "claude:c1", Agent: model.Claude, SessionID: "c1", Cwd: dir, ConfigDir: "/h/.claude-work", Title: "Old"}
 	if err := a.moveSession(closed, "fresh"); err != nil {
 		t.Fatal(err)
 	}
+	// Resumed in its own profile.
+	waitFor(t, func() bool {
+		b, _ := os.ReadFile(filepath.Join(dir, "claude-profile"))
+		return strings.TrimSpace(string(b)) == "/h/.claude-work"
+	})
 	out, err := a.tmux.Run("list-panes", "-s", "-t", "=fresh", "-F", "#{window_index} #{pane_start_command}")
 	if err != nil || !strings.HasPrefix(out, "0 ") || strings.Count(out, "\n") != 1 || !strings.Contains(out, "claude --resume c1") {
 		t.Fatalf("panes:\n%s %v", out, err)
@@ -214,10 +223,27 @@ func TestMoveAClosedConversationOpensItThere(t *testing.T) {
 	if !strings.Contains(out, "claude --resume c1") || !strings.HasPrefix(out, "1 ") {
 		t.Fatalf("panes:\n%s(want the resume in a new, not current, window)", out)
 	}
+	// It ran, in the default profile (the variable removed).
+	waitFor(t, func() bool {
+		b, _ := os.ReadFile(filepath.Join(dir, "claude-profile"))
+		return strings.TrimSpace(string(b)) == "<unset>"
+	})
 	// A closed conversation whose directory is gone is not opened.
 	gone := closed
 	gone.Cwd = filepath.Join(dir, "deleted")
 	if err := a.moveSession(gone, "docs"); err == nil || !strings.Contains(err.Error(), "no longer exists") {
 		t.Fatalf("%v", err)
 	}
+}
+
+// waitFor polls cond for up to two seconds (a process started in a pane
+// runs on its own schedule).
+func waitFor(t *testing.T, cond func() bool) {
+	t.Helper()
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+		if cond() {
+			return
+		}
+	}
+	t.Fatal("condition not met within 2s")
 }

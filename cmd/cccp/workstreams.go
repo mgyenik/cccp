@@ -289,56 +289,61 @@ func (a *app) moveSession(s core.Session, dest string) error {
 	if p.Kind == core.MoveOpen && p.Open.Resume && !(dirs.FS{}).Exists(p.Open.Dir) {
 		return fmt.Errorf("cannot resume %s: its directory %s no longer exists", s.DisplayTitle(), p.Open.Dir)
 	}
-	// tmux cannot make an empty session: a new one starts with a window,
-	// closed once the session has the moved one, which then takes its index
-	// (the session's first). The scratch window runs sleep, not the user's
-	// shell: killing a shell while it starts up can leave its startup
-	// half done (a lock such as pyenv's rehash lock left behind, which then
-	// stalls every later shell).
-	scratch, scratchIndex := "", ""
 	if !a.running(dest) {
 		restored, err := a.restoreDormant(dest)
 		if err != nil {
 			return err
 		}
 		if !restored {
-			dir := s.Cwd
-			if !(dirs.FS{}).Exists(dir) {
-				dir = a.l.Home
-			}
-			out, err := a.tmux.Run("new-session", "-d", "-P", "-F", "#{window_id} #{window_index}", "-s", dest, "-c", dir,
-				"sleep", "86400")
-			if err != nil {
+			if err := a.moveIntoNew(s, p, dest); err != nil {
 				return err
 			}
-			if f := strings.Fields(out); len(f) == 2 {
-				scratch, scratchIndex = f[0], f[1]
-			}
+			a.pokeDaemon()
+			return nil
 		}
 	}
-	moved := p.Window // the window now in dest (a window id, or a pane of it)
 	switch p.Kind {
 	case core.MoveWindow:
 		if _, err := a.tmux.Run("move-window", "-s", p.Window, "-t", "="+dest+":"); err != nil {
 			return err
 		}
 	case core.MoveOpen:
-		pane, err := a.tmux.NewWindow(dest, p.Open.Dir, "", p.Open.Env, p.Open.Argv, true)
-		if err != nil {
-			return err
-		}
-		moved = pane
-	}
-	if scratch != "" {
-		if _, err := a.tmux.Run("kill-window", "-t", scratch); err != nil {
-			return err
-		}
-		if _, err := a.tmux.Run("move-window", "-s", moved, "-t", "="+dest+":"+scratchIndex); err != nil {
+		if _, err := a.tmux.NewWindow(dest, p.Open.Dir, "", p.Open.Env, p.Open.Argv, true); err != nil {
 			return err
 		}
 	}
 	a.pokeDaemon()
 	return nil
+}
+
+// moveIntoNew makes the workstream dest out of the session being moved.
+//
+// A window to open becomes the new session's first window: new-session runs
+// its command. A running window cannot become a session itself (new-session
+// always makes its own first window), so the session is made with a
+// placeholder and move-window -k puts the window in its place, killing it.
+// The placeholder runs sleep, never the user's shell: a shell killed while
+// it starts up can leave its startup half done (pyenv's rehash lock was
+// left behind that way, and every later shell waited 60 s for it).
+func (a *app) moveIntoNew(s core.Session, p core.Move, dest string) error {
+	dir := s.Cwd // also the directory a window to open runs in (core.PlanJump)
+	if !(dirs.FS{}).Exists(dir) {
+		dir = a.l.Home // attaching a background session works from anywhere
+	}
+	if p.Kind == core.MoveOpen {
+		args := []string{"new-session", "-d", "-s", dest, "-c", dir}
+		for _, kv := range p.Open.Env {
+			args = append(args, "-e", kv)
+		}
+		_, err := a.tmux.Run(append(args, p.Open.Argv...)...)
+		return err
+	}
+	out, err := a.tmux.Run("new-session", "-d", "-P", "-F", "#{window_index}", "-s", dest, "-c", dir, "sleep", "86400")
+	if err != nil {
+		return err
+	}
+	_, err = a.tmux.Run("move-window", "-k", "-s", p.Window, "-t", "="+dest+":"+strings.TrimSpace(out))
+	return err
 }
 
 // restoreDormant restores the dormant workstream name, if there is one.
