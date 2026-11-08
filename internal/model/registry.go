@@ -103,5 +103,16 @@ func (e RegistryEntry) IsUserSession() bool {
 	if strings.HasPrefix(e.Entrypoint, "sdk") {
 		return false
 	}
-	return e.Kind == "interactive" || e.Kind == "background"
+	k := e.SessionKind()
+	return k == "interactive" || k == "background"
+}
+
+// SessionKind is the entry's kind in cccp's terms: Claude Code writes "bg"
+// for a background session (2.1.319; a conversation moved to the
+// background, or started with --bg), "background" in older versions.
+func (e RegistryEntry) SessionKind() string {
+	if e.Kind == "bg" {
+		return "background"
+	}
+	return e.Kind
 }

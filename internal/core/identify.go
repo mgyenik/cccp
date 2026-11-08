@@ -100,26 +100,31 @@ func identify(obs Observation) identified {
 		regSIDByPID[r.Entry.PID] = r.Entry.SessionID
 	}
 
-	// 3. One current session per process: the registry's, else the hook
+	// 3. One current session per process: the registry's, else the
 	// session with the latest event. Others on that process are
-	// superseded (e.g. /clear without a SessionEnd).
+	// superseded (e.g. /clear without a SessionEnd). A session claims its
+	// registry entry's process and the one its hooks report, which can
+	// differ: a background job's hooks run in its wrapper (claude daemon
+	// run), whose own SessionStart names a session that never runs.
 	current := map[int]*builder{}
 	for _, b := range sortedBuilders(id.builders) {
-		pid := 0
-		switch {
-		case b.reg != nil:
-			pid = b.reg.Entry.PID
-		case hookLive(b.hook):
-			pid = b.hook.State.PID
+		var pids []int
+		if b.reg != nil {
+			pids = append(pids, b.reg.Entry.PID)
 		}
-		if pid == 0 {
-			continue
+		if hookLive(b.hook) && (b.reg == nil || b.hook.State.PID != b.reg.Entry.PID) {
+			pids = append(pids, b.hook.State.PID)
 		}
-		if sid, ok := regSIDByPID[pid]; ok && sid != b.sid {
-			continue
-		}
-		if cur, ok := current[pid]; !ok || b.lastEvent().After(cur.lastEvent()) {
-			current[pid] = b
+		for _, pid := range pids {
+			if pid == 0 {
+				continue
+			}
+			if sid, ok := regSIDByPID[pid]; ok && sid != b.sid {
+				continue
+			}
+			if cur, ok := current[pid]; !ok || b.lastEvent().After(cur.lastEvent()) {
+				current[pid] = b
+			}
 		}
 	}
 	for _, b := range id.builders {
@@ -133,7 +138,8 @@ func identify(obs Observation) identified {
 	// 4. Attach pane processes to their sessions.
 	agents := paneAgents(obs.Agents)
 	for pid, b := range current {
-		if ap, ok := agents[pid]; ok {
+		// A session on two processes: the registry's is its own.
+		if ap, ok := agents[pid]; ok && (b.proc == nil || (b.reg != nil && b.reg.Entry.PID == pid)) {
 			b.proc = &ap
 		}
 	}

@@ -1440,3 +1440,90 @@ func TestRestoredConversationOpensInItsPlaceholder(t *testing.T) {
 		t.Fatalf("resumed: %+v", s)
 	}
 }
+
+// A conversation moved to the background (Claude Code 2.1.319): its hooks
+// run in the job's wrapper process (no pane), its registry entry is the
+// worker's, kind "bg". It is a background session, opened with claude
+// attach in its project's workstream.
+func TestParkedBackgroundJobOpensWithAttach(t *testing.T) {
+	cwd := "/w/cam/.claude/worktrees/agent-1"
+	obs := Observation{
+		Profiles: profiles,
+		Hooks: []HookRecord{hookRec("j1", 31485, true, func(s *model.HookState) {
+			s.Activity, s.ActivityAt, s.TurnEndedAt, s.Cwd = model.Idle, at(10), at(10), cwd
+		})},
+		Registry: []RegistryRecord{regRec("j1", 31530, "shell", at(11), func(e *model.RegistryEntry) {
+			e.Kind, e.Cwd = "bg", cwd
+		})},
+		Tmux: TmuxView{OK: true, Panes: []model.TmuxPane{{ID: "%2", Session: "cam", Path: "/w/cam"}, {ID: "%9", Session: "vector", Path: "/w/vec"}}},
+	}
+	snap, _ := compute(obs, nil, at(12))
+	s := find(t, snap, "claude:j1")
+	if !s.Alive || s.Kind != "background" || s.Location != "background" {
+		t.Fatalf("%+v", s)
+	}
+	j := PlanJump(s, obs.Tmux.Panes)
+	if j.Kind != JumpNewWindow || !strings.HasSuffix(strings.Join(j.Argv, " "), "claude attach j1") || j.TmuxSession != "cam" {
+		t.Fatalf("jump %+v", j)
+	}
+}
+
+// A background job's wrapper (claude daemon run) starts a session it never
+// runs (a SessionStart only), then the job's hooks report the wrapper's
+// process too: the job is current on it, and the phantom is not listed.
+func TestJobWrapperPhantomIsNotListed(t *testing.T) {
+	cwd := "/w/cam/.claude/worktrees/agent-1"
+	obs := Observation{
+		Profiles: profiles,
+		Hooks: []HookRecord{
+			hookRec("phantom", 31485, true, func(s *model.HookState) {
+				s.Activity, s.ActivityAt, s.LastEvent, s.LastEventAt, s.Cwd = model.Idle, at(1), "SessionStart", at(1), cwd
+			}),
+			hookRec("job", 31485, true, func(s *model.HookState) {
+				s.Activity, s.ActivityAt, s.LastEvent, s.LastEventAt, s.Cwd = model.Idle, at(10), "Stop", at(10), cwd
+				s.LastPrompt, s.LastPromptAt = "build the toolpath engine", at(2)
+			}),
+		},
+		Registry: []RegistryRecord{regRec("job", 31530, "idle", at(11), func(e *model.RegistryEntry) { e.Kind, e.Cwd = "bg", cwd })},
+	}
+	snap, _ := compute(obs, nil, at(12))
+	if keys := keys(snap); len(keys) != 1 || keys[0] != "claude:job" {
+		t.Fatalf("sessions %v", keys)
+	}
+	// A superseded session that did run (a prompt; its last event a
+	// SessionStart, after a compaction) stays listed, closed.
+	obs.Hooks[0].State.LastPrompt = "an earlier task"
+	snap, _ = compute(obs, nil, at(12))
+	if s := find(t, snap, "claude:phantom"); s.Alive || s.Group != GroupClosed {
+		t.Fatalf("%+v", s)
+	}
+	// A new session that is not superseded is listed from its SessionStart.
+	fresh := Observation{Profiles: profiles, Hooks: []HookRecord{hookRec("new", 77, true, func(s *model.HookState) {
+		s.Activity, s.ActivityAt, s.LastEvent, s.LastEventAt = model.Idle, at(1), "SessionStart", at(1)
+	})}}
+	snap, _ = compute(fresh, nil, at(12))
+	if s := find(t, snap, "claude:new"); !s.Alive {
+		t.Fatalf("a fresh session: %+v", s)
+	}
+}
+
+// A session on two processes, each in a pane: its pane is the one where
+// its registry entry's process runs.
+func TestSessionOnTwoProcessesTakesTheRegistrysPane(t *testing.T) {
+	obs := Observation{
+		Profiles: profiles,
+		Hooks:    []HookRecord{hookRec("j", 41, true, func(s *model.HookState) { s.Activity, s.LastEventAt = model.Idle, at(5) })},
+		Registry: []RegistryRecord{regRec("j", 42, "idle", at(6), nil)},
+		Tmux:     TmuxView{OK: true, Panes: []model.TmuxPane{pane("%1", "@1", 1), pane("%2", "@2", 2)}},
+		Agents: []AgentProc{
+			{PID: 41, Agent: model.Claude, Pane: "%1", Cwd: "/w"},
+			{PID: 42, Agent: model.Claude, Pane: "%2", Cwd: "/w"},
+		},
+	}
+	for i := 0; i < 20; i++ { // map order varies: the rule must not
+		snap, _ := compute(obs, nil, at(10))
+		if s := find(t, snap, "claude:j"); s.Pane != "%2" {
+			t.Fatalf("pane %q, want the registry process's %%2", s.Pane)
+		}
+	}
+}

@@ -122,7 +122,7 @@ func (c *computation) build(b *builder) (Session, bool) {
 	// Liveness and process.
 	switch {
 	case r != nil:
-		s.Alive, s.PID, s.Kind = true, r.PID, r.Kind
+		s.Alive, s.PID, s.Kind = true, r.PID, r.SessionKind()
 	case b.proc != nil:
 		s.Alive, s.PID = true, b.proc.PID
 	case h != nil:
@@ -277,6 +277,14 @@ func (c *computation) build(b *builder) (Session, bool) {
 	// A closed session is listed while its transcript exists; without one
 	// (only hook state left), for the retention period.
 	if s.Group == GroupClosed && b.conv == nil && !s.EndedAt.IsZero() && c.now.Sub(s.EndedAt) > c.cfg.EndedRetention.Duration {
+		return Session{}, false
+	}
+	// Nor is a session that never ran: only its SessionStart was seen, then
+	// another session took its process, and nothing was said and no
+	// transcript exists (a background job's wrapper starts one before the
+	// job's own; there is nothing to show or resume).
+	if b.superseded && hs != nil && hs.LastEvent == "SessionStart" && b.conv == nil && !m.hasClaude && !m.hasAgy &&
+		s.LastPrompt == "" && s.LastMessage == "" {
 		return Session{}, false
 	}
 	return s, true

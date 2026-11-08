@@ -99,3 +99,18 @@ func TestFocusSince(t *testing.T) {
 		t.Fatal("clients attached: from now")
 	}
 }
+
+func TestRegistrySessionKind(t *testing.T) {
+	for kind, want := range map[string]string{"interactive": "interactive", "bg": "background", "background": "background", "daemon": "daemon"} {
+		e := RegistryEntry{Kind: kind, Entrypoint: "cli"}
+		if got := e.SessionKind(); got != want {
+			t.Errorf("%s: %s", kind, got)
+		}
+		if e.IsUserSession() != (want == "interactive" || want == "background") {
+			t.Errorf("%s: user session %v", kind, e.IsUserSession())
+		}
+	}
+	if (RegistryEntry{Kind: "bg", Entrypoint: "sdk-ts"}).IsUserSession() {
+		t.Fatal("an SDK process is not a user's session")
+	}
+}
