@@ -111,6 +111,10 @@ type Session struct {
 	// BackgroundShell: the turn is over but a background shell command the
 	// session started still runs (Claude Code's registry status "shell").
 	BackgroundShell bool `json:"background_shell,omitempty"`
+	// Placeholder is the restore placeholder pane (cccp start) waiting to
+	// resume this conversation, which is not running ("" if none); its
+	// window and workstream are then WindowID, Location and TmuxSess.
+	Placeholder string `json:"placeholder,omitempty"`
 	// RecheckAt is when the session's state may change with no new event
 	// (zero: never): Compute must run again then (NextDeadline).
 	RecheckAt time.Time `json:"recheck_at,omitzero"`

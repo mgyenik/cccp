@@ -4,7 +4,12 @@ Documentation=file://%h/git/cccp/docs/architecture.md
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/cccp daemon
+# Through a login shell: the daemon starts summaries (claude) and must find
+# them on the user's own PATH (~/.profile adds ~/.local/bin). At boot the
+# user manager's environment does not have it yet: the desktop session
+# imports its PATH later, and a daemon started before that could not run
+# claude ("executable file not found in $PATH", 2026-11-07).
+ExecStart=/bin/sh -lc 'exec %h/.local/bin/cccp daemon'
 Restart=on-failure
 RestartSec=2
 # Low priority: the daemon is never latency critical and should not compete

@@ -228,8 +228,17 @@ func runResumePane(a *app, args []string) error {
 	}
 	fmt.Printf("\n  ⏎  resume «%s»\n\n     %s\n     in %s\n\n  Enter resumes it · Ctrl-D or Ctrl-C: a shell here instead\n",
 		name, strings.Join(plan.Argv, " "), cwd)
-	if !waitForEnter() {
-		return a.paneShell(cwd)
+	for {
+		if !waitForEnter() {
+			return a.paneShell(cwd)
+		}
+		// Never a second process on the conversation: two would interleave
+		// their writes to one transcript.
+		where := a.openElsewhere(string(s.Agent)+":"+s.SessionID, os.Getenv("TMUX_PANE"))
+		if where == "" {
+			break
+		}
+		fmt.Printf("\n  «%s» is already open in %s: resuming it here too would run it twice.\n  Enter checks again · Ctrl-D or Ctrl-C: a shell here instead\n", name, where)
 	}
 	cmd := exec.Command(plan.Argv[0], plan.Argv[1:]...)
 	cmd.Env = append(os.Environ(), plan.Env...)
@@ -245,6 +254,35 @@ func runResumePane(a *app, args []string) error {
 		}
 	}
 	return a.paneShell(cwd)
+}
+
+// startPlaceholder starts a restore placeholder's conversation: the
+// placeholder resumes it on Enter (runResumePane).
+func (a *app) startPlaceholder(pane string) error {
+	_, err := a.tmux.Run("send-keys", "-t", pane, "Enter")
+	return err
+}
+
+// openElsewhere is where the conversation key runs in a pane other than
+// pane ("" if it does not), from a fresh scan (the daemon's, or one done
+// here without a daemon): one started seconds ago counts.
+func (a *app) openElsewhere(key, pane string) string {
+	return openIn(a.snapshot(true), key, pane)
+}
+
+// openIn is where conversation key runs in snap, in a pane other than pane
+// ("" if nowhere else).
+func openIn(snap core.Snapshot, key, pane string) string {
+	for _, s := range snap.Sessions {
+		if s.Key != key || !s.Alive || s.Pane == pane {
+			continue
+		}
+		if s.Location != "" {
+			return s.Location
+		}
+		return fmt.Sprintf("another process (pid %d)", s.PID)
+	}
+	return ""
 }
 
 // waitForEnter reads a line; false on EOF (Ctrl-D) or Ctrl-C.

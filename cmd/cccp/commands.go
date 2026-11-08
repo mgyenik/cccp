@@ -237,6 +237,17 @@ func (a *app) jump(client string, s core.Session) error {
 			return err
 		}
 		to = p.Pane
+	case core.JumpPlaceholder:
+		// The conversation waits in its restored pane: go there and start
+		// it (the placeholder resumes on Enter, and refuses if the
+		// conversation is open elsewhere).
+		if err := a.tmux.SwitchClient(client, p.Pane); err != nil {
+			return err
+		}
+		if err := a.startPlaceholder(p.Pane); err != nil {
+			return err
+		}
+		to = p.Pane
 	case core.JumpNewWindow:
 		dir := p.Dir
 		if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {

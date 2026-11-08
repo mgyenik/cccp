@@ -247,3 +247,41 @@ func waitFor(t *testing.T, cond func() bool) {
 	}
 	t.Fatal("condition not met within 2s")
 }
+
+// Opening a restored conversation presses Enter in its placeholder, which
+// waits on a line (runResumePane): it starts there, in its own window.
+func TestStartPlaceholderResumesInPlace(t *testing.T) {
+	a, dir := testApp(t)
+	done := filepath.Join(dir, "resumed")
+	if _, err := a.tmux.Run("new-session", "-d", "-s", "cam", "-c", dir, "sh -c 'read line; echo resumed > "+done+"; exec sleep 60'"); err != nil {
+		t.Fatal(err)
+	}
+	pane, err := a.tmux.Run("display-message", "-p", "-t", "=cam:", "#{pane_id}")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.startPlaceholder(strings.TrimSpace(pane)); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { _, err := os.Stat(done); return err == nil })
+	if out, _ := a.tmux.Run("list-windows", "-a", "-F", "#{window_id}"); strings.Count(strings.TrimSpace(out), "\n") != 0 {
+		t.Fatalf("a window was opened: %s", out)
+	}
+}
+
+// A placeholder never resumes a conversation that already runs elsewhere.
+func TestOpenIn(t *testing.T) {
+	snap := core.Snapshot{Sessions: []core.Session{
+		{Key: "claude:a", Alive: true, Pane: "%52", Location: "cccp:2"},
+		{Key: "claude:b", Alive: true, PID: 77},                   // outside tmux
+		{Key: "claude:c", Alive: false, Placeholder: "%5"},        // waiting: not running
+		{Key: "claude:d", Alive: true, Pane: "%5", Location: "x"}, // running in this very pane
+	}}
+	for key, want := range map[string]string{
+		"claude:a": "cccp:2", "claude:b": "another process (pid 77)", "claude:c": "", "claude:d": "", "claude:none": "",
+	} {
+		if got := openIn(snap, key, "%5"); got != want {
+			t.Errorf("%s: %q want %q", key, got, want)
+		}
+	}
+}

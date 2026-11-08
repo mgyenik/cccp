@@ -210,6 +210,14 @@ The one command after a reboot (and harmless at any time):
      record keeps the conversation while the placeholder waits (a reboot
      before you resume it loses nothing); the mark is cleared when the pane
      becomes a shell, and a live session in the pane outranks it.
+     **Opening the conversation from the cockpit goes to its placeholder and
+     starts it there** (in its own workstream), and `M` moves the
+     placeholder's window; neither opens a second copy. A placeholder never
+     resumes a conversation already open in another pane (it says where, and
+     waits): two processes on one transcript interleave their writes. (Fixed
+     2026-11-07: the cockpit resumed a restored conversation in a new window,
+     in the workstream its directory matched or else the client's current
+     one, and the placeholder resumed it again when Enter was pressed in it.)
 2. **Attach and open the cockpit**:
    * outside tmux: `exec tmux attach -t LAST \; run-shell -b "cccp popup
      --client '#{client_name}'"`, LAST being the most recently used

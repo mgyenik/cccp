@@ -39,8 +39,14 @@ func Compute(obs Observation, mem Memory, cfg config.Config, watchStart, now tim
 	if !obs.Tmux.OK && obs.Tmux.Err != "" {
 		snap.Problems = append(snap.Problems, "tmux: "+obs.Tmux.Err)
 	}
+	placeholders := placeholderPanes(obs.Tmux.Panes)
 	for _, b := range sortedBuilders(c.id.builders) {
 		if s, ok := c.build(b); ok {
+			if p, ok := placeholders[s.Key]; ok && !s.Alive {
+				// Waiting in a restored pane: open it there, never in a
+				// second window (two processes would share one transcript).
+				s.Placeholder, s.WindowID, s.Location, s.TmuxSess = p.ID, p.WindowID, p.Location(), p.Session
+			}
 			snap.Sessions = append(snap.Sessions, s)
 		}
 	}
@@ -247,6 +253,9 @@ const (
 	JumpNewWindow
 	// JumpImpossible: the session cannot be shown; Reason says why.
 	JumpImpossible
+	// JumpPlaceholder: switch the client to the restore placeholder waiting
+	// to resume the conversation (Pane), and start it there.
+	JumpPlaceholder
 )
 
 // Jump is the plan for showing a session.
@@ -290,6 +299,8 @@ func PlanJump(s Session, panes []model.TmuxPane) Jump {
 	switch {
 	case s.Alive && s.Pane != "":
 		return Jump{Kind: JumpPane, Pane: s.Pane}
+	case !s.Alive && s.Placeholder != "":
+		return Jump{Kind: JumpPlaceholder, Pane: s.Placeholder}
 	case s.Alive && s.Kind == "background" && s.SessionID != "":
 		argv, env := claudeCommand(s, "attach", s.SessionID)
 		return Jump{Kind: JumpNewWindow, Dir: s.Cwd, Argv: argv, Env: env, TmuxSession: SessionForDir(panes, s.Cwd)}
@@ -310,9 +321,33 @@ func PlanJump(s Session, panes []model.TmuxPane) Jump {
 	return Jump{Kind: JumpImpossible, Reason: "cannot resume " + string(s.Agent) + " sessions"}
 }
 
+// placeholderPanes are the restore placeholders waiting to resume a
+// conversation, by session key.
+func placeholderPanes(panes []model.TmuxPane) map[string]model.TmuxPane {
+	out := map[string]model.TmuxPane{}
+	for _, p := range panes {
+		if c, ok := workstream.ParseTag(p.Resume); ok {
+			out[string(c.Agent)+":"+c.SessionID] = p
+		}
+	}
+	return out
+}
+
 // SessionForDir is the tmux session with the most panes in dir (or below
 // it), "" when none has any. Ties go to the session name that sorts first.
+// A Claude agent worktree (PROJECT/.claude/worktrees/NAME) belongs with its
+// project: when no pane is in the worktree, the project's panes decide.
 func SessionForDir(panes []model.TmuxPane, dir string) string {
+	if s := sessionForDir(panes, dir); s != "" {
+		return s
+	}
+	if i := strings.Index(dir, "/.claude/worktrees/"); i > 0 {
+		return sessionForDir(panes, dir[:i])
+	}
+	return ""
+}
+
+func sessionForDir(panes []model.TmuxPane, dir string) string {
 	if dir == "" {
 		return ""
 	}
@@ -357,7 +392,9 @@ type Move struct {
 // takes its whole window along (whatever else is split beside it); one with
 // no window of its own is opened there as Enter would open it, but in dest.
 func PlanMove(s Session, dest string) Move {
-	if s.Alive && s.Pane != "" {
+	if (s.Alive && s.Pane != "") || (!s.Alive && s.Placeholder != "") {
+		// A placeholder's window moves like a live session's: opening a
+		// copy in dest would leave the placeholder to start a second one.
 		if s.TmuxSess == dest {
 			return Move{Kind: MoveImpossible, Reason: s.DisplayTitle() + " is already in " + dest}
 		}

@@ -952,6 +952,13 @@ func TestSessionForDir(t *testing.T) {
 	}
 	for dir, want := range map[string]string{
 		"/w/acme": "alpha", "/w/songs": "gamma", "/w/none": "", "": "",
+		// A Claude agent worktree belongs with its project...
+		"/w/songs/.claude/worktrees/agent-1": "gamma",
+		// ...whichever directory the project is.
+		"/w/acme/tools/.claude/worktrees/x": "alpha",
+		// Not a worktree: no walking up to a parent.
+		"/w/acme-other/sub":         "",
+		"/w/songs/.claude/skills/x": "",
 	} {
 		if got := SessionForDir(panes, dir); got != want {
 			t.Errorf("%q → %q want %q", dir, got, want)
@@ -1395,5 +1402,41 @@ func TestAgyInterruptEndsTheTurnWithoutAHook(t *testing.T) {
 	snap, _ = compute(o, &mem, at(200))
 	if s := find(t, snap, "agy:a1"); s.Activity != model.Working {
 		t.Fatalf("no record: %+v", s)
+	}
+}
+
+// A conversation restored by cccp start waits in a placeholder pane: it is
+// opened there (never in a second window) and moved with that window.
+func TestRestoredConversationOpensInItsPlaceholder(t *testing.T) {
+	tag := workstream.EncodeTag(workstream.Conversation{Agent: model.Claude, SessionID: "c1", ConfigDir: "/h/.claude", Title: "Title c1"})
+	ph := model.TmuxPane{ID: "%7", Session: "cam", WindowID: "@4", WindowIndex: 0, WindowPanes: 1, Path: "/w/proj", Resume: tag}
+	obs := Observation{Profiles: profiles, Conversations: []Conversation{conv(model.Claude, "c1", 50), conv(model.Claude, "c2", 40)},
+		Tmux: TmuxView{OK: true, Panes: []model.TmuxPane{ph, {ID: "%8", Session: "vector", WindowID: "@5", Path: "/elsewhere"}}}}
+	snap, _ := compute(obs, nil, at(60))
+	s := find(t, snap, "claude:c1")
+	if s.Alive || s.Placeholder != "%7" || s.TmuxSess != "cam" || s.WindowID != "@4" || s.Location != "cam:0" {
+		t.Fatalf("%+v", s)
+	}
+	if j := PlanJump(s, obs.Tmux.Panes); j.Kind != JumpPlaceholder || j.Pane != "%7" {
+		t.Fatalf("jump %+v", j)
+	}
+	if m := PlanMove(s, "other"); m.Kind != MoveWindow || m.Window != "@4" {
+		t.Fatalf("move %+v", m)
+	}
+	if m := PlanMove(s, "cam"); m.Kind != MoveImpossible {
+		t.Fatalf("move into its own workstream: %+v", m)
+	}
+	// A conversation without a placeholder resumes in a new window as before.
+	if s2 := find(t, snap, "claude:c2"); s2.Placeholder != "" || PlanJump(s2, obs.Tmux.Panes).Kind != JumpNewWindow {
+		t.Fatalf("%+v", s2)
+	}
+	// Once resumed (claude runs under the placeholder), it is a live session
+	// in that pane, not a waiting one.
+	obs.Hooks = []HookRecord{hookRec("c1", 42, true, func(st *model.HookState) {
+		st.Pane, st.Activity, st.ActivityAt = "%7", model.Working, at(55)
+	})}
+	snap, _ = compute(obs, nil, at(60))
+	if s := find(t, snap, "claude:c1"); !s.Alive || s.Pane != "%7" || s.Placeholder != "" || PlanJump(s, nil).Kind != JumpPane {
+		t.Fatalf("resumed: %+v", s)
 	}
 }
