@@ -1,0 +1,19 @@
+# Installed by `cccp install --only docker` (docs/jails.md, "Containers").
+#
+# Docker runs containers in its own cgroups, outside cccp's jail: a
+# container an agent starts is charged to no workstream. With
+# "cgroup-parent": "agent-containers.slice" in /etc/docker/daemon.json,
+# every container starts under this slice instead, where the kernel kills a
+# process at the limit rather than the machine running out of memory.
+#
+# Budget: cccp.slice (the jail) 50% + containers 25% leaves 25% for the
+# desktop and system.
+[Unit]
+Description=Containers started through Docker, memory-limited (cccp)
+Before=slices.target
+
+[Slice]
+MemoryMax=25%
+MemorySwapMax=1G
+CPUWeight=50
+TasksMax=8192

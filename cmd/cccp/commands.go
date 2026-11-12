@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"os/user"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -633,6 +634,14 @@ func isTerminal(f *os.File) bool {
 	return err == nil
 }
 
+// currentUser is the login name ("" if unknown).
+func currentUser() string {
+	if u, err := user.Current(); err == nil {
+		return u.Username
+	}
+	return os.Getenv("USER")
+}
+
 func (a *app) installer(yes bool) (*install.Installer, error) {
 	if !yes && !isTerminal(os.Stdin) {
 		return nil, errNoTerminal
@@ -643,14 +652,14 @@ func (a *app) installer(yes bool) (*install.Installer, error) {
 	}
 	return &install.Installer{
 		L: a.l, Profiles: a.profiles(a.config()), Assets: cccp.Assets, Cmd: execRunner{}, Environ: os.Environ(), Tmux: a.tmux, Self: self,
-		Out: os.Stdout, In: bufio.NewReader(os.Stdin), Yes: yes,
+		Out: os.Stdout, In: bufio.NewReader(os.Stdin), Yes: yes, User: currentUser(),
 	}, nil
 }
 
 func runInstall(a *app, args []string) error {
 	fs := flag.NewFlagSet("install", flag.ExitOnError)
 	yes := fs.Bool("yes", false, "do every step without asking")
-	only := fs.String("only", "", "comma-separated subset: bin,claude,agy,systemd,tmux")
+	only := fs.String("only", "", "comma-separated subset: bin,claude,agy,systemd,tmux; host steps, only when named: docker (cap containers' memory, sudo), linger")
 	_ = fs.Parse(args)
 	want := map[string]bool{}
 	for _, s := range strings.Split(*only, ",") {

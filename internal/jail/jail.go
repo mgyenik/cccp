@@ -89,13 +89,20 @@ var Presets = []string{PresetNormal, PresetBoost, PresetMax}
 
 // Defaults are the built-in limits (docs/jails.md): A, A while a workstream
 // is at max, and each workstream preset.
+//
+// Memory is budgeted so that everything agents can start fits in RAM at
+// once beside the desktop: A at 50% plus containers (started through
+// Docker, which runs them outside A) capped at 25% by the install's docker
+// step, leaving 25% for the desktop and system (about 23 GB measured in
+// use when a runaway container exhausted memory, 2026-11-12). max raises
+// A's CPU weight, not its memory: more would break the budget.
 var Defaults = Settings{
-	Root:    Limits{MemoryHigh: "infinity", MemoryMax: "80%", MemorySwapMax: "2G", CPUWeight: 50},
-	RootMax: Limits{MemoryHigh: "infinity", MemoryMax: "90%", MemorySwapMax: "4G", CPUWeight: 200},
+	Root:    Limits{MemoryHigh: "infinity", MemoryMax: "50%", MemorySwapMax: "2G", CPUWeight: 50},
+	RootMax: Limits{MemoryHigh: "infinity", MemoryMax: "50%", MemorySwapMax: "4G", CPUWeight: 200},
 	Presets: map[string]Limits{
-		PresetNormal: {MemoryHigh: "infinity", MemoryMax: "47%", MemorySwapMax: "1G", CPUWeight: 100, TasksMax: 4096},
-		PresetBoost:  {MemoryHigh: "infinity", MemoryMax: "80%", MemorySwapMax: "2G", CPUWeight: 400, TasksMax: 8192},
-		PresetMax:    {MemoryHigh: "infinity", MemoryMax: "90%", MemorySwapMax: "4G", CPUWeight: 400, TasksMax: 8192},
+		PresetNormal: {MemoryHigh: "infinity", MemoryMax: "33%", MemorySwapMax: "1G", CPUWeight: 100, TasksMax: 4096},
+		PresetBoost:  {MemoryHigh: "infinity", MemoryMax: "45%", MemorySwapMax: "2G", CPUWeight: 400, TasksMax: 8192},
+		PresetMax:    {MemoryHigh: "infinity", MemoryMax: "50%", MemorySwapMax: "4G", CPUWeight: 400, TasksMax: 8192},
 	},
 }
 

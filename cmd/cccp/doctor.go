@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -108,6 +109,22 @@ func runDoctor(a *app, args []string) error {
 		f.Close()
 	}
 	check("hook errors (24h)", recent == 0, fmt.Sprintf("%d (see %s)", recent, l.HookErrorLog))
+
+	// Containers and lingering (docs/jails.md, "Containers"): host setup the
+	// jail depends on.
+	if _, err := exec.LookPath("docker"); err == nil {
+		daemon, _ := os.ReadFile(install.DockerDaemonJSON)
+		max, _ := (execRunner{}).Run(nil, "systemctl", "show", install.ContainerSlice, "-p", "MemoryMax", "--value")
+		ok, detail := install.ContainerCheck(daemon, max)
+		check("containers", ok, detail)
+	}
+	if out, err := (execRunner{}).Run(nil, "loginctl", "show-user", currentUser(), "-p", "Linger", "--value"); err == nil {
+		if strings.TrimSpace(out) == "yes" {
+			check("linger", true, "tmux, cccp and the agents outlive the desktop session")
+		} else {
+			check("linger", false, "off: if the desktop session ends (a crash, an oomd kill), tmux, cccp and every agent stop with it: cccp install --only linger")
+		}
+	}
 
 	snap := a.snapshot(false)
 	if j := snap.Jail; !j.On {

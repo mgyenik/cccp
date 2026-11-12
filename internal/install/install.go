@@ -51,6 +51,11 @@ type Installer struct {
 	Out  io.Writer
 	In   *bufio.Reader
 	Yes  bool // do every step without asking
+
+	// User is the user's login name (the linger step). Root prefixes the
+	// system paths the docker step writes ("" in use; a directory in tests).
+	User string
+	Root string
 }
 
 // Step names, in order.
@@ -97,6 +102,13 @@ func (i *Installer) Install(only map[string]bool) error {
 			"\n    sets focus-events on, hooks [97], Shift+PgDn / Shift+PgUp / Shift+Up, status-right and window-status formats" +
 			"\n    (current values are saved to " + l.TmuxRestore + " for uninstall)", i.installTmux},
 	)
+	// Host steps change system configuration: only when named.
+	if only[StepDocker] {
+		steps = append(steps, step{StepDocker, i.dockerWhat(), i.installDocker})
+	}
+	if only[StepLinger] {
+		steps = append(steps, step{StepLinger, "keep your user manager (tmux, cccp, the agents) running when no session is open, so a crash or kill of the desktop does not stop them (loginctl enable-linger)", i.installLinger})
+	}
 	for _, s := range steps {
 		if len(only) > 0 && !only[s.name] {
 			continue
@@ -128,6 +140,14 @@ func (i *Installer) Uninstall() error {
 	}
 	steps = append(steps, step{StepAgy, "remove " + l.AgyPluginDir, func() error { return os.RemoveAll(l.AgyPluginDir) }})
 	steps = append(steps, step{"marketplace", "remove the local marketplace " + l.MarketplaceDir, func() error { return os.RemoveAll(l.MarketplaceDir) }})
+	if r, err := i.loadHostRestore(); err == nil {
+		if r.Docker != nil {
+			steps = append(steps, step{StepDocker, "remove the container memory cap (" + ContainerSlice + ", cgroup-parent in " + DockerDaemonJSON + ") and restart dockerd (needs sudo)", i.uninstallDocker})
+		}
+		if r.LingerBefore != "" {
+			steps = append(steps, step{StepLinger, "put lingering back as it was before cccp (" + r.LingerBefore + ")", i.uninstallLinger})
+		}
+	}
 	var failed []string
 	for _, s := range steps {
 		i.printf("\n[%s] %s\n", s.name, s.what)

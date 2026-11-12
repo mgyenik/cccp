@@ -60,6 +60,13 @@ bin,claude,agy,systemd,tmux` picks steps):
    turns `focus-events` on while terminals are attached, it names them:
    **detach and reattach each one** (see Notifications).
 
+Two host steps run only when named, since they change system
+configuration: `cccp install --only docker` caps the memory of every
+container started through Docker (agents' containers otherwise run outside
+the jail; needs `sudo`, restarts dockerd), and `cccp install --only
+linger` keeps tmux, cccp and the agents running if the desktop session
+ends. See [docs/jails.md](docs/jails.md#containers).
+
 Sessions started before the plugin was installed are still listed: Claude
 Code ≥ ~2.1.28x through its session registry, older ones and pre-plugin agy
 sessions through tmux/`/proc` discovery with inferred state. Restart them for
@@ -116,14 +123,15 @@ Agents run heavy things. cccp keeps tmux and each workstream in its own
 cgroup through your systemd user manager, so one runaway build cannot take
 the machine's memory or starve the desktop and the other workstreams:
 
-* all of tmux may use 80% of memory, at a lower CPU priority than the
-  desktop;
-* each workstream may use 47% (`normal`); at its limit the kernel kills a
+* all of tmux may use 50% of memory, at a lower CPU priority than the
+  desktop (containers, which Docker runs outside the jail, get their own
+  25% with the `docker` install step; the rest is the desktop's);
+* each workstream may use 33% (`normal`); at its limit the kernel kills a
   process in that workstream, not your browser. cccp notifies you at 85%.
 
 When a workstream needs more, `L` in the cockpit (or `cccp limits infra
-boost --for 2h`) raises it to `boost` (80%, four times the CPU share) or
-`max` (90%, above the desktop), for 1 h by default, 2 h, 8 h or until
+boost --for 2h`) raises it to `boost` (45%, four times the CPU share) or
+`max` (50%, above the desktop in CPU), for 1 h by default, 2 h, 8 h or until
 undone; it reverts by itself. `cccp limits` shows every workstream's use and
 limits. Installing it needs no restart: the running tmux server and panes
 are moved. Without a systemd user manager (or cgroups v2) it is off and
@@ -190,7 +198,7 @@ Jails (all optional; the built-in values are in docs/jails.md):
 enabled = true
 
 [jail.root]                    # all of tmux
-memory_max = "80%"
+memory_max = "50%"
 
 [jail.preset.normal]           # change a preset
 memory_max = "40G"

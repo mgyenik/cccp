@@ -20,8 +20,9 @@ and carries limits; a **scope** holds processes started by something else.
 Limits on a slice apply to everything under it together, and a process's
 children are always created in its cgroup, so nothing an agent starts
 escapes its pane's cgroup, not even by detaching (`nohup`, `setsid`). The
-exception is containers started through the Docker daemon, which runs them
-in its own cgroups.
+exception is work a pane asks a **daemon** to start: containers started
+through the Docker daemon run in its own cgroups, outside the jail. They
+are capped separately (Containers, below).
 
 Two levels:
 
@@ -85,15 +86,24 @@ Tested on this machine (systemd 255, cgroups v2, Linux 6.17), 2026-11-05:
 
 ## Limits
 
-Presets (percentages of physical memory; on 86 GB: 47% ≈ 40 GB):
+Presets (percentages of physical memory; on 86 GB: 33% ≈ 28 GB):
 
 | | `MemoryMax` (the limit) | `MemorySwapMax` | `CPUWeight` | `TasksMax` |
 |---|---|---|---|---|
-| **A** `cccp.slice` | 80% | 2G | 50 (the desktop's apps: 100) | |
-| **A** under `max` | 90% | 4G | 200 | |
-| workstream `normal` | 47% | 1G | 100 | 4096 |
-| workstream `boost` | 80% | 2G | 400 | 8192 |
-| workstream `max` | 90% | 4G | 400 | 8192 |
+| **A** `cccp.slice` | 50% | 2G | 50 (the desktop's apps: 100) | |
+| **A** under `max` | 50% | 4G | 200 | |
+| workstream `normal` | 33% | 1G | 100 | 4096 |
+| workstream `boost` | 45% | 2G | 400 | 8192 |
+| workstream `max` | 50% | 4G | 400 | 8192 |
+| containers (`agent-containers.slice`, system) | 25% | 1G | 50 | 8192 |
+
+**The budget.** Everything agents can start must fit in RAM at once beside
+the desktop: A (50%) plus containers (25%) leaves 25% (about 21 GB) for the
+desktop, the kernel and system services, which used about 23 GB, swap
+included, during the 2026-11-12 incident (Containers). So `max` raises A's
+CPU weight, not its memory. (These were 80% for A and 90% under `max`
+until then: a `boost` or `max` workstream could exhaust the machine from
+inside the jail.)
 
 `MemoryHigh` is set to `infinity` everywhere (it can still be set in the
 config, for anyone who wants it).
@@ -111,6 +121,65 @@ config, for anyone who wants it).
 * `custom` sets any of these per workstream.
 * Defaults and per-workstream settings are in cccp's config; the presets'
   values can be changed there.
+
+## Containers
+
+**The incident (2026-11-12).** An agent's test suite ran `docker run`
+without `--memory`. The `docker` command was in the pane's jail, but the
+container is the Docker daemon's child, not the pane's: it started in
+`system.slice`, with no limit. It allocated about 62 GiB in 78 seconds,
+filling RAM and swap. The kernel's global OOM killer killed it, but
+`systemd-oomd`, which watches only the user's own processes, had already
+seen their memory pressure and killed Chrome, then gnome-shell. Losing the
+desktop session stopped the user manager, and with it tmux, cccp and every
+agent.
+
+**The cap.** `cccp install --only docker` (needs `sudo`; never part of a
+plain install) adds a system slice, `agent-containers.slice`, with a hard
+`MemoryMax` (25%, the budget above), and makes it the default parent of
+every container (`"cgroup-parent"` in `/etc/docker/daemon.json`, other
+settings kept), then restarts dockerd. Verified 2026-11-12: a container
+started from a jailed pane runs in
+`/agent.slice/agent-containers.slice/docker-….scope`, with `memory.max`
+25% of RAM. Every container then starts under
+it, whoever starts it (yours too), and at the limit the kernel kills a
+process inside it instead of the machine running out of memory. `cccp
+uninstall` reverses it. `cccp doctor` reports containers that run without
+the cap.
+
+What it does not do:
+
+* **No per-workstream limit.** All containers share one cap, because a
+  container is the daemon's child, not the pane's. Charging each
+  workstream's containers to that workstream needs a per-workstream Docker
+  API proxy (`DOCKER_HOST` set in the panes, adding the cgroup parent and a
+  `--memory` to every create request); left for later.
+* **Not a guarantee.** A container can still choose its own parent
+  (`--cgroup-parent`); careless agents do not, but nothing stops one. Being
+  in the `docker` group is equivalent to root.
+* **Not watched (yet).** The kernel enforces the cap with or without cccp.
+  cccp does not read the container slice, so a kill there is silent: the
+  agent sees exit status 137 and may retry. Watching it, as workstreams are
+  watched (a notification on a kill, a warning at 85%, its memory in `cccp
+  limits` and the cockpit), is straightforward to add if it turns out to be
+  needed: the slice's `memory.events` and `memory.current` under
+  `/sys/fs/cgroup/agent.slice/agent-containers.slice` (systemd nests it
+  under `agent.slice` by its dash) are world-readable. A notification
+  could not say which agent started the container without asking Docker.
+* **Other daemons.** `systemd-run --user` and `systemctl --user start` put
+  work in the user manager's `app.slice`, also outside the jail. Agents
+  rarely do this; it is not covered.
+
+**Lingering.** With lingering off, the user manager (tmux, cccp, every
+agent) stops a few seconds after the last login session ends, which is
+what turned the loss of gnome-shell into the loss of everything. `cccp
+install --only linger` turns it on (`loginctl enable-linger`; uninstall puts
+it back as it was), so the agents outlive the desktop session. `cccp doctor`
+reports it.
+
+**Not done:** `ManagedOOMPreference=avoid` for gnome-shell and
+`cccp-tmux.scope`, so `systemd-oomd` picks other victims (whether systemd
+honours it for these cgroups is untested).
 
 ## Boosting at runtime
 

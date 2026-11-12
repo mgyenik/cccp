@@ -48,6 +48,7 @@ type Layout struct {
 	MarketplaceDir string
 	TmuxSnippet    string
 	TmuxRestore    string
+	HostRestore    string // what install's host steps changed
 	BinPath        string
 	SystemdUnit    string
 	TmuxConf       string
@@ -111,6 +112,7 @@ func Resolve(getenv func(string) string, home string, uid int) Layout {
 	l.MarketplaceDir = filepath.Join(l.ShareDir, "marketplace")
 	l.TmuxSnippet = filepath.Join(l.ShareDir, "cccp.tmux")
 	l.TmuxRestore = filepath.Join(l.ShareDir, "tmux-restore.json")
+	l.HostRestore = filepath.Join(l.ShareDir, "host-restore.json")
 	l.BinPath = filepath.Join(home, ".local", "bin", "cccp")
 	l.SystemdUnit = filepath.Join(xdg("XDG_CONFIG_HOME", ".config"), "systemd", "user", "cccp.service")
 	l.TmuxConf = filepath.Join(home, ".tmux.conf")
