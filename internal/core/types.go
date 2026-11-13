@@ -111,6 +111,9 @@ type Session struct {
 	// BackgroundShell: the turn is over but a background shell command the
 	// session started still runs (Claude Code's registry status "shell").
 	BackgroundShell bool `json:"background_shell,omitempty"`
+	// RecentPrompts are the user's last typed prompts, oldest first (for the
+	// working title; not published).
+	RecentPrompts []model.Prompt `json:"-"`
 	// Placeholder is the restore placeholder pane (cccp start) waiting to
 	// resume this conversation, which is not running ("" if none); its
 	// window and workstream are then WindowID, Location and TmuxSess.

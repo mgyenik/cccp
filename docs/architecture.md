@@ -687,3 +687,23 @@ carries `command.data.groups[].buckets[]`. `internal/usage` parses both
 (pure); `cmd/cccp/usage.go` runs them. A bar is coloured by the server's
 severity when it gives one (Claude), else by the share used (agy).
 
+## 17. Working titles (2026-11-12)
+
+Claude Code writes one `ai-title` per conversation, from its first one to
+three prompts, and never updates it (40 of 40 recent transcripts checked);
+agy's summary title is likewise set early. A session opened with "review
+the recent work" keeps "Project onboarding" for hundreds of prompts. The
+transcript readers keep the user's last 8 typed prompts (`RecentPrompts`:
+typed ones only, never a background report), and the machine queues a
+title job (`offerTitles`) for a live conversation after 3 prompts without a
+working title, then after every 5 new ones. The job runs on the summary
+queue (summaries first: a notification can wait on one) with
+`TitlePrompt`: the current title and the recent prompts, a title of at most
+6 words, the current one repeated while it still fits. A reply that is not
+a title (several lines, over 10 words) keeps the current one and waits for
+the next 5 prompts. Titles are kept in memory (`Memory.Titles`, by session),
+rank after the user's own (alias, `/rename`) and before the agents'.
+Measured on 8 long conversations: two prompt revisions, the second after
+the model explained itself in a paragraph (prompts about titles read as
+instructions) and a housekeeping tangent replaced a project title.
+

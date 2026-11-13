@@ -1527,3 +1527,33 @@ func TestSessionOnTwoProcessesTakesTheRegistrysPane(t *testing.T) {
 		}
 	}
 }
+
+// The working title replaces the agent's first-prompt title; a title the
+// user set (/rename) still wins.
+func TestWorkingTitleOrder(t *testing.T) {
+	obs := Observation{
+		Profiles: profiles,
+		Hooks: []HookRecord{hookRec("s1", 42, true, func(s *model.HookState) {
+			s.Activity, s.ActivityAt = model.Working, at(5)
+		})},
+		ClaudeTranscripts: map[string]ClaudeTranscript{"s1": {Path: "/t", Meta: model.ClaudeMeta{AITitle: "Project onboarding"}}},
+	}
+	mem := NewMemory()
+	mem.Initialized = true
+	mem.Titles["claude:s1"] = TitleRecord{Text: "Sketch text constraints", BasedOn: at(4)}
+	snap, _ := compute(obs, &mem, at(10))
+	if s := find(t, snap, "claude:s1"); s.Title != "Sketch text constraints" || s.TitleSource != "working" {
+		t.Fatalf("%q (%s)", s.Title, s.TitleSource)
+	}
+	obs.Hooks[0].State.CustomTitle = "my name"
+	snap, _ = compute(obs, &mem, at(10))
+	if s := find(t, snap, "claude:s1"); s.Title != "my name" || s.TitleSource != "custom" {
+		t.Fatalf("rename: %q (%s)", s.Title, s.TitleSource)
+	}
+	// Without a working title, the agent's.
+	obs.Hooks[0].State.CustomTitle = ""
+	snap, _ = compute(obs, nil, at(10))
+	if s := find(t, snap, "claude:s1"); s.Title != "Project onboarding" {
+		t.Fatalf("%q", s.Title)
+	}
+}

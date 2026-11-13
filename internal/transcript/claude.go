@@ -380,6 +380,9 @@ func (e *claudeEntry) parseUser(line []byte, seq int64) {
 	if !toolResult {
 		if starts, auto := turnStart(r, prompt); starts {
 			e.meta.LastTurnAuto, e.meta.LastTurnAt = auto, r.Timestamp
+			if !auto && !r.IsMeta && !strings.HasPrefix(prompt, "<") {
+				e.meta.RecentPrompts = model.AddPrompt(e.meta.RecentPrompts, prompt, r.Timestamp)
+			}
 		}
 	}
 	if toolResult {

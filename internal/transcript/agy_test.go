@@ -31,6 +31,9 @@ func TestAgyMeta(t *testing.T) {
 	if m.LastMessage != "On it." || !m.LastMessageAt.Equal(at("2026-11-04T10:00:05Z")) {
 		t.Fatalf("last message %q at %v (the last one with text)", m.LastMessage, m.LastMessageAt)
 	}
+	if len(m.RecentPrompts) != 1 || m.RecentPrompts[0].Text != "build it" || !m.RecentPrompts[0].At.Equal(at("2026-11-04T10:00:00Z")) {
+		t.Fatalf("recent prompts %+v", m.RecentPrompts)
+	}
 	if m.LastPrompt != "build it" || !m.PendingTools || m.ContextTokens != 6300 || m.LastStepIndex != 3 {
 		t.Fatalf("%+v", m)
 	}

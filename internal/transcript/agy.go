@@ -7,6 +7,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"cccp/internal/model"
 )
 
 type agyEntry struct {
@@ -88,6 +90,7 @@ func (e *agyEntry) parse(buf []byte) {
 			if t := agyText(s.Content); t != "" {
 				e.meta.LastPrompt = stripUserRequestTags(t)
 				e.meta.LastPromptAt = s.CreatedAt
+				e.meta.RecentPrompts = model.AddPrompt(e.meta.RecentPrompts, e.meta.LastPrompt, s.CreatedAt)
 			}
 		case "PLANNER_RESPONSE":
 			e.meta.LastModelCallAt = s.CreatedAt

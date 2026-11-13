@@ -18,6 +18,15 @@ type SummaryRecord struct {
 	Verdict string `json:"verdict,omitempty"`
 }
 
+// TitleRecord is a working title.
+type TitleRecord struct {
+	Text string `json:"text"`
+	// BasedOn is the newest prompt it was made from: prompts after it are
+	// new to it.
+	BasedOn time.Time `json:"based_on"`
+	At      time.Time `json:"at"`
+}
+
 // RegStatus is a registry session's last observed status.
 type RegStatus struct {
 	Status string
@@ -30,6 +39,10 @@ type Memory struct {
 	// Seen: when each session's latest completion was looked at (its pane
 	// visible on a focused client), or when the session was first seen.
 	Seen map[string]time.Time `json:"seen"`
+	// Titles are cccp's working titles: what each conversation is about now,
+	// from its recent prompts (Claude Code and agy title a conversation once,
+	// from its first prompts).
+	Titles map[string]TitleRecord `json:"titles,omitempty"`
 	// Aliases set by the user.
 	Aliases map[string]string `json:"aliases"`
 	// RegCompletions: turn ends observed as registry busy/waiting → idle
@@ -58,6 +71,7 @@ func NewMemory() Memory {
 		Aliases:        map[string]string{},
 		RegCompletions: map[string]time.Time{},
 		Summaries:      map[string]SummaryRecord{},
+		Titles:         map[string]TitleRecord{},
 		RegLast:        map[string]RegStatus{},
 		Boosts:         map[string]jail.Boost{},
 	}
@@ -70,6 +84,7 @@ func (m Memory) Clone() Memory {
 	maps.Copy(c.Aliases, m.Aliases)
 	maps.Copy(c.RegCompletions, m.RegCompletions)
 	maps.Copy(c.Summaries, m.Summaries)
+	maps.Copy(c.Titles, m.Titles)
 	maps.Copy(c.RegLast, m.RegLast)
 	c.Initialized = m.Initialized
 	c.Workstreams = m.Workstreams.Clone()
@@ -83,6 +98,9 @@ func (m Memory) Persisted(o Memory) bool {
 		maps.EqualFunc(m.Seen, o.Seen, time.Time.Equal) &&
 		maps.Equal(m.Aliases, o.Aliases) &&
 		maps.EqualFunc(m.RegCompletions, o.RegCompletions, time.Time.Equal) &&
+		maps.EqualFunc(m.Titles, o.Titles, func(a, b TitleRecord) bool {
+			return a.Text == b.Text && a.BasedOn.Equal(b.BasedOn) && a.At.Equal(b.At)
+		}) &&
 		maps.EqualFunc(m.Summaries, o.Summaries, func(a, b SummaryRecord) bool {
 			return a.InputHash == b.InputHash && a.Text == b.Text && a.At.Equal(b.At) && a.Verdict == b.Verdict
 		}) &&
@@ -106,6 +124,11 @@ func (m Memory) Prune(keep map[string]bool) Memory {
 	for k := range c.Summaries {
 		if !keep[k] {
 			delete(c.Summaries, k)
+		}
+	}
+	for k := range c.Titles {
+		if !keep[k] {
+			delete(c.Titles, k)
 		}
 	}
 	for k := range c.RegLast {

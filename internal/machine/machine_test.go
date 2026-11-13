@@ -33,6 +33,8 @@ type scene struct {
 	auto      bool // transcript: the last turn was started by a background report
 	prompt    string
 	shell     bool // registry: idle with a background shell running
+	prompts   int  // transcript: this many recent prompts, at seconds 1..n
+	alias     string
 }
 
 func (sc scene) obs() core.Observation {
@@ -67,9 +69,12 @@ func (sc scene) obs() core.Observation {
 			PID: 42, SessionID: "s1", Kind: "interactive", Entrypoint: "cli", Status: "shell", Cwd: "/w/proj",
 			StatusUpdatedMs: at(sc.since).Add(time.Second).UnixMilli()}}}
 	}
-	if sc.lastResp > 0 || sc.auto {
-		o.ClaudeTranscripts = map[string]core.ClaudeTranscript{"s1": {Path: "/t", Meta: model.ClaudeMeta{
-			LastAssistantAt: at(sc.lastResp), TTL: model.TTL5m, LastTurnAuto: sc.auto}}}
+	if sc.lastResp > 0 || sc.auto || sc.prompts > 0 {
+		meta := model.ClaudeMeta{LastAssistantAt: at(sc.lastResp), TTL: model.TTL5m, LastTurnAuto: sc.auto, AITitle: "Project onboarding"}
+		for i := 1; i <= sc.prompts; i++ {
+			meta.RecentPrompts = model.AddPrompt(meta.RecentPrompts, fmt.Sprintf("prompt %d", i), at(i))
+		}
+		o.ClaudeTranscripts = map[string]core.ClaudeTranscript{"s1": {Path: "/t", Meta: meta}}
 	}
 	return o
 }
@@ -804,6 +809,92 @@ func TestBackgroundShellTurn(t *testing.T) {
 		s := session(t, published(t, effs))
 		if (len(of[Notify](effs)) == 1) != c.notify || s.Group != c.group {
 			t.Fatalf("%q: group %s, %v", c.reply, s.Group, effs)
+		}
+	}
+}
+
+// starts are the StartSummary effects that are working titles.
+func titleJobs(effs []Effect) []StartSummary {
+	var out []StartSummary
+	for _, s := range of[StartSummary](effs) {
+		if s.Title {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// A live conversation gets a working title from its recent prompts: after
+// TitleFirstAfter prompts, then after every TitleEvery new ones. It
+// replaces the agent's first-prompt title.
+func TestWorkingTitle(t *testing.T) {
+	m := newMachine(summaryConfig("always"))
+	busy := func(n int) scene { return scene{activity: model.Working, since: n, prompts: n} }
+	if j := titleJobs(m.Step(Observed{Obs: busy(2).obs(), At: at(20)})); len(j) != 0 {
+		t.Fatalf("2 prompts: %v", j)
+	}
+	effs := m.Step(Observed{Obs: busy(3).obs(), At: at(21)})
+	j := titleJobs(effs)
+	if len(j) != 1 || j[0].SystemPrompt != TitlePrompt || !j[0].Basis.Equal(at(3)) ||
+		!strings.Contains(j[0].Input, "Current title: Project onboarding") || !strings.Contains(j[0].Input, "3. prompt 3") {
+		t.Fatalf("3 prompts: %+v", j)
+	}
+	effs = m.Step(SummaryDone{Key: j[0].Key, Hash: j[0].Hash, Text: "\"Sketch-mode text constraints.\"", At: at(22), Title: true, Basis: j[0].Basis})
+	s := session(t, published(t, effs))
+	if s.Title != "Sketch-mode text constraints" || s.TitleSource != "working" {
+		t.Fatalf("title %q (%s)", s.Title, s.TitleSource)
+	}
+	if m.Memory().Titles["claude:s1"].Text != "Sketch-mode text constraints" {
+		t.Fatal("not kept in memory")
+	}
+	// 4 new prompts: not yet; 5: again, from the working title.
+	if j := titleJobs(m.Step(Observed{Obs: busy(7).obs(), At: at(30)})); len(j) != 0 {
+		t.Fatalf("4 new prompts: %v", j)
+	}
+	j = titleJobs(m.Step(Observed{Obs: busy(8).obs(), At: at(31)}))
+	if len(j) != 1 || !strings.Contains(j[0].Input, "Current title: Sketch-mode text constraints") {
+		t.Fatalf("5 new prompts: %+v", j)
+	}
+	// A reply that is not a title keeps the current one, and waits for the
+	// next TitleEvery prompts (no retry loop).
+	effs = m.Step(SummaryDone{Key: j[0].Key, Hash: j[0].Hash, Text: "The latest prompts are about wiring up title generation for the dashboard and more.", At: at(32), Title: true, Basis: j[0].Basis})
+	if s := session(t, published(t, effs)); s.Title != "Sketch-mode text constraints" {
+		t.Fatalf("kept: %q", s.Title)
+	}
+	if j := titleJobs(m.Step(Observed{Obs: busy(8).obs(), At: at(33)})); len(j) != 0 {
+		t.Fatalf("retried: %v", j)
+	}
+}
+
+func TestNoWorkingTitleWhenTheUserTitledItOrSummariesAreOff(t *testing.T) {
+	m := newMachine(summaryConfig("always"))
+	m.Step(SetAlias{Key: "claude:s1", Value: "mine", At: at(1)})
+	if j := titleJobs(m.Step(Observed{Obs: scene{activity: model.Working, since: 5, prompts: 8}.obs(), At: at(20)})); len(j) != 0 {
+		t.Fatalf("alias: %v", j)
+	}
+	off := newMachine(summaryConfig("off"))
+	if j := titleJobs(off.Step(Observed{Obs: scene{activity: model.Working, since: 5, prompts: 8}.obs(), At: at(20)})); len(j) != 0 {
+		t.Fatalf("summaries off: %v", j)
+	}
+	// Not for a closed conversation.
+	closed := newMachine(summaryConfig("always"))
+	if j := titleJobs(closed.Step(Observed{Obs: scene{activity: model.Idle, since: 5, prompts: 8, ended: true}.obs(), At: at(20)})); len(j) != 0 {
+		t.Fatalf("closed: %v", j)
+	}
+}
+
+func TestCleanTitle(t *testing.T) {
+	for in, want := range map[string]string{
+		"Sketch-mode text constraints":     "Sketch-mode text constraints",
+		"\"Quoted title.\"":                "Quoted title",
+		"**Bold**":                         "Bold",
+		"Title\nwith an explanation after": "",
+		"one two three four five six seven eight nine ten eleven": "",
+		strings.Repeat("x", 81):                                   "",
+		"":                                                        "",
+	} {
+		if got := cleanTitle(in); got != want {
+			t.Errorf("%q → %q want %q", in, got, want)
 		}
 	}
 }

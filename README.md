@@ -191,6 +191,14 @@ quiet_after = "10s"            # unmanaged session: pending tool + quiet pane â†
 Summaries run `claude -p` with no tools, no settings and no session
 persistence. With `"ac"` they only run on mains power.
 
+**Working titles.** Claude Code and agy title a conversation once, from its
+first prompts, so a session opened with "review the recent work and get up
+to speed" stays "Project onboarding" for good. With summaries on, cccp
+retitles each live conversation from your recent prompts (after 3 prompts,
+then every 5 new ones, keeping the title while it still fits), with the same
+model and profile as summaries. An alias (`a`) or Claude's `/rename` always
+wins.
+
 Jails (all optional; the built-in values are in docs/jails.md):
 
 ```toml

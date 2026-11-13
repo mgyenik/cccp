@@ -49,6 +49,44 @@ type ClaudeMeta struct {
 	// LastTurnAt is when that turn started (zero: none in view).
 	LastTurnAuto bool
 	LastTurnAt   time.Time
+	// RecentPrompts are the user's last typed prompts, oldest first (at most
+	// RecentPromptsKept, each clipped): what the conversation is about now.
+	RecentPrompts []Prompt
+}
+
+// Prompt is one prompt the user typed.
+type Prompt struct {
+	Text string
+	At   time.Time
+}
+
+// RecentPromptsKept is how many recent prompts transcripts keep, and
+// PromptClip how much of each.
+const (
+	RecentPromptsKept = 8
+	PromptClip        = 400
+)
+
+// AddPrompt appends a prompt to recent (oldest first), keeping the last
+// RecentPromptsKept, each clipped to PromptClip bytes (not splitting a
+// UTF-8 sequence).
+func AddPrompt(recent []Prompt, text string, at time.Time) []Prompt {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return recent
+	}
+	if len(text) > PromptClip {
+		cut := PromptClip
+		for cut > 0 && text[cut]&0xC0 == 0x80 {
+			cut--
+		}
+		text = text[:cut] + "…"
+	}
+	recent = append(recent, Prompt{Text: text, At: at})
+	if n := len(recent) - RecentPromptsKept; n > 0 {
+		recent = append([]Prompt(nil), recent[n:]...)
+	}
+	return recent
 }
 
 // AutoPrompt reports whether a prompt is one Claude Code sends on its own
@@ -87,4 +125,7 @@ type AgyMeta struct {
 	// LastModelCallAt is the last model call (a planner response, with or
 	// without text): what Gemini's prompt cache ages from.
 	LastModelCallAt time.Time
+	// RecentPrompts are the user's last prompts, oldest first (see
+	// ClaudeMeta.RecentPrompts).
+	RecentPrompts []Prompt
 }

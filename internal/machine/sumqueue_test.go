@@ -91,3 +91,25 @@ func TestSumQueueSuccessResetsFailures(t *testing.T) {
 		t.Fatal("success should reset the consecutive count")
 	}
 }
+
+// Summaries run before working titles (a notification can be waiting on a
+// summary), and a title job belongs to its session.
+func TestSummariesBeforeTitles(t *testing.T) {
+	q := newSumQueue()
+	now := time.Unix(0, 0)
+	q.offer(summaryJob{key: titleKey("a"), hash: "t", title: true}, now)
+	q.offer(summaryJob{key: "b", hash: "s"}, now)
+	if j, _ := q.next(now); j.key != "b" {
+		t.Fatalf("started %q first", j.key)
+	}
+	q.done("b", "s", false, now)
+	if j, _ := q.next(now); j.key != titleKey("a") {
+		t.Fatalf("then %q", j.key)
+	}
+	q.done(titleKey("a"), "t", true, now) // failed: backing off
+	q.offer(summaryJob{key: titleKey("c"), hash: "x", title: true}, now)
+	q.forget(map[string]bool{"a": true})
+	if len(q.queue) != 0 || len(q.failures) != 1 {
+		t.Fatalf("forget by session: queue %v failures %v", q.queue, q.failures)
+	}
+}

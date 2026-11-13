@@ -594,7 +594,7 @@ func (d *Daemon) summarize(e machine.StartSummary) {
 	ctx, cancel := context.WithTimeout(d.ctx, d.opt.SummaryTimeout)
 	defer cancel()
 	text, err := d.ports.Summarizer.Summarize(ctx, e.Model, e.Profile, e.SystemPrompt, e.Input)
-	done := machine.SummaryDone{Key: e.Key, Hash: e.Hash, Text: text, Err: err, At: d.ports.Now()}
+	done := machine.SummaryDone{Key: e.Key, Hash: e.Hash, Text: text, Err: err, At: d.ports.Now(), Title: e.Title, Basis: e.Basis}
 	select {
 	case d.sums <- done:
 	case <-d.ctx.Done():

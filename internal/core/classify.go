@@ -450,6 +450,7 @@ func (c *computation) fillText(s *Session, h *model.HookState, r *model.Registry
 	if m.hasClaude {
 		cm := m.claude
 		s.AutoTurn = cm.LastTurnAuto
+		s.RecentPrompts = cm.RecentPrompts
 		if cm.LastPrompt != "" && (s.LastPrompt == "" || cm.LastPromptAt.After(s.LastPromptAt)) {
 			s.LastPrompt = cm.LastPrompt
 			if !cm.LastPromptAt.IsZero() {
@@ -464,6 +465,7 @@ func (c *computation) fillText(s *Session, h *model.HookState, r *model.Registry
 	}
 	if m.hasAgy {
 		am := m.agy
+		s.RecentPrompts = am.RecentPrompts
 		if am.LastPrompt != "" && (s.LastPrompt == "" || am.LastPromptAt.After(s.LastPromptAt)) {
 			s.LastPrompt, s.LastPromptAt = am.LastPrompt, am.LastPromptAt
 		}
@@ -489,6 +491,9 @@ func (c *computation) fillText(s *Session, h *model.HookState, r *model.Registry
 	if r != nil && r.NameSource != "" && r.NameSource != "derived" {
 		cs = append(cs, cand{r.Name, "name"})
 	}
+	// cccp's working title, after the user's own (rename) and before the
+	// agents' first-prompt titles.
+	cs = append(cs, cand{c.mem.Titles[s.Key].Text, "working"})
 	if m.hasClaude {
 		cs = append(cs, cand{m.claude.AITitle, "ai-title"})
 	}

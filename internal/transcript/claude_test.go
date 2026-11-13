@@ -189,3 +189,30 @@ func TestLastTurnOrigin(t *testing.T) {
 		t.Fatalf("old prompt: %+v", m)
 	}
 }
+
+// The working title reads the user's own recent prompts: typed ones only,
+// the last few, clipped.
+func TestRecentPrompts(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "S.jsonl")
+	var lines []string
+	for i := 1; i <= 10; i++ {
+		lines = append(lines, entry(i, fmt.Sprintf("prompt %d", i), `"promptSource":"typed","turnOrigin":"human",`))
+	}
+	lines = append(lines,
+		entry(11, "<task-notification> done", `"promptSource":"system","turnOrigin":"task_notification",`),
+		entry(12, "Another Claude session sent a message:\nhi", `"isMeta":true,"promptSource":"system","turnOrigin":"peer",`),
+		entry(13, "<command-name>/model</command-name>", `"promptSource":"typed","turnOrigin":"human",`),
+		entry(14, strings.Repeat("é", 400), `"promptSource":"typed","turnOrigin":"human",`))
+	write(t, p, lines...)
+	m, err := NewReader().Claude(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rp := m.RecentPrompts
+	if len(rp) != model.RecentPromptsKept || rp[0].Text != "prompt 4" || rp[6].Text != "prompt 10" || rp[6].At.Second() != 10 {
+		t.Fatalf("%+v", rp)
+	}
+	if last := rp[7].Text; !strings.HasSuffix(last, "…") || len(last) > model.PromptClip+len("…") || strings.ContainsRune(last, '�') {
+		t.Fatalf("clipped: %q", last)
+	}
+}

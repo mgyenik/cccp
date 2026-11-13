@@ -1,6 +1,7 @@
 package machine
 
 import (
+	"strings"
 	"time"
 
 	"cccp/internal/model"
@@ -8,12 +9,22 @@ import (
 
 // summaryJob asks for a one-line summary of one session's input.
 type summaryJob struct {
-	key     string
+	key     string // the queue key: the session's, or titleKey of it
 	hash    string
 	input   string
 	profile model.Profile // the Claude profile to run under
 	prompt  string        // the system prompt
+	// title: a working title, made from the prompts up to basis.
+	title bool
+	basis time.Time
 }
+
+// titleKey is a session's working-title job's queue key: its own, beside
+// the session's summary job.
+func titleKey(session string) string { return "title:" + session }
+
+// sessionOf is the session a queue key belongs to.
+func sessionOf(key string) string { return strings.TrimPrefix(key, "title:") }
 
 // Summary scheduling policy.
 const (
@@ -71,13 +82,21 @@ func (q *sumQueue) offer(job summaryJob, now time.Time) bool {
 	return true
 }
 
-// next returns the job to start, if none is running and one is queued.
+// next returns the job to start, if none is running and one is queued:
+// summaries before titles (a notification can be waiting on a summary).
 func (q *sumQueue) next(now time.Time) (summaryJob, bool) {
 	if q.running != "" || len(q.queue) == 0 || now.Before(q.pausedUntil) {
 		return summaryJob{}, false
 	}
-	job := q.queue[0]
-	q.queue = q.queue[1:]
+	i := 0
+	for j, job := range q.queue {
+		if !job.title {
+			i = j
+			break
+		}
+	}
+	job := q.queue[i]
+	q.queue = append(q.queue[:i:i], q.queue[i+1:]...)
 	q.running, q.runningHash = job.key, job.hash
 	return job, true
 }
@@ -124,13 +143,13 @@ func (q *sumQueue) stalled(key, hash string, now time.Time) bool {
 // forget drops state for sessions that no longer exist.
 func (q *sumQueue) forget(keep map[string]bool) {
 	for k := range q.failures {
-		if !keep[k] {
+		if !keep[sessionOf(k)] {
 			delete(q.failures, k)
 		}
 	}
 	out := q.queue[:0]
 	for _, j := range q.queue {
-		if keep[j.key] {
+		if keep[sessionOf(j.key)] {
 			out = append(out, j)
 		}
 	}
